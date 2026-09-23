@@ -10,8 +10,8 @@ A site is listed only when RxMaxSpeed is pinned to one hard ceiling the way
 the sample charts show for DHAPT35 and DHAPT48: after the night dip the line
 sits flat, and it cannot climb above that level.
 
-The rule is applied to every site using only 20–22 Sep 2026. No other
-date in the source file is used for the summary, the site list, or the charts.
+The rule is applied to every site over the whole hourly history in the file.
+Each snapshot chart shows only the latest three days.
 """
 
 from __future__ import annotations
@@ -153,10 +153,6 @@ FINDING_NOTES = (
     ),
 )
 SNAP_DAYS = 3
-# Preparation window. Summary, site list, hourly rows, and charts use these
-# dates only. Earlier days in the source file are ignored.
-REPORT_START = pd.Timestamp("2026-09-20")
-REPORT_END = pd.Timestamp("2026-09-22")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
@@ -170,13 +166,6 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     work["ts"] = work["Date"] + pd.to_timedelta(work["Hour"], unit="h")
     work = work.sort_values(["eNodeB Name", "ts"])
     work = work.drop_duplicates(["eNodeB Name", "ts"], keep="last")
-    # 20–22 Sep only. Busy hours, the stuck level, and the site list are
-    # calculated on this window. Other dates in the file are not used.
-    work = work[(work["Date"] >= REPORT_START) & (work["Date"] <= REPORT_END)].copy()
-    if work.empty:
-        raise SystemExit(
-            f"No hourly rows from {REPORT_START.date()} to {REPORT_END.date()}."
-        )
 
     records: list[dict] = []
     on_cap = np.zeros(len(work), dtype=bool)
@@ -446,11 +435,10 @@ def _page(ws, title: str, *, fit_width: bool = True):
 
 
 
-def _y_max(rec: dict) -> int:
-    peak = max(rec["max_rx"], rec["bw"])
-    if peak <= 290:
-        return 300
-    return int(np.ceil(peak * 1.12 / 50.0) * 50)
+def _chart_y_max(values: list[float]) -> int:
+    """Round the visible peak up to the next 100, with a little headroom."""
+    peak = max(values) if values else 100.0
+    return max(100, int(np.ceil(peak * 1.12 / 100.0) * 100))
 
 
 def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
@@ -462,11 +450,10 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
     data = book.add_worksheet("_ChartData")
     data.hide()
 
-    # KPI strip uses the first eight columns. The chart is wider than that
-    # strip, so the columns under it stay wide enough for the hour labels.
-    for col, width in enumerate([22, 20, 22, 20, 24, 20, 22, 20]):
+    # The chart is about one screen wide, so it does not need a long sheet.
+    for col, width in enumerate([18, 16, 18, 16, 18, 16, 18, 16]):
         ws.set_column(col, col, width)
-    ws.set_column(8, 50, 12)
+    ws.set_column(8, 16, 11)
 
     anchors: dict[str, int] = {}
     # Fixed stride so the site list can link to row i * BLOCK_ROWS + 1.
@@ -481,10 +468,10 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         s = work.loc[work["eNodeB Name"] == site].sort_values("ts")
         s = s[(s["Date"] >= chart_start) & (s["Date"] <= chart_end)]
 
-        # Two category levels, same axis as the sample snap.
-        # Inner level: 00:00, 01:00, … 23:00, repeated for each day.
-        # Outer level: the same date on every hour of that day, so Excel draws
-        # the date once, centered, inside the box under those 24 hours.
+        # Hourly line, compact axis like the sample snap.
+        # The line uses every hour. The visible time labels are every 3 hours
+        # (00:00, 03:00, 06:00 … 21:00). The date is the same on all 24 hours
+        # of a day, so Excel draws it once, centered, under that day.
         c0 = i * 3
         data.write(0, c0, "Date")
         data.write(0, c0 + 1, "Time")
@@ -495,12 +482,13 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         }
         dates: list[str] = []
         times: list[str] = []
+        plotted: list[float] = []
         r = 0
         for day in pd.date_range(chart_start, chart_end, freq="D"):
             date_label = f"{int(day.day)}/{MONTHS[int(day.month) - 1]}"
             for hour in range(24):
                 r += 1
-                hour_label = f"{hour:02d}:00"
+                hour_label = f"{hour:02d}:00" if hour % 3 == 0 else ""
                 dates.append(date_label)
                 times.append(hour_label)
                 data.write_string(r, c0, date_label, cat_fmt)
@@ -510,6 +498,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                     data.write_blank(r, c0 + 2, None)
                 else:
                     data.write_number(r, c0 + 2, value)
+                    plotted.append(value)
         n = r
 
         ws.set_row(top, 26)
@@ -542,9 +531,9 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   vs Tx BW {rec['util']:.1f}%"
             f"   ·   longest flat run {rec['longest']} h"
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
-            f"   ·   20–22 Sep only "
+            f"   ·   snapshot is the latest 3 days "
             f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
-            f"hours 00:00–23:00 under each date",
+            f"line every hour, labels 00:00, 03:00, 06:00 … 21:00",
             styles["note"],
         )
 
@@ -565,71 +554,59 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         chart.show_blanks_as("gap")
         chart.set_title(
             {
-                "name": f"RxMaxSpeed(Mbit/s)_{site}",
-                "name_font": {"name": "Calibri", "size": 14, "bold": True, "color": NAVY},
+                "name": site,
+                "name_font": {"name": "Calibri", "size": 16, "color": "#595959"},
             }
         )
-        # Categories cover Date and Time, so Excel draws both levels.
         chart.add_series(
             {
                 "name": "Sum of RxMaxSpeed,Mbps",
                 "categories": ["_ChartData", 1, c0, n, c0 + 1],
-                # Date is the outer axis level, hour is the level next to the line.
                 "categories_data": [dates, times],
                 "values": ["_ChartData", 1, c0 + 2, n, c0 + 2],
-                "line": {"color": "#5B9BD5", "width": 1.5},
+                "line": {"color": "#5B9BD5", "width": 2.25},
                 "marker": {"type": "none"},
             }
         )
         chart.set_x_axis(
             {
-                # No axis title. The sample has the hours and the date only.
                 "num_font": {
                     "name": "Calibri",
                     "size": 8,
-                    "color": "black",
+                    "color": "#595959",
                     "rotation": 0,
                 },
-                # 00:00–23:00 on the row next to the plot. The date is the
-                # level under that row, one label centered in each day's box.
                 "label_position": "nextTo",
                 "label_align": "center",
                 "position_axis": "on_tick",
-                "major_tick_mark": "outside",
-                "major_gridlines": {
-                    "visible": True,
-                    "line": {"color": "#D9D9D9", "width": 0.75},
-                },
+                "major_tick_mark": "none",
+                "minor_tick_mark": "none",
+                "major_gridlines": {"visible": False},
                 "minor_gridlines": {"visible": False},
-                "line": {"color": "#7F7F7F"},
+                "line": {"color": "#B0B0B0"},
             }
         )
         chart.set_y_axis(
             {
-                "name": "MB/s",
-                "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
-                "num_font": {"name": "Calibri", "size": 9, "color": "black"},
+                "num_font": {"name": "Calibri", "size": 9, "color": "#595959"},
                 "min": 0,
-                "max": _y_max(rec),
-                "major_unit": 50,
+                "max": _chart_y_max(plotted),
+                "major_unit": 100,
                 "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
-                "line": {"color": "#7F7F7F"},
+                "line": {"none": True},
             }
         )
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
-        chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
-        # Bottom band is the hour row (00:00–23:00) and, under it, one date
-        # in the box for that day. No "Date & Time" title.
+        chart.set_chartarea({"border": {"color": "#D0D0D0"}, "fill": {"color": "white"}})
+        # Short chart. Bottom band holds 00:00 / 03:00 / … and one date per day.
         chart.set_plotarea(
             {
-                "border": {"color": "#BFBFBF"},
+                "border": {"none": True},
                 "fill": {"color": "white"},
-                "layout": {"x": 0.05, "y": 0.12, "width": 0.93, "height": 0.58},
+                "layout": {"x": 0.08, "y": 0.16, "width": 0.88, "height": 0.60},
             }
         )
-        # 72 labels (3 days × 24 hours). About 44 px each, so 00:00 does not
-        # collide with 01:00, and each date stays centered under its own day.
-        chart.set_size({"width": 3400, "height": 500})
+        chart.set_size({"width": 1120, "height": 400})
         # Don't let the chart shrink when the sheet is scaled or columns move.
         ws.insert_chart(
             top + 4,
@@ -816,9 +793,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         (
             "Repeats across days",
             f"A day counts as on-cap when at least {STUCK_DAY_BUSY_HOURS} busy hours "
-            "are on the stuck level. Only 20, 21 and 22 Sep are counted. "
-            f"This must happen on at least {MIN_DAY_FRACTION:.0%} of those days "
-            "(and on at least 3 days).",
+            "are on the stuck level. This must happen on at least "
+            f"{MIN_DAY_FRACTION:.0%} of the days in the file (and on at least 3 days).",
         ),
         (
             "Continuous flat run",
@@ -869,15 +845,16 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         foot + 1,
         1,
         "DHAPT35 and DHAPT48 both pass this rule and are marked Sample snap = Yes "
-        "on the site list. Their snapshot pages use the same chart title as the "
-        "source pivot: RxMaxSpeed(Mbit/s)_<site>.",
+        "on the site list. Each snapshot is a short chart of the latest 3 days: "
+        "the line is every hour, the axis shows 00:00, 03:00, 06:00 … 21:00, "
+        "and the date is shown once under that day. The chart title is the site name.",
         styles["method_val"],
     )
 
 
 
-# Banner + KPI strip + a 520 px chart with a two-row axis under the plot.
-BLOCK_ROWS = 42
+# Banner + KPI strip + a compact chart (about 1120 × 400 px).
+BLOCK_ROWS = 32
 
 
 def main() -> None:
@@ -891,7 +868,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v8.xlsx",
+        default="FEGE_Choked_Flat_Sites_v9.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1020,10 +997,11 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         0,
         5,
         7,
-        "Prepared from 20–22 Sep 2026 only. No other date is used. "
-        f"A site is listed when at least {MIN_BUSY_PCT:.0f}% of busy hours "
-        "(08:00–22:00) on those three days sit on one flat ceiling. "
-        "Each chart shows 00:00–23:00 under that date. Open a site name to see it.",
+        "The list uses every date in the file. A site is listed when at least "
+        f"{MIN_BUSY_PCT:.0f}% of busy hours (08:00–22:00) sit on one flat ceiling. "
+        "Each snapshot is the latest 3 days only: a short chart with hours "
+        "00:00, 03:00, 06:00 … 21:00 and the date once under that day. "
+        "Open a site name to see it.",
         styles["note"],
     )
 
@@ -1139,9 +1117,9 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(3, 32)
     ws.merge_range(
         "A4:L4",
-        "Prepared from 20–22 Sep 2026 only. Other dates in the source file are "
-        "not used. Cutoff on Busy hours on cap is 10% of 08:00–22:00 on those "
-        "three days (same flat top as DHAPT35 and DHAPT48, within ±4 Mbit/s). "
+        "Cutoff on Busy hours on cap is 10% of 08:00–22:00 across every date in "
+        "the file (same flat top as DHAPT35 and DHAPT48, within ±4 Mbit/s). "
+        "The snapshot is the latest 3 days only. "
         "Open a site name to jump to its snapshot. The full rule is on sheet 4.",
         styles["note"],
     )
