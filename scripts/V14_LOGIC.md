@@ -61,3 +61,12 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - Sheet `2. Snapshots` renamed to `2. HourlyChartOfIssueSites`.
 - The long note under each chart KPI strip is removed.
 - File: `FEGE_Choked_Flat_Sites_v15.xlsx`
+
+## Jupyter (for local Windows use)
+
+Copy both files into `D:\KPI Monitoring\Transmission\FEGEPortChockCheck` and Run All:
+
+- `jupyter/TX_Port_Choke_Check.ipynb`
+- `jupyter/tx_port_choke_engine.py`
+
+Accepts CSV, XLS, XLSX, XLSB. Writes `TX_Port_Choke_Check.xlsx` in that same folder.
