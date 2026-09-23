@@ -10,6 +10,12 @@ A site is listed only when RxMaxSpeed is pinned to one hard ceiling the way
 the sample charts show for DHAPT35 and DHAPT48: after the night dip the line
 sits flat, and it cannot climb above that level.
 
+Two shapes are accepted. "Crowded level": most hours sit on one flat level
+and nothing climbs far above it (DHAPT35 / DHAPT48). "Hard ceiling": the
+trace moves up and down during the day but every rise stops at the same
+top value and never goes above it (the clipped ~500 Mbit/s sites such as
+DHSVRS5 / GPSDR01). Jagged traces whose peaks keep changing are not listed.
+
 The rule is applied to every site over the latest seven days in the file
 (16–22 Sep 2026 in the current source). Every hour is scored, including
 night and other off-peak hours. A site is listed when at least three of
@@ -46,6 +52,16 @@ TOL_FRAC = 0.015
 # spikes (the DHGULN2 / DHDHN40 / DHBDD32 / DHDHN09 shape), not a choke.
 OVERSHOOT_MBPS = 40.0
 OVERSHOOT_FRAC = 0.12
+# Second shape: the ceiling is the top of the trace. The level is searched
+# only in the top 10% of the samples, and the line may not go above it at
+# all (one glitch hour excepted). A trace that keeps climbing to new peaks
+# has no ceiling and fails here even if a busy cluster exists lower down.
+CEIL_TOP_Q = 0.90
+CEIL_OVER_MBPS = 8.0
+CEIL_OVER_FRAC = 0.03
+CEIL_MAX_ABOVE = 1
+CAP_CROWDED = "Crowded level"
+CAP_CEILING = "Hard ceiling"
 MIN_RUN_HOURS = 3
 STUCK_DAY_HOURS = 3
 MIN_DAYS_ON_CAP = 3
@@ -108,6 +124,33 @@ def find_plateau(rx: np.ndarray) -> tuple[float, float, np.ndarray]:
     center = float(np.median(rx[band]))
     band = np.abs(rx - center) <= tol
     return center, tol, band
+
+
+def find_ceiling(rx: np.ndarray) -> tuple[float, float, np.ndarray, int]:
+    """Return (ceiling Mbit/s, tolerance, mask on the ceiling, hours above it).
+
+    Same grid search as find_plateau, but only over the top 10% of the
+    samples, so the level is the top the trace keeps returning to. The
+    last value counts the hours that climb clearly above that top; a
+    choked port has none.
+    """
+    p95 = float(np.quantile(rx, 0.95))
+    tol = max(TOL_MBPS, TOL_FRAC * p95)
+    hi = float(np.max(rx))
+    lo = float(np.quantile(rx, CEIL_TOP_Q))
+    if not np.isfinite(hi) or hi <= lo:
+        center = hi
+    else:
+        grid = np.arange(lo, hi + 1e-6, 0.5)
+        diff = np.abs(rx[None, :] - grid[:, None])
+        counts = np.count_nonzero(diff <= tol, axis=1)
+        center0 = float(grid[int(np.argmax(counts))])
+        band = np.abs(rx - center0) <= tol
+        center = float(np.median(rx[band]))
+    band = np.abs(rx - center) <= tol
+    over = max(CEIL_OVER_MBPS, CEIL_OVER_FRAC * center)
+    above = int(np.count_nonzero(rx > center + over))
+    return center, tol, band, above
 
 
 def longest_run(ts: np.ndarray, band: np.ndarray) -> int:
@@ -217,44 +260,60 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         rx = s["Rx"].to_numpy(dtype=float)
         if len(rx) < 24 or float(np.nanmax(rx)) < MIN_CENTER_MBPS:
             continue
-        center, tol, band = find_plateau(rx)
-        if center < MIN_CENTER_MBPS:
-            continue
         hours = s["Hour"].to_numpy()
         busy = (hours >= BUSY_START) & (hours <= BUSY_END)
         offpeak = ~busy
         night = (hours >= NIGHT_START) & (hours <= NIGHT_END)
+        days = s["Date"].dt.date.to_numpy()
+
+        # Two ways to find the cap. The crowded level (sample-snap shape) is
+        # tried first; if the trace is not crowded on one level, the top of
+        # the trace is tried as a hard ceiling. The first one that passes
+        # every test decides the site.
+        candidates = []
+        center, tol, band = find_plateau(rx)
         overshoot = float(np.quantile(rx, 0.99) - center)
-        overshoot_limit = max(OVERSHOOT_MBPS, OVERSHOOT_FRAC * center)
-        if overshoot > overshoot_limit:
+        if center >= MIN_CENTER_MBPS and overshoot <= max(
+            OVERSHOOT_MBPS, OVERSHOOT_FRAC * center
+        ):
+            candidates.append((CAP_CROWDED, center, tol, band))
+        c_center, c_tol, c_band, c_above = find_ceiling(rx)
+        if c_center >= MIN_CENTER_MBPS and c_above <= CEIL_MAX_ABOVE:
+            candidates.append((CAP_CEILING, c_center, c_tol, c_band))
+
+        chosen = None
+        for cap_type, center, tol, band in candidates:
+            in_band_std = float(np.std(rx[band])) if band.any() else 999.0
+            if in_band_std > max(STD_MBPS, STD_FRAC * center):
+                continue
+            day_on: dict = defaultdict(int)
+            day_busy: dict = defaultdict(int)
+            day_off: dict = defaultdict(int)
+            for day, flag, is_busy in zip(days, band, busy):
+                if not flag:
+                    continue
+                day_on[day] += 1
+                if is_busy:
+                    day_busy[day] += 1
+                else:
+                    day_off[day] += 1
+            days_on_cap = sum(v >= STUCK_DAY_HOURS for v in day_on.values())
+            week_flag = days_on_cap >= MIN_DAYS_ON_CAP
+            last_on = int(day_on.get(last_day, 0))
+            last_flag = last_on >= LAST_DAY_HOURS
+            if week_flag or last_flag:
+                chosen = (cap_type, center, tol, band, in_band_std)
+                break
+        if chosen is None:
             continue
-        in_band_std = float(np.std(rx[band])) if band.any() else 999.0
-        if in_band_std > max(STD_MBPS, STD_FRAC * center):
-            continue
+        cap_type, center, tol, band, in_band_std = chosen
+        overshoot = float(np.quantile(rx, 0.99) - center)
+        last_busy = int(day_busy.get(last_day, 0))
+        last_off = int(day_off.get(last_day, 0))
+        days_total = int(s["Date"].dt.normalize().nunique())
 
         hours_pct = 100.0 * float(band.mean())
         run = longest_run(s["ts"].to_numpy(), band)
-
-        day_on: dict = defaultdict(int)
-        day_busy: dict = defaultdict(int)
-        day_off: dict = defaultdict(int)
-        for day, flag, is_busy in zip(s["Date"].dt.date, band, busy):
-            if not flag:
-                continue
-            day_on[day] += 1
-            if is_busy:
-                day_busy[day] += 1
-            else:
-                day_off[day] += 1
-        days_on_cap = sum(v >= STUCK_DAY_HOURS for v in day_on.values())
-        days_total = int(s["Date"].dt.normalize().nunique())
-        week_flag = days_on_cap >= MIN_DAYS_ON_CAP
-        last_on = int(day_on.get(last_day, 0))
-        last_busy = int(day_busy.get(last_day, 0))
-        last_off = int(day_off.get(last_day, 0))
-        last_flag = last_on >= LAST_DAY_HOURS
-        if not week_flag and not last_flag:
-            continue
 
         bw = float(np.median(s["TxBW"].to_numpy()))
         if bw <= 0:
@@ -273,6 +332,7 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
             {
                 "site": site,
                 "finding": classify(util),
+                "cap_type": cap_type,
                 "bw": bw,
                 "center": center,
                 "tol": tol,
@@ -610,6 +670,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
             f"   ·   scored on {rec['start'].strftime('%-d-%b-%y')} – {rec['end'].strftime('%-d-%b-%y')}, all hours"
             f"   ·   {rec['cap_when']}"
+            f"   ·   cap shape: {rec['cap_type']}"
             f"   ·   {rec['listed_by']}"
             f"   ·   last day: {last_day_text(rec)}"
             f"   ·   snapshot is the latest 3 days "
@@ -850,21 +911,33 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
     ws.merge_range("A11:B11", "Rule applied to every site", styles["section"])
     rules = [
         (
-            "Stuck level",
+            f"Cap shape 1 — {CAP_CROWDED}",
             "The level in the upper half of the trace that contains the most "
             f"hourly samples inside ±{TOL_MBPS:.1f} Mbit/s "
             f"(or ±{TOL_FRAC:.0%} of the 95th percentile, when that is wider). "
-            "The level is the median of those samples.",
+            "The level is the median of those samples. The 99th percentile of "
+            f"RxMaxSpeed may sit at most {OVERSHOOT_MBPS:.0f} Mbit/s above it "
+            f"(or {OVERSHOOT_FRAC:.0%} of the level, when that is wider). "
+            "This is the DHAPT35 / DHAPT48 shape: the line locks to one level.",
         ),
         (
-            "Hard ceiling",
-            "The 99th percentile of hourly RxMaxSpeed may sit at most "
-            f"{OVERSHOOT_MBPS:.0f} Mbit/s above the stuck level "
-            f"(or {OVERSHOOT_FRAC:.0%} of the stuck level, when that is wider). "
-            "One odd hour above the cap is ignored. If the trace still climbs "
-            "well above the crowded level (spikes of tens to hundreds of Mbit/s, "
-            "as on DHGULN2, DHDHN40, DHBDD32, DHDHN09), that level is an outlier "
-            "busy cluster, not a choke, and the site is not listed.",
+            f"Cap shape 2 — {CAP_CEILING}",
+            "Tried when shape 1 does not fit. The same search is run only over "
+            f"the top {1 - CEIL_TOP_Q:.0%} of the samples, so the level is the top "
+            "the trace keeps returning to. The line may not go above that top "
+            f"by more than {CEIL_OVER_MBPS:.0f} Mbit/s (or {CEIL_OVER_FRAC:.0%}); "
+            f"at most {CEIL_MAX_ABOVE} glitch hour is excused. This catches ports "
+            "that move up and down during the day but are clipped at one value "
+            "every time they rise (the ~500 Mbit/s group such as DHSVRS5, "
+            "GPSDR01, DHKKT87, and DHKKTE2 whose cap moved from 270 to 352). "
+            "Cap shape is shown on the site list.",
+        ),
+        (
+            "Not listed (outliers)",
+            "A trace whose peaks keep changing — spikes of tens to hundreds of "
+            "Mbit/s above the crowded level and no fixed top (DHGULN2, DHDHN40, "
+            "DHBDD32, DHDHN09) — fails both shapes. It is busy, not choked, and is "
+            "not listed.",
         ),
         (
             "Analysis window",
@@ -933,7 +1006,7 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ws.write(r, 0, key, styles["method_key"])
         ws.write(r, 1, val, styles["method_val"])
 
-    foot = 24
+    foot = 11 + len(rules) + 1
     ws.set_row(foot, 20)
     ws.merge_range(foot, 0, foot, 1, "Check against the sample snaps", styles["section"])
     ws.set_row(foot + 1, 36)
@@ -967,7 +1040,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v13.xlsx",
+        default="FEGE_Choked_Flat_Sites_v14.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1009,6 +1082,12 @@ def main() -> None:
     print("Where capped:")
     for name in ("Busy + off-peak", "Busy hours", "Off-peak", "Partial"):
         print(f"  {name}: {by_when[name]}")
+    by_shape = defaultdict(int)
+    for rec in records:
+        by_shape[rec["cap_type"]] += 1
+    print("Cap shape:")
+    for name in (CAP_CROWDED, CAP_CEILING):
+        print(f"  {name}: {by_shape[name]}")
     print("Sample snaps:")
     for rec in records:
         if rec["reference"]:
@@ -1115,7 +1194,8 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         f"Scored on {period_txt} (latest {ANALYSIS_DAYS} days). "
         f"Listed when ≥{MIN_DAYS_ON_CAP} days have ≥{STUCK_DAY_HOURS} hours on the cap "
         f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
-        "Jagged traces that still spike well above the crowded level are outliers and are not listed. "
+        "Two cap shapes count: a crowded flat level (DHAPT35 shape) or a hard ceiling the trace "
+        "is clipped at and never rises above. Jagged traces with changing peaks are not listed. "
         "Each snapshot is the latest 3 days only. Open a site name to see it.",
         styles["note"],
     )
@@ -1208,36 +1288,38 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws = book.add_worksheet("1. Site List")
     _page(ws, "FEGE choked / flat sites")
 
-    widths = [5, 14, 14, 12, 14, 13, 11, 16, 16, 12, 32, 18, 12, 14, 12]
+    widths = [5, 14, 14, 14, 12, 14, 13, 11, 16, 16, 12, 32, 18, 12, 14, 12]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
     ws.set_row(0, 28)
-    ws.merge_range("A1:O1", "FEGE transmission — choked and flat sites (latest 7 days)", styles["title"])
+    ws.merge_range("A1:P1", "FEGE transmission — choked and flat sites (latest 7 days)", styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
-        "A2:O2",
+        "A2:P2",
         f"DHK 5G sites    ·    {period_txt}    ·    hourly    ·    "
         f"{n_sites} sites checked    ·    {len(records)} with RxMaxSpeed stuck flat",
         styles["subtitle"],
     )
     ws.set_row(2, 32)
     ws.merge_range(
-        "A3:O3",
+        "A3:P3",
         "RxMaxSpeed (Mbit/s)  =  VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000"
         "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000"
         f"          Source: {source_name}",
         styles["meta"],
     )
-    ws.set_row(3, 32)
+    ws.set_row(3, 40)
     ws.merge_range(
-        "A4:O4",
+        "A4:P4",
         f"Scored on {period_txt} (16-Sep-26 to 22-Sep-26). "
         f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
         f"(busy 08:00–22:00 and off-peak / night). "
         f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day sit on the cap. "
-        "Outlier traces that keep climbing above the crowded level (DHGULN2-type spikes) are removed. "
+        f"Cap shape: '{CAP_CROWDED}' = line locks to one level (DHAPT35 shape); "
+        f"'{CAP_CEILING}' = line moves but is clipped at one top and never rises above it. "
+        "Traces whose peaks keep changing (DHGULN2-type spikes) are not listed. "
         "The snapshot is the latest 3 days only. Open a site name to jump to it. Full rule on sheet 4.",
         styles["note"],
     )
@@ -1246,6 +1328,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         "No.",
         "eNodeB Name",
         "Finding",
+        "Cap shape",
         "Tx Total BW (Mbit/s)",
         "Stuck RxMaxSpeed (Mbit/s)",
         "Max RxMaxSpeed (Mbit/s)",
@@ -1281,37 +1364,38 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
             string=rec["site"],
         )
         ws.write_string(row, 2, rec["finding"], _finding_format(styles, rec["finding"], zebra))
-        ws.write_number(row, 3, rec["bw"], n)
-        ws.write_number(row, 4, rec["center"], n)
-        ws.write_number(row, 5, rec["max_rx"], n)
-        ws.write_number(row, 6, rec["util"], styles["pct_z"] if zebra else styles["pct"])
+        ws.write_string(row, 3, rec["cap_type"], c)
+        ws.write_number(row, 4, rec["bw"], n)
+        ws.write_number(row, 5, rec["center"], n)
+        ws.write_number(row, 6, rec["max_rx"], n)
+        ws.write_number(row, 7, rec["util"], styles["pct_z"] if zebra else styles["pct"])
         ws.write_string(
             row,
-            7,
+            8,
             f"{rec['hours_on']}/{rec['hours_n']} ({rec['hours_pct']:.1f}%)",
             c,
         )
-        ws.write_string(row, 8, rec["cap_when"], c)
-        ws.write_string(row, 9, f"{rec['days_on_cap']}/{rec['days_total']}", c)
+        ws.write_string(row, 9, rec["cap_when"], c)
+        ws.write_string(row, 10, f"{rec['days_on_cap']}/{rec['days_total']}", c)
         last_txt = last_day_text(rec)
-        ws.write_string(row, 10, last_txt, styles["yes"] if rec["last_flag"] else c)
-        ws.write_string(row, 11, rec["listed_by"], c)
-        ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        ws.write_string(row, 11, last_txt, styles["yes"] if rec["last_flag"] else c)
+        ws.write_string(row, 12, rec["listed_by"], c)
+        ws.write_number(row, 13, rec["longest"], styles["int_z"] if zebra else styles["int"])
         if np.isfinite(rec["night_rx"]):
-            ws.write_number(row, 13, rec["night_rx"], n)
-        else:
-            ws.write_string(row, 13, "—", c)
-        if rec["reference"]:
-            ws.write_string(row, 14, "Yes", styles["yes"])
+            ws.write_number(row, 14, rec["night_rx"], n)
         else:
             ws.write_string(row, 14, "—", c)
+        if rec["reference"]:
+            ws.write_string(row, 15, "Yes", styles["yes"])
+        else:
+            ws.write_string(row, 15, "—", c)
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.freeze_panes(header_row + 1, 0)
     ws.repeat_rows(header_row, header_row)
 
-    last_col = 14
+    last_col = 15
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, last_col, "How to read Finding", styles["section"])
@@ -1367,11 +1451,13 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     counts = defaultdict(int)
     listed = defaultdict(int)
     when = defaultdict(int)
+    shapes = defaultdict(int)
     last_n = 0
     for rec in records:
         counts[rec["finding"]] += 1
         listed[rec["listed_by"]] += 1
         when[rec["cap_when"]] += 1
+        shapes[rec["cap_type"]] += 1
         last_n += int(rec["last_flag"])
     count_row = last_help + 3
     ws.write(count_row, 0, "Count", styles["label"])
@@ -1424,11 +1510,23 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         f"Off-peak: {when['Off-peak']}    ·    Partial: {when['Partial']}",
         styles["meta"],
     )
-    ws.set_row(count_row + 3, 20)
+    ws.set_row(count_row + 3, 18)
+    ws.write(count_row + 3, 0, "Shape", styles["label"])
     ws.merge_range(
-        count_row + 3,
+        count_row + 3, 1, count_row + 3, 4,
+        f"{CAP_CROWDED}: {shapes[CAP_CROWDED]}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 3, 5, count_row + 3, last_col,
+        f"{CAP_CEILING}: {shapes[CAP_CEILING]}",
+        styles["meta"],
+    )
+    ws.set_row(count_row + 4, 20)
+    ws.merge_range(
+        count_row + 4,
         0,
-        count_row + 3,
+        count_row + 4,
         last_col,
         f"Window is {period_txt}. "
         f"7-day rule: ≥{MIN_DAYS_ON_CAP} days with ≥{STUCK_DAY_HOURS} hours on the cap. "
