@@ -10,7 +10,8 @@ A site is listed only when RxMaxSpeed is pinned to one hard ceiling the way
 the sample charts show for DHAPT35 and DHAPT48: after the night dip the line
 sits flat, and it cannot climb above that level.
 
-The rule is applied to every site over the whole hourly history in the file.
+The rule is applied to every site using only 20–22 Sep 2026. No other
+date in the source file is used for the summary, the site list, or the charts.
 """
 
 from __future__ import annotations
@@ -152,6 +153,10 @@ FINDING_NOTES = (
     ),
 )
 SNAP_DAYS = 3
+# Preparation window. Summary, site list, hourly rows, and charts use these
+# dates only. Earlier days in the source file are ignored.
+REPORT_START = pd.Timestamp("2026-09-20")
+REPORT_END = pd.Timestamp("2026-09-22")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
@@ -165,6 +170,13 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     work["ts"] = work["Date"] + pd.to_timedelta(work["Hour"], unit="h")
     work = work.sort_values(["eNodeB Name", "ts"])
     work = work.drop_duplicates(["eNodeB Name", "ts"], keep="last")
+    # 20–22 Sep only. Busy hours, the stuck level, and the site list are
+    # calculated on this window. Other dates in the file are not used.
+    work = work[(work["Date"] >= REPORT_START) & (work["Date"] <= REPORT_END)].copy()
+    if work.empty:
+        raise SystemExit(
+            f"No hourly rows from {REPORT_START.date()} to {REPORT_END.date()}."
+        )
 
     records: list[dict] = []
     on_cap = np.zeros(len(work), dtype=bool)
@@ -530,7 +542,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   vs Tx BW {rec['util']:.1f}%"
             f"   ·   longest flat run {rec['longest']} h"
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
-            f"   ·   chart is the latest {SNAP_DAYS} days "
+            f"   ·   20–22 Sep only "
             f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
             f"hours 00:00–23:00 under each date",
             styles["note"],
@@ -804,8 +816,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         (
             "Repeats across days",
             f"A day counts as on-cap when at least {STUCK_DAY_BUSY_HOURS} busy hours "
-            "are on the stuck level. This must happen on at least "
-            f"{MIN_DAY_FRACTION:.0%} of the days in the file (and on at least 3 days).",
+            "are on the stuck level. Only 20, 21 and 22 Sep are counted. "
+            f"This must happen on at least {MIN_DAY_FRACTION:.0%} of those days "
+            "(and on at least 3 days).",
         ),
         (
             "Continuous flat run",
@@ -878,7 +891,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v7.xlsx",
+        default="FEGE_Choked_Flat_Sites_v8.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1007,11 +1020,10 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         0,
         5,
         7,
-        "Sites are grouped by the finding note. A site is listed when at least "
-        f"{MIN_BUSY_PCT:.0f}% of busy hours (08:00–22:00) sit on one flat ceiling. "
-        "Snapshots show only the latest 3 days. Each day has hours 00:00–23:00 "
-        "on the top axis row, and the date once in the box under that day. "
-        "Open a site name to see its chart.",
+        "Prepared from 20–22 Sep 2026 only. No other date is used. "
+        f"A site is listed when at least {MIN_BUSY_PCT:.0f}% of busy hours "
+        "(08:00–22:00) on those three days sit on one flat ceiling. "
+        "Each chart shows 00:00–23:00 under that date. Open a site name to see it.",
         styles["note"],
     )
 
@@ -1127,9 +1139,9 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(3, 32)
     ws.merge_range(
         "A4:L4",
-        "Cutoff on Busy hours on cap is 10% of 08:00–22:00 (same flat top as "
-        "DHAPT35 and DHAPT48, within ±4 Mbit/s). Sites from 10% upward are listed, "
-        "including ones that are flat for only part of the period. "
+        "Prepared from 20–22 Sep 2026 only. Other dates in the source file are "
+        "not used. Cutoff on Busy hours on cap is 10% of 08:00–22:00 on those "
+        "three days (same flat top as DHAPT35 and DHAPT48, within ±4 Mbit/s). "
         "Open a site name to jump to its snapshot. The full rule is on sheet 4.",
         styles["note"],
     )
