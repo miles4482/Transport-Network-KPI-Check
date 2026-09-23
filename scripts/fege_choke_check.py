@@ -40,10 +40,10 @@ NIGHT_END = 6  # inclusive, the valley on the sample charts
 # Separately, the last day is flagged when at least 2 hours sit on the ceiling.
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
-# A few hours may sit a little above the crowded level. 40 Mbit/s (or 12% of
-# the level) still reads as a ceiling; a trace that keeps climbing past that
-# is not a hard week-long cap, but the site can still be listed on the
-# 3-day / last-day rules below.
+# Hard ceiling. A few hours may sit a little above the crowded level.
+# 40 Mbit/s (or 12% of the level) still reads as a cap. If the 99th
+# percentile climbs past that, the crowded level is a busy cluster with
+# spikes (the DHGULN2 / DHDHN40 / DHBDD32 / DHDHN09 shape), not a choke.
 OVERSHOOT_MBPS = 40.0
 OVERSHOOT_FRAC = 0.12
 MIN_RUN_HOURS = 3
@@ -225,6 +225,9 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         offpeak = ~busy
         night = (hours >= NIGHT_START) & (hours <= NIGHT_END)
         overshoot = float(np.quantile(rx, 0.99) - center)
+        overshoot_limit = max(OVERSHOOT_MBPS, OVERSHOOT_FRAC * center)
+        if overshoot > overshoot_limit:
+            continue
         in_band_std = float(np.std(rx[band])) if band.any() else 999.0
         if in_band_std > max(STD_MBPS, STD_FRAC * center):
             continue
@@ -859,8 +862,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"{OVERSHOOT_MBPS:.0f} Mbit/s above the stuck level "
             f"(or {OVERSHOOT_FRAC:.0%} of the stuck level, when that is wider). "
             "One odd hour above the cap is ignored. If the trace still climbs "
-            "well above the crowded level, that level is a busy cluster, not a cap, "
-            "and the site is not listed.",
+            "well above the crowded level (spikes of tens to hundreds of Mbit/s, "
+            "as on DHGULN2, DHDHN40, DHBDD32, DHDHN09), that level is an outlier "
+            "busy cluster, not a choke, and the site is not listed.",
         ),
         (
             "Analysis window",
@@ -963,7 +967,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v12.xlsx",
+        default="FEGE_Choked_Flat_Sites_v13.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1111,6 +1115,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         f"Scored on {period_txt} (latest {ANALYSIS_DAYS} days). "
         f"Listed when ≥{MIN_DAYS_ON_CAP} days have ≥{STUCK_DAY_HOURS} hours on the cap "
         f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
+        "Jagged traces that still spike well above the crowded level are outliers and are not listed. "
         "Each snapshot is the latest 3 days only. Open a site name to see it.",
         styles["note"],
     )
@@ -1232,6 +1237,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
         f"(busy 08:00–22:00 and off-peak / night). "
         f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day sit on the cap. "
+        "Outlier traces that keep climbing above the crowded level (DHGULN2-type spikes) are removed. "
         "The snapshot is the latest 3 days only. Open a site name to jump to it. Full rule on sheet 4.",
         styles["note"],
     )
