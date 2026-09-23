@@ -30,19 +30,18 @@ BUSY_END = 22  # inclusive
 NIGHT_START = 2
 NIGHT_END = 6  # inclusive, the valley on the sample charts
 
-# Flat-cap test, relaxed so a site is listed when the busy-hour trace
-# spends a quarter of its time on a ceiling, not only when it is pinned
-# there for most of the day. The band is still a few Mbit/s wide: a normal
-# busy trace, whose top hours wander by tens of Mbit/s, does not qualify.
+# Flat-cap test. A site is listed when at least 10% of busy hours sit on
+# one hard ceiling (the second sample snap is the shape; the share of hours
+# on that ceiling can be much lower than a fully pinned day).
 # DHAPT35 sits near 269–270 and DHAPT48 near 240–243, both well inside this band.
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
 OVERSHOOT_MBPS = 10.0
 OVERSHOOT_FRAC = 0.04
-MIN_BUSY_PCT = 25.0
-MIN_RUN_HOURS = 4
-STUCK_DAY_BUSY_HOURS = 4
-MIN_DAY_FRACTION = 0.25
+MIN_BUSY_PCT = 10.0
+MIN_RUN_HOURS = 3
+STUCK_DAY_BUSY_HOURS = 2
+MIN_DAY_FRACTION = 0.20
 STD_MBPS = 2.5
 STD_FRAC = 0.01
 MIN_CENTER_MBPS = 20.0
@@ -150,6 +149,7 @@ FINDING_NOTES = (
     ),
 )
 SNAP_DAYS = 3
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
@@ -467,18 +467,22 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         data.write(0, c0 + 2, "Rx")
         dates: list[str] = []
         times: list[str] = []
-        for r, (_, row) in enumerate(s.iterrows(), start=1):
+        # One point every 2 hours, so the axis matches the sample snap:
+        # 00:00, 02:00, 04:00 ... under the line, and 20/Sep centered under that day.
+        r = 0
+        for _, row in s.iterrows():
             stamp = row["ts"].to_pydatetime()
-            date_label = f"{stamp.day}/{stamp.strftime('%b')}"
-            # Label every 2 hours (00:00, 02:00, ...) the way the sample snap does.
-            # The point itself is still plotted for every hour.
-            hour_label = f"{stamp.hour:02d}:00" if stamp.hour % 2 == 0 else ""
+            if stamp.hour % 2 != 0:
+                continue
+            r += 1
+            date_label = f"{stamp.day}/{MONTHS[stamp.month - 1]}"
+            hour_label = f"{stamp.hour:02d}:00"
             dates.append(date_label)
             times.append(hour_label)
             data.write_string(r, c0, date_label, cat_fmt)
             data.write_string(r, c0 + 1, hour_label, cat_fmt)
             data.write_number(r, c0 + 2, float(row["Rx"]))
-        n = len(s)
+        n = r
 
         ws.set_row(top, 26)
         banner = (
@@ -511,7 +515,8 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   longest flat run {rec['longest']} h"
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
             f"   ·   chart is the latest {SNAP_DAYS} days "
-            f"({chart_start.strftime('%d %b')} – {chart_end.strftime('%d %b %Y')}), one point per hour",
+            f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
+            f"point every 2 hours (00:00, 02:00, …)",
             styles["note"],
         )
 
@@ -538,7 +543,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         # Categories cover Date and Time, so Excel draws both levels.
         chart.add_series(
             {
-                "name": "RxMaxSpeed (Mbit/s)",
+                "name": "Sum of RxMaxSpeed,Mbps",
                 "categories": ["_ChartData", 1, c0, n, c0 + 1],
                 # Date is the outer axis level, hour is the level next to the line.
                 "categories_data": [dates, times],
@@ -551,7 +556,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             {
                 "name": "Date & Time",
                 "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
-                "num_font": {"name": "Calibri", "size": 8},
+                "num_font": {"name": "Calibri", "size": 9},
                 "label_position": "low",
                 "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
                 "minor_gridlines": {"visible": False},
@@ -559,7 +564,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         )
         chart.set_y_axis(
             {
-                "name": "Mbit/s",
+                "name": "MB/s",
                 "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
                 "num_font": {"name": "Calibri", "size": 9},
                 "min": 0,
@@ -571,8 +576,8 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
         chart.set_plotarea({"border": {"color": "#BFBFBF"}, "fill": {"color": "white"}})
-        # Three days, hour labels every 2 hours, same shape as the sample snap.
-        chart.set_size({"width": 1080, "height": 360})
+        # Three days at a 2-hour step, same date/time axis as the sample snap.
+        chart.set_size({"width": 1100, "height": 380})
         ws.insert_chart(top + 4, 0, chart, {"x_offset": 6, "y_offset": 6})
 
         for r in range(top + 4, top + block):
@@ -829,7 +834,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v4.xlsx",
+        default="FEGE_Choked_Flat_Sites_v5.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1076,7 +1081,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(3, 32)
     ws.merge_range(
         "A4:L4",
-        "Flexible rule: listed when at least a quarter of busy hours (08:00–22:00) sit "
+        "Flexible rule: listed when at least 10% of busy hours (08:00–22:00) sit "
         "within ±4 Mbit/s of one hard ceiling, the same flat top as DHAPT35 and DHAPT48. "
         "Open a site name to jump to its snapshot. The full rule is on sheet 4.",
         styles["note"],
