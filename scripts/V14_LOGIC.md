@@ -53,4 +53,11 @@ Hard ceiling adds: DHDHN04, DHGUL16, DHGUL42, DHKKT87, DHKKTE2, DHSVRC0, DHSVRS5
 
 ## Later work
 
-Keep this rule as the baseline. If the rule or chart changes, write `FEGE_Choked_Flat_Sites_v15.xlsx` and leave v14 as the freeze point.
+Keep this **detection rule** as the baseline. Presentation changed in **v15** (same 78 sites, same two shapes):
+
+- Report title: **TX Port Choke Check**
+- Do not grade sites as At / Above / Below Tx BW. RAN-side Tx Total BW is a column only.
+- Severity from hours on cap: Severe ≥50%, High ≥25%, Moderate ≥10%, Low <10%.
+- Sheet `2. Snapshots` renamed to `2. HourlyChartOfIssueSites`.
+- The long note under each chart KPI strip is removed.
+- File: `FEGE_Choked_Flat_Sites_v15.xlsx`

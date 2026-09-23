@@ -71,9 +71,17 @@ STD_MBPS = 2.5
 STD_FRAC = 0.01
 MIN_CENTER_MBPS = 20.0
 
-# How the stuck level compares with the configured FEGE Tx bandwidth.
-AT_BW_LOW = 0.85
-AT_BW_HIGH = 1.20
+# Severity is hours on the cap as a share of the 7-day window.
+# RAN-side Tx Total BW is shown as a column only; it is not used to judge.
+SEV_SEVERE_PCT = 50.0
+SEV_HIGH_PCT = 25.0
+SEV_MODERATE_PCT = 10.0
+SEV_SEVERE = "Severe"
+SEV_HIGH = "High"
+SEV_MODERATE = "Moderate"
+SEV_LOW = "Low"
+REPORT_TITLE = "TX Port Choke Check"
+SNAP_SHEET = "2. HourlyChartOfIssueSites"
 
 # Sites on the two sample charts. The report must contain both.
 REFERENCE_SITES = ("DHAPT35", "DHAPT48")
@@ -172,32 +180,39 @@ def longest_run(ts: np.ndarray, band: np.ndarray) -> int:
     return int(longest)
 
 
-def classify(util: float) -> str:
-    if util >= AT_BW_HIGH:
-        return "Above Tx BW"
-    if util >= AT_BW_LOW:
-        return "At Tx BW"
-    return "Below Tx BW"
+def severity(hours_pct: float) -> str:
+    """How hard the port is sitting on the cap, from hours-on-cap share."""
+    if hours_pct >= SEV_SEVERE_PCT:
+        return SEV_SEVERE
+    if hours_pct >= SEV_HIGH_PCT:
+        return SEV_HIGH
+    if hours_pct >= SEV_MODERATE_PCT:
+        return SEV_MODERATE
+    return SEV_LOW
 
 
-FINDING_ORDER = {"At Tx BW": 0, "Above Tx BW": 1, "Below Tx BW": 2}
-FINDING_NOTES = (
+SEVERITY_ORDER = {SEV_SEVERE: 0, SEV_HIGH: 1, SEV_MODERATE: 2, SEV_LOW: 3}
+SEVERITY_NOTES = (
     (
-        "At Tx BW",
-        "Stuck level is 85% to 120% of the FEGE Tx Total BW counter. "
-        "This is the sample-snap case: nominal bandwidth is 250 Mbit/s and the "
-        "measured cap sits around 220–280 Mbit/s. The port is full.",
+        SEV_SEVERE,
+        f"Severe: the port sat on the cap at least {SEV_SEVERE_PCT:.0f}% of hours "
+        "in the latest 7 days. This is the DHAPT35 / DHAPT48 case — the line is "
+        "locked for most of the week.",
     ),
     (
-        "Above Tx BW",
-        "The trace is flat, and the cap is more than 20% above the Tx Total BW "
-        "counter. Speed is still stuck; the bandwidth counter and the real limit "
-        "do not agree.",
+        SEV_HIGH,
+        f"High: {SEV_HIGH_PCT:.0f}% to {SEV_SEVERE_PCT:.0f}% of hours on the cap. "
+        "The choke is clear on several days, but the port is not locked all week.",
     ),
     (
-        "Below Tx BW",
-        "The trace is flat at less than 85% of Tx Total BW. RxMaxSpeed is stuck, "
-        "so transmission is limited below the configured FEGE bandwidth.",
+        SEV_MODERATE,
+        f"Moderate: {SEV_MODERATE_PCT:.0f}% to {SEV_HIGH_PCT:.0f}% of hours on the cap. "
+        "Enough repeating hours to list the site, but the wall is not all-day.",
+    ),
+    (
+        SEV_LOW,
+        f"Low: under {SEV_MODERATE_PCT:.0f}% of hours on the cap. Usually a hard "
+        "ceiling (clipped top) or a last-day flag. Still choked — just fewer hours.",
     ),
 )
 SNAP_DAYS = 3
@@ -331,7 +346,7 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         records.append(
             {
                 "site": site,
-                "finding": classify(util),
+                "severity": severity(hours_pct),
                 "cap_type": cap_type,
                 "bw": bw,
                 "center": center,
@@ -375,7 +390,7 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     listed_order = {"≥3 days + last day": 0, "≥3 days": 1, "Last day": 2}
     records.sort(
         key=lambda r: (
-            FINDING_ORDER[r["finding"]],
+            SEVERITY_ORDER[r["severity"]],
             listed_order[r["listed_by"]],
             -r["hours_pct"],
             r["site"],
@@ -465,6 +480,38 @@ def _styles(book):
             bg_color=ORANGE,
             font_color=ORANGE_FONT,
         ),
+        "severe": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color="#F4CCCC",
+            font_color="#990000",
+        ),
+        "high": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=ORANGE,
+            font_color=ORANGE_FONT,
+        ),
+        "moderate": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=AMBER,
+            font_color=AMBER_FONT,
+        ),
+        "low": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=GREEN,
+            font_color=GREEN_FONT,
+        ),
         "above": fmt(
             border=1,
             border_color=LINE,
@@ -543,12 +590,14 @@ def _styles(book):
     }
 
 
-def _finding_format(styles, finding: str, zebra: bool):
-    if finding == "At Tx BW":
-        return styles["at"]
-    if finding == "Above Tx BW":
-        return styles["above"]
-    return styles["below"]
+def _severity_format(styles, level: str, zebra: bool):
+    if level == SEV_SEVERE:
+        return styles["severe"]
+    if level == SEV_HIGH:
+        return styles["high"]
+    if level == SEV_MODERATE:
+        return styles["moderate"]
+    return styles["low"]
 
 
 def _page(ws, title: str, *, fit_width: bool = True):
@@ -559,7 +608,7 @@ def _page(ws, title: str, *, fit_width: bool = True):
     # two-row date/time axis into one overlapping band.
     if fit_width:
         ws.fit_to_pages(1, 0)
-    ws.set_header(f"&L&8&K1F4E79{title}&R&8FEGE port  |  DHK")
+    ws.set_header(f"&L&8&K1F4E79{title}&R&8{REPORT_TITLE}  |  DHK")
     ws.set_footer("&L&8Choked = RxMaxSpeed stuck flat&R&8Page &P of &N")
     ws.hide_gridlines(2)
     ws.set_tab_color(NAVY)
@@ -573,8 +622,8 @@ def _chart_y_max(values: list[float]) -> int:
 
 
 def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
-    ws = book.add_worksheet("2. Snapshots")
-    _page(ws, "RxMaxSpeed snapshots", fit_width=False)
+    ws = book.add_worksheet(SNAP_SHEET)
+    _page(ws, "Hourly chart of issue sites", fit_width=False)
     ws.set_zoom(100)
     ws.set_print_scale(100)
     ws.set_tab_color(BLUE)
@@ -640,7 +689,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
 
         ws.set_row(top, 26)
         banner = (
-            f"{i + 1:02d}    {site}    ·    {rec['finding']}"
+            f"{i + 1:02d}    {site}    ·    {rec['severity']}"
             + ("    ·    sample snap" if rec["reference"] else "")
         )
         ws.merge_range(top, 0, top, 7, banner, styles["banner"])
@@ -658,26 +707,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         for col, _label, value in labels:
             ws.merge_range(top + 2, col, top + 2, col + 1, value, styles["kpi_value"])
 
-        ws.set_row(top + 3, 28)
-        ws.merge_range(
-            top + 3,
-            0,
-            top + 3,
-            7,
-            f"Max {rec['max_rx']:.2f} Mbit/s"
-            f"   ·   vs Tx BW {rec['util']:.1f}%"
-            f"   ·   longest flat run {rec['longest']} h"
-            f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
-            f"   ·   scored on {rec['start'].strftime('%-d-%b-%y')} – {rec['end'].strftime('%-d-%b-%y')}, all hours"
-            f"   ·   {rec['cap_when']}"
-            f"   ·   cap shape: {rec['cap_type']}"
-            f"   ·   {rec['listed_by']}"
-            f"   ·   last day: {last_day_text(rec)}"
-            f"   ·   snapshot is the latest 3 days "
-            f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
-            f"hourly 00:00–23:00 with date grouped by day",
-            styles["note"],
-        )
+        ws.set_row(top + 3, 8)
 
         if n == 0:
             ws.merge_range(
@@ -978,19 +1008,19 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"(or {STD_FRAC:.0%} of the stuck level, when that is wider).",
         ),
         (
-            "At Tx BW",
-            f"Stuck level is between {AT_BW_LOW:.0%} and {AT_BW_HIGH:.0%} of "
-            "median Tx Total BW. Same region as the two sample snaps.",
+            "Severity",
+            f"Severe ≥ {SEV_SEVERE_PCT:.0f}% of hours on the cap; "
+            f"High {SEV_HIGH_PCT:.0f}–{SEV_SEVERE_PCT:.0f}%; "
+            f"Moderate {SEV_MODERATE_PCT:.0f}–{SEV_HIGH_PCT:.0f}%; "
+            f"Low under {SEV_MODERATE_PCT:.0f}%. "
+            "This is the share of hours sitting on the wall, not a comparison "
+            "with the RAN Tx Total BW counter.",
         ),
         (
-            "Above Tx BW",
-            f"Stuck level is above {AT_BW_HIGH:.0%} of median Tx Total BW. "
-            "The speed is stuck, but higher than the bandwidth counter.",
-        ),
-        (
-            "Below Tx BW",
-            f"Stuck level is below {AT_BW_LOW:.0%} of median Tx Total BW. "
-            "The speed is stuck under the configured FEGE bandwidth.",
+            "Tx Total BW column",
+            "VS.FEGE.TxTotalBW is a RAN-side counter, not the transmission "
+            "engineered bandwidth. It is shown for reference only and is not "
+            "used to list or grade a site.",
         ),
         (
             "Night Rx",
@@ -1040,7 +1070,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v14.xlsx",
+        default="FEGE_Choked_Flat_Sites_v15.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1060,14 +1090,15 @@ def main() -> None:
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
     _write_workbook(output, source.name, work, records)
 
-    by_finding = defaultdict(int)
+    by_sev = defaultdict(int)
     for rec in records:
-        by_finding[rec["finding"]] += 1
+        by_sev[rec["severity"]] += 1
     print(f"Window: {work['Date'].min().date()} – {work['Date'].max().date()} ({ANALYSIS_DAYS} days, all hours)")
     print(f"Sites checked: {work['eNodeB Name'].nunique()}")
-    print(f"Choked / flat: {len(records)}")
-    for name in ("At Tx BW", "Above Tx BW", "Below Tx BW"):
-        print(f"  {name}: {by_finding[name]}")
+    print(f"Issue sites: {len(records)}")
+    print("Severity (hours on cap):")
+    for name in (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW):
+        print(f"  {name}: {by_sev[name]}")
     by_when = defaultdict(int)
     by_listed = defaultdict(int)
     last_n = 0
@@ -1103,10 +1134,10 @@ def main() -> None:
 def _write_summary(book, styles, source_name, period_txt, n_sites, records):
     """One sheet that shows the result without opening the other pages."""
     ws = book.add_worksheet("Summary")
-    _page(ws, "FEGE choke check — at a glance")
+    _page(ws, REPORT_TITLE)
     ws.set_tab_color("#C65911")
 
-    widths = [6, 14, 14, 14, 12, 14, 32, 18]
+    widths = [6, 14, 14, 14, 14, 14, 32, 18]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
@@ -1157,22 +1188,27 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
 
     counts = defaultdict(int)
     for rec in records:
-        counts[rec["finding"]] += 1
+        counts[rec["severity"]] += 1
 
     ws.set_row(0, 28)
-    ws.merge_range("A1:H1", "FEGE choke check — at a glance", styles["title"])
+    ws.merge_range("A1:H1", REPORT_TITLE, styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
         "A2:H2",
-        f"DHK 5G    ·    {period_txt}    ·    hourly    ·    {source_name}",
+        f"DHK 5G transmission    ·    {period_txt}    ·    hourly    ·    {source_name}",
         styles["subtitle"],
     )
 
     tiles = [
         (0, "Sites checked", n_sites, False),
-        (2, "Choked / flat", len(records), True),
-        (4, "At Tx BW", counts["At Tx BW"], True),
-        (6, "Above / below Tx BW", f"{counts['Above Tx BW']}  /  {counts['Below Tx BW']}", False),
+        (2, "Issue sites", len(records), True),
+        (4, "Severe choke", counts[SEV_SEVERE], True),
+        (
+            6,
+            "High / Moderate / Low",
+            f"{counts[SEV_HIGH]}  /  {counts[SEV_MODERATE]}  /  {counts[SEV_LOW]}",
+            False,
+        ),
     ]
     ws.set_row(3, 18)
     ws.set_row(4, 32)
@@ -1196,7 +1232,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
         "Two cap shapes count: a crowded flat level (DHAPT35 shape) or a hard ceiling the trace "
         "is clipped at and never rises above. Jagged traces with changing peaks are not listed. "
-        "Each snapshot is the latest 3 days only. Open a site name to see it.",
+        "Each hourly chart is the latest 3 days only. Open a site name to see it.",
         styles["note"],
     )
 
@@ -1205,15 +1241,15 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         "eNodeB Name",
         "Tx BW (Mbit/s)",
         "Stuck Rx (Mbit/s)",
-        "vs Tx BW (%)",
+        "Hours on cap (%)",
         "Days on cap (≥3h)",
         "Last day cap",
         "Listed because",
     ]
     row = 7
     indexed = list(enumerate(records))
-    for name, note in FINDING_NOTES:
-        group = [(i, rec) for i, rec in indexed if rec["finding"] == name]
+    for name, note in SEVERITY_NOTES:
+        group = [(i, rec) for i, rec in indexed if rec["severity"] == name]
         ws.set_row(row, 22)
         ws.merge_range(
             row,
@@ -1242,13 +1278,13 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
             ws.write_url(
                 row,
                 1,
-                f"internal:'2. Snapshots'!A{excel_anchor}",
+                f"internal:'{SNAP_SHEET}'!A{excel_anchor}",
                 link,
                 string=rec["site"],
             )
             ws.write_number(row, 2, rec["bw"], nfmt)
             ws.write_number(row, 3, rec["center"], nfmt)
-            ws.write_number(row, 4, rec["util"], styles["pct_z"] if zebra else styles["pct"])
+            ws.write_number(row, 4, rec["hours_pct"], styles["pct_z"] if zebra else styles["pct"])
             ws.write_string(row, 5, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
             ws.write_string(row, 6, last_day_text(rec), cfmt)
             ws.write_string(row, 7, rec["listed_by"], cfmt)
@@ -1272,7 +1308,7 @@ def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: l
         f"{period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')}"
     )
 
-    # Summary is the first sheet so the file opens on the at-a-glance view.
+    # Summary is the first sheet so the file opens on the report view.
     chart_end = period_end.normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
     _write_summary(book, styles, source_name, period_txt, n_sites, records)
@@ -1286,53 +1322,53 @@ def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: l
 def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     """Same list as _write_list, with each site name linked to its snapshot."""
     ws = book.add_worksheet("1. Site List")
-    _page(ws, "FEGE choked / flat sites")
+    _page(ws, REPORT_TITLE)
 
-    widths = [5, 14, 14, 14, 12, 14, 13, 11, 16, 16, 12, 32, 18, 12, 14, 12]
+    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 12]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
+    last_col_letter = "O"
     ws.set_row(0, 28)
-    ws.merge_range("A1:P1", "FEGE transmission — choked and flat sites (latest 7 days)", styles["title"])
+    ws.merge_range(f"A1:{last_col_letter}1", f"{REPORT_TITLE} — issue sites (latest 7 days)", styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
-        "A2:P2",
-        f"DHK 5G sites    ·    {period_txt}    ·    hourly    ·    "
-        f"{n_sites} sites checked    ·    {len(records)} with RxMaxSpeed stuck flat",
+        f"A2:{last_col_letter}2",
+        f"DHK 5G transmission    ·    {period_txt}    ·    hourly    ·    "
+        f"{n_sites} sites checked    ·    {len(records)} issue sites",
         styles["subtitle"],
     )
     ws.set_row(2, 32)
     ws.merge_range(
-        "A3:P3",
+        f"A3:{last_col_letter}3",
         "RxMaxSpeed (Mbit/s)  =  VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000"
-        "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000"
+        "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000  (RAN-side, reference only)"
         f"          Source: {source_name}",
         styles["meta"],
     )
     ws.set_row(3, 40)
     ws.merge_range(
-        "A4:P4",
+        f"A4:{last_col_letter}4",
         f"Scored on {period_txt} (16-Sep-26 to 22-Sep-26). "
         f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
         f"(busy 08:00–22:00 and off-peak / night). "
         f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day sit on the cap. "
-        f"Cap shape: '{CAP_CROWDED}' = line locks to one level (DHAPT35 shape); "
-        f"'{CAP_CEILING}' = line moves but is clipped at one top and never rises above it. "
-        "Traces whose peaks keep changing (DHGULN2-type spikes) are not listed. "
-        "The snapshot is the latest 3 days only. Open a site name to jump to it. Full rule on sheet 4.",
+        f"Severity is hours on the cap: Severe ≥{SEV_SEVERE_PCT:.0f}%, High ≥{SEV_HIGH_PCT:.0f}%, "
+        f"Moderate ≥{SEV_MODERATE_PCT:.0f}%, Low below that. "
+        f"Cap shape: '{CAP_CROWDED}' or '{CAP_CEILING}'. "
+        "The hourly chart is the latest 3 days only. Open a site name to jump to it. Full rule on sheet 4.",
         styles["note"],
     )
 
     headers = [
         "No.",
         "eNodeB Name",
-        "Finding",
+        "Severity",
         "Cap shape",
         "Tx Total BW (Mbit/s)",
         "Stuck RxMaxSpeed (Mbit/s)",
         "Max RxMaxSpeed (Mbit/s)",
-        "vs Tx BW (%)",
         "Hours on cap (all 24h)",
         "Where capped",
         "Days on cap (≥3h)",
@@ -1359,53 +1395,52 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         ws.write_url(
             row,
             1,
-            f"internal:'2. Snapshots'!A{excel_anchor}",
+            f"internal:'{SNAP_SHEET}'!A{excel_anchor}",
             link,
             string=rec["site"],
         )
-        ws.write_string(row, 2, rec["finding"], _finding_format(styles, rec["finding"], zebra))
+        ws.write_string(row, 2, rec["severity"], _severity_format(styles, rec["severity"], zebra))
         ws.write_string(row, 3, rec["cap_type"], c)
         ws.write_number(row, 4, rec["bw"], n)
         ws.write_number(row, 5, rec["center"], n)
         ws.write_number(row, 6, rec["max_rx"], n)
-        ws.write_number(row, 7, rec["util"], styles["pct_z"] if zebra else styles["pct"])
         ws.write_string(
             row,
-            8,
+            7,
             f"{rec['hours_on']}/{rec['hours_n']} ({rec['hours_pct']:.1f}%)",
             c,
         )
-        ws.write_string(row, 9, rec["cap_when"], c)
-        ws.write_string(row, 10, f"{rec['days_on_cap']}/{rec['days_total']}", c)
+        ws.write_string(row, 8, rec["cap_when"], c)
+        ws.write_string(row, 9, f"{rec['days_on_cap']}/{rec['days_total']}", c)
         last_txt = last_day_text(rec)
-        ws.write_string(row, 11, last_txt, styles["yes"] if rec["last_flag"] else c)
-        ws.write_string(row, 12, rec["listed_by"], c)
-        ws.write_number(row, 13, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        ws.write_string(row, 10, last_txt, styles["yes"] if rec["last_flag"] else c)
+        ws.write_string(row, 11, rec["listed_by"], c)
+        ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
         if np.isfinite(rec["night_rx"]):
-            ws.write_number(row, 14, rec["night_rx"], n)
+            ws.write_number(row, 13, rec["night_rx"], n)
+        else:
+            ws.write_string(row, 13, "—", c)
+        if rec["reference"]:
+            ws.write_string(row, 14, "Yes", styles["yes"])
         else:
             ws.write_string(row, 14, "—", c)
-        if rec["reference"]:
-            ws.write_string(row, 15, "Yes", styles["yes"])
-        else:
-            ws.write_string(row, 15, "—", c)
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.freeze_panes(header_row + 1, 0)
     ws.repeat_rows(header_row, header_row)
 
-    last_col = 15
+    last_col = 14
     note_row = last + 2
     ws.set_row(note_row, 20)
-    ws.merge_range(note_row, 0, note_row, last_col, "How to read Finding", styles["section"])
-    for offset, (name, text) in enumerate(FINDING_NOTES):
+    ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
+    for offset, (name, text) in enumerate(SEVERITY_NOTES):
         r = note_row + 1 + offset
         ws.set_row(r, 32)
-        ws.merge_range(r, 0, r, 1, name, _finding_format(styles, name, False))
+        ws.merge_range(r, 0, r, 1, name, _severity_format(styles, name, False))
         ws.merge_range(r, 2, r, last_col, text, styles["body"])
 
-    where_row = note_row + 5
+    where_row = note_row + 1 + len(SEVERITY_NOTES) + 1
     ws.set_row(where_row, 20)
     ws.merge_range(where_row, 0, where_row, last_col, "How to read Where capped", styles["section"])
     where_notes = (
@@ -1454,19 +1489,21 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     shapes = defaultdict(int)
     last_n = 0
     for rec in records:
-        counts[rec["finding"]] += 1
+        counts[rec["severity"]] += 1
         listed[rec["listed_by"]] += 1
         when[rec["cap_when"]] += 1
         shapes[rec["cap_type"]] += 1
         last_n += int(rec["last_flag"])
     count_row = last_help + 3
-    ws.write(count_row, 0, "Count", styles["label"])
-    ws.merge_range(count_row, 1, count_row, 2, f"At Tx BW: {counts['At Tx BW']}", styles["meta"])
+    ws.write(count_row, 0, "Severity", styles["label"])
+    ws.merge_range(count_row, 1, count_row, 2, f"Severe: {counts[SEV_SEVERE]}", styles["meta"])
     ws.merge_range(
-        count_row, 3, count_row, 4, f"Above Tx BW: {counts['Above Tx BW']}", styles["meta"]
+        count_row, 3, count_row, 4, f"High: {counts[SEV_HIGH]}", styles["meta"]
     )
     ws.merge_range(
-        count_row, 5, count_row, 6, f"Below Tx BW: {counts['Below Tx BW']}", styles["meta"]
+        count_row, 5, count_row, 6,
+        f"Moderate: {counts[SEV_MODERATE]}    ·    Low: {counts[SEV_LOW]}",
+        styles["meta"],
     )
     ws.merge_range(
         count_row,
