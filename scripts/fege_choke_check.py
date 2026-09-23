@@ -468,10 +468,9 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         s = work.loc[work["eNodeB Name"] == site].sort_values("ts")
         s = s[(s["Date"] >= chart_start) & (s["Date"] <= chart_end)]
 
-        # Hourly line, compact axis like the sample snap.
-        # The line uses every hour. The visible time labels are every 3 hours
-        # (00:00, 03:00, 06:00 … 21:00). The date is the same on all 24 hours
-        # of a day, so Excel draws it once, centered, under that day.
+        # Hourly line, compact 2-level category axis matching the target snap.
+        # Outer level: Date shown only once per day (blank for hours 1..23).
+        # Inner level: All 24 hourly timestamps (00:00 to 23:00) rotated vertically.
         c0 = i * 3
         data.write(0, c0, "Date")
         data.write(0, c0 + 1, "Time")
@@ -488,10 +487,17 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             date_label = f"{int(day.day)}/{MONTHS[int(day.month) - 1]}"
             for hour in range(24):
                 r += 1
-                hour_label = f"{hour:02d}:00" if hour % 3 == 0 else ""
-                dates.append(date_label)
+                hour_label = f"{hour:02d}:00"
+                # Write date only on the first hour (hour 00:00) of each day.
+                # In Excel, leaving subsequent hours blank merges/groups the outer date
+                # category across the 24 hours of that day in a clean box.
+                d_val = date_label if hour == 0 else ""
+                dates.append(d_val)
                 times.append(hour_label)
-                data.write_string(r, c0, date_label, cat_fmt)
+                if hour == 0:
+                    data.write_string(r, c0, date_label, cat_fmt)
+                else:
+                    data.write_blank(r, c0, None)
                 data.write_string(r, c0 + 1, hour_label, cat_fmt)
                 value = rx_by_key.get((day.normalize(), hour))
                 if value is None:
@@ -533,7 +539,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
             f"   ·   snapshot is the latest 3 days "
             f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
-            f"line every hour, labels 00:00, 03:00, 06:00 … 21:00",
+            f"hourly 00:00–23:00 with date grouped by day",
             styles["note"],
         )
 
@@ -574,7 +580,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                     "name": "Calibri",
                     "size": 8,
                     "color": "#595959",
-                    "rotation": 0,
+                    "rotation": -90,
                 },
                 "label_position": "nextTo",
                 "label_align": "center",
@@ -591,22 +597,22 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                 "num_font": {"name": "Calibri", "size": 9, "color": "#595959"},
                 "min": 0,
                 "max": _chart_y_max(plotted),
-                "major_unit": 100,
+                "major_unit": 50,
                 "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
                 "line": {"none": True},
             }
         )
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
         chart.set_chartarea({"border": {"color": "#D0D0D0"}, "fill": {"color": "white"}})
-        # Short chart. Bottom band holds 00:00 / 03:00 / … and one date per day.
+        # Compact, precise chart layout matching the sample snap.
         chart.set_plotarea(
             {
                 "border": {"none": True},
                 "fill": {"color": "white"},
-                "layout": {"x": 0.08, "y": 0.16, "width": 0.88, "height": 0.60},
+                "layout": {"x": 0.06, "y": 0.16, "width": 0.91, "height": 0.58},
             }
         )
-        chart.set_size({"width": 1120, "height": 400})
+        chart.set_size({"width": 1200, "height": 410})
         # Don't let the chart shrink when the sheet is scaled or columns move.
         ws.insert_chart(
             top + 4,
@@ -845,8 +851,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         foot + 1,
         1,
         "DHAPT35 and DHAPT48 both pass this rule and are marked Sample snap = Yes "
-        "on the site list. Each snapshot is a short chart of the latest 3 days: "
-        "the line is every hour, the axis shows 00:00, 03:00, 06:00 … 21:00, "
+        "on the site list. Each snapshot is a clean chart of the latest 3 days: "
+        "hourly timestamps 00:00 to 23:00, "
         "and the date is shown once under that day. The chart title is the site name.",
         styles["method_val"],
     )
@@ -868,7 +874,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v9.xlsx",
+        default="FEGE_Choked_Flat_Sites_v10.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -999,8 +1005,8 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         7,
         "The list uses every date in the file. A site is listed when at least "
         f"{MIN_BUSY_PCT:.0f}% of busy hours (08:00–22:00) sit on one flat ceiling. "
-        "Each snapshot is the latest 3 days only: a short chart with hours "
-        "00:00, 03:00, 06:00 … 21:00 and the date once under that day. "
+        "Each snapshot is the latest 3 days only: hourly timestamps 00:00 to 23:00 "
+        "with the date grouped cleanly once under each 24-hour day block. "
         "Open a site name to see it.",
         styles["note"],
     )
