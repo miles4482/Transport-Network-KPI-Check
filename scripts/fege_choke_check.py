@@ -30,17 +30,21 @@ BUSY_END = 22  # inclusive
 NIGHT_START = 2
 NIGHT_END = 6  # inclusive, the valley on the sample charts
 
-# Flat-cap test. Tolerance is wide enough for the sample plateaus
-# (DHAPT35 sits near 269.3–269.8; DHAPT48 sits near 240–243) and tight
-# enough that a normal busy trace, whose top hours wander by tens of Mbit/s,
-# does not qualify.
-TOL_MBPS = 2.5
-TOL_FRAC = 0.01
-OVERSHOOT_MBPS = 6.0
-OVERSHOOT_FRAC = 0.025
-MIN_BUSY_PCT = 50.0
-MIN_RUN_HOURS = 8
-STUCK_DAY_BUSY_HOURS = 8
+# Flat-cap test, relaxed so a site is listed when the busy-hour trace
+# spends a quarter of its time on a ceiling, not only when it is pinned
+# there for most of the day. The band is still a few Mbit/s wide: a normal
+# busy trace, whose top hours wander by tens of Mbit/s, does not qualify.
+# DHAPT35 sits near 269–270 and DHAPT48 near 240–243, both well inside this band.
+TOL_MBPS = 4.0
+TOL_FRAC = 0.015
+OVERSHOOT_MBPS = 10.0
+OVERSHOOT_FRAC = 0.04
+MIN_BUSY_PCT = 25.0
+MIN_RUN_HOURS = 4
+STUCK_DAY_BUSY_HOURS = 4
+MIN_DAY_FRACTION = 0.25
+STD_MBPS = 2.5
+STD_FRAC = 0.01
 MIN_CENTER_MBPS = 20.0
 
 # How the stuck level compares with the configured FEGE Tx bandwidth.
@@ -156,12 +160,13 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         night = (hours >= NIGHT_START) & (hours <= NIGHT_END)
         if busy.sum() == 0:
             continue
-        overshoot = float(rx.max() - center)
+        # 99th percentile, so one stray hour above the cap does not hide a flat site.
+        overshoot = float(np.quantile(rx, 0.99) - center)
         overshoot_limit = max(OVERSHOOT_MBPS, OVERSHOOT_FRAC * center)
         if overshoot > overshoot_limit:
             continue
         in_band_std = float(np.std(rx[band])) if band.any() else 999.0
-        if in_band_std > max(1.8, 0.006 * center):
+        if in_band_std > max(STD_MBPS, STD_FRAC * center):
             continue
 
         busy_pct = 100.0 * float(band[busy].mean())
@@ -179,7 +184,7 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
             day_busy[day][0] += int(flag)
         days_on_cap = sum(v[0] >= STUCK_DAY_BUSY_HOURS for v in day_busy.values())
         days_total = int(s["Date"].dt.normalize().nunique())
-        days_needed = max(3, int(np.ceil(0.5 * days_total)))
+        days_needed = max(3, int(np.ceil(MIN_DAY_FRACTION * days_total)))
         if days_on_cap < days_needed:
             continue
 
@@ -710,11 +715,12 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Hard ceiling",
-            "The highest hourly RxMaxSpeed may sit at most "
+            "The 99th percentile of hourly RxMaxSpeed may sit at most "
             f"{OVERSHOOT_MBPS:.0f} Mbit/s above the stuck level "
-            f"(or {OVERSHOOT_FRAC:.1%} of the stuck level, when that is wider). "
-            "If the trace still climbs well above the crowded level, that level "
-            "is a busy cluster, not a cap, and the site is not listed.",
+            f"(or {OVERSHOOT_FRAC:.0%} of the stuck level, when that is wider). "
+            "One odd hour above the cap is ignored. If the trace still climbs "
+            "well above the crowded level, that level is a busy cluster, not a cap, "
+            "and the site is not listed.",
         ),
         (
             "Busy hours on the cap",
@@ -725,8 +731,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         (
             "Repeats across days",
             f"A day counts as on-cap when at least {STUCK_DAY_BUSY_HOURS} busy hours "
-            "are on the stuck level. This must happen on at least half of the days "
-            "in the file (and on at least 3 days).",
+            "are on the stuck level. This must happen on at least "
+            f"{MIN_DAY_FRACTION:.0%} of the days in the file (and on at least 3 days).",
         ),
         (
             "Continuous flat run",
@@ -735,8 +741,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Tightness",
-            "Samples on the cap have a standard deviation of at most 1.8 Mbit/s "
-            "(or 0.6% of the stuck level, when that is wider).",
+            f"Samples on the cap have a standard deviation of at most {STD_MBPS:.1f} Mbit/s "
+            f"(or {STD_FRAC:.0%} of the stuck level, when that is wider).",
         ),
         (
             "At Tx BW",
@@ -798,7 +804,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites.xlsx",
+        default="FEGE_Choked_Flat_Sites_v2.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -867,7 +873,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         ws.set_column(i, i, w)
 
     ws.set_row(0, 28)
-    ws.merge_range("A1:L1", "FEGE transmission — choked and flat sites", styles["title"])
+    ws.merge_range("A1:L1", "FEGE transmission — choked and flat sites (flexible rule)", styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
         "A2:L2",
@@ -886,8 +892,8 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(3, 32)
     ws.merge_range(
         "A4:L4",
-        "Listed only where the busy-hour trace (08:00–22:00) sits on one hard ceiling, "
-        "the same flat top as the sample charts for DHAPT35 and DHAPT48. "
+        "Flexible rule: listed when at least a quarter of busy hours (08:00–22:00) sit "
+        "within ±4 Mbit/s of one hard ceiling, the same flat top as DHAPT35 and DHAPT48. "
         "Open a site name to jump to its snapshot. The full rule is on sheet 4.",
         styles["note"],
     )
