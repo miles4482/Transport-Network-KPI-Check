@@ -130,6 +130,26 @@ def classify(util: float) -> str:
 
 
 FINDING_ORDER = {"At Tx BW": 0, "Above Tx BW": 1, "Below Tx BW": 2}
+FINDING_NOTES = (
+    (
+        "At Tx BW",
+        "Stuck level is 85% to 120% of the FEGE Tx Total BW counter. "
+        "This is the sample-snap case: nominal bandwidth is 250 Mbit/s and the "
+        "measured cap sits around 220–280 Mbit/s. The port is full.",
+    ),
+    (
+        "Above Tx BW",
+        "The trace is flat, and the cap is more than 20% above the Tx Total BW "
+        "counter. Speed is still stuck; the bandwidth counter and the real limit "
+        "do not agree.",
+    ),
+    (
+        "Below Tx BW",
+        "The trace is flat at less than 85% of Tx Total BW. RxMaxSpeed is stuck, "
+        "so transmission is limited below the configured FEGE bandwidth.",
+    ),
+)
+SNAP_DAYS = 3
 
 
 def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
@@ -415,7 +435,7 @@ def _y_max(rec: dict) -> int:
     return int(np.ceil(peak * 1.12 / 50.0) * 50)
 
 
-def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
+def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
     ws = book.add_worksheet("2. Snapshots")
     _page(ws, "RxMaxSpeed snapshots")
     ws.set_tab_color(BLUE)
@@ -437,6 +457,7 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
         anchors[rec["site"]] = top
         site = rec["site"]
         s = work.loc[work["eNodeB Name"] == site].sort_values("ts")
+        s = s[(s["Date"] >= chart_start) & (s["Date"] <= chart_end)]
 
         # Two category columns give the same axis as the sample snap:
         # the hour sits next to the line, and the date sits under that day.
@@ -489,9 +510,23 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
             f"   ·   vs Tx BW {rec['util']:.1f}%"
             f"   ·   longest flat run {rec['longest']} h"
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
-            f"   ·   each point is one hour; axis shows hour and date",
+            f"   ·   chart is the latest {SNAP_DAYS} days "
+            f"({chart_start.strftime('%d %b')} – {chart_end.strftime('%d %b %Y')}), one point per hour",
             styles["note"],
         )
+
+        if n == 0:
+            ws.merge_range(
+                top + 5,
+                0,
+                top + 5,
+                7,
+                "No hourly samples in the latest 3 days.",
+                styles["note"],
+            )
+            for r in range(top + 4, top + block):
+                ws.set_row(r, 15)
+            continue
 
         chart = book.add_chart({"type": "line"})
         chart.set_title(
@@ -536,9 +571,8 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
         chart.set_plotarea({"border": {"color": "#BFBFBF"}, "fill": {"color": "white"}})
-        # Wide enough that 00:00, 02:00, 04:00 stay readable across every day,
-        # the same axis as the sample snap. Scroll right to see later days.
-        chart.set_size({"width": 5400, "height": 420})
+        # Three days, hour labels every 2 hours, same shape as the sample snap.
+        chart.set_size({"width": 1080, "height": 360})
         ws.insert_chart(top + 4, 0, chart, {"x_offset": 6, "y_offset": 6})
 
         for r in range(top + 4, top + block):
@@ -795,7 +829,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v3.xlsx",
+        default="FEGE_Choked_Flat_Sites_v4.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -918,61 +952,74 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         else:
             ws.merge_range(4, col, 4, col + 1, value, value_fmt)
 
-    ws.set_row(5, 28)
+    ws.set_row(5, 32)
     ws.merge_range(
         5,
         0,
         5,
         7,
-        "Stuck RxMaxSpeed is the flat ceiling. Busy on cap is the share of hours "
-        "from 08:00 to 22:00 sitting on that ceiling. Open a site name for its snapshot. "
-        "At Tx BW = ceiling is 85–120% of FEGE bandwidth. Above = higher than the counter. "
-        "Below = stuck under 85% of FEGE bandwidth.",
+        "Sites are grouped by the finding note. Stuck RxMaxSpeed is the flat ceiling "
+        "over the full period. Busy on cap is the share of 08:00–22:00 hours on that "
+        "ceiling. Snapshots show only the latest 3 days. Open a site name to see its chart.",
         styles["note"],
     )
 
     headers = [
         "No.",
         "eNodeB Name",
-        "Finding",
         "Tx BW (Mbit/s)",
         "Stuck Rx (Mbit/s)",
+        "vs Tx BW (%)",
         "Busy on cap",
         "Days on cap",
         "Longest flat (h)",
     ]
-    header_row = 7
-    ws.set_row(header_row, 22)
-    for col, text in enumerate(headers):
-        ws.write(header_row, col, text, styles["header"])
-
-    for i, rec in enumerate(records):
-        row = header_row + 1 + i
-        zebra = i % 2 == 1
-        ws.set_row(row, 18)
-        nfmt = styles["num_z"] if zebra else styles["num"]
-        cfmt = styles["center_z"] if zebra else styles["center"]
-        link = styles["link_z"] if zebra else styles["link"]
-        excel_anchor = i * BLOCK_ROWS + 1
-        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
-        ws.write_url(
+    row = 7
+    indexed = list(enumerate(records))
+    for name, note in FINDING_NOTES:
+        group = [(i, rec) for i, rec in indexed if rec["finding"] == name]
+        ws.set_row(row, 22)
+        ws.merge_range(
             row,
-            1,
-            f"internal:'2. Snapshots'!A{excel_anchor}",
-            link,
-            string=rec["site"],
+            0,
+            row,
+            7,
+            f"{name}    ·    {len(group)} site{'s' if len(group) != 1 else ''}",
+            styles["section"],
         )
-        ws.write_string(row, 2, rec["finding"], _finding_format(styles, rec["finding"], zebra))
-        ws.write_number(row, 3, rec["bw"], nfmt)
-        ws.write_number(row, 4, rec["center"], nfmt)
-        ws.write_string(row, 5, f"{rec['busy_pct']:.0f}%", cfmt)
-        ws.write_string(row, 6, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
-        ws.write_number(row, 7, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        row += 1
+        ws.set_row(row, 36)
+        ws.merge_range(row, 0, row, 7, note, styles["body"])
+        row += 1
+        ws.set_row(row, 22)
+        for col, text in enumerate(headers):
+            ws.write(row, col, text, styles["header"])
+        row += 1
+        for n_in_group, (i, rec) in enumerate(group):
+            zebra = n_in_group % 2 == 1
+            ws.set_row(row, 18)
+            nfmt = styles["num_z"] if zebra else styles["num"]
+            cfmt = styles["center_z"] if zebra else styles["center"]
+            link = styles["link_z"] if zebra else styles["link"]
+            excel_anchor = i * BLOCK_ROWS + 1
+            ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+            ws.write_url(
+                row,
+                1,
+                f"internal:'2. Snapshots'!A{excel_anchor}",
+                link,
+                string=rec["site"],
+            )
+            ws.write_number(row, 2, rec["bw"], nfmt)
+            ws.write_number(row, 3, rec["center"], nfmt)
+            ws.write_number(row, 4, rec["util"], styles["pct_z"] if zebra else styles["pct"])
+            ws.write_string(row, 5, f"{rec['busy_pct']:.0f}%", cfmt)
+            ws.write_string(row, 6, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
+            ws.write_number(row, 7, rec["longest"], styles["int_z"] if zebra else styles["int"])
+            row += 1
+        row += 1
 
-    last = header_row + len(records)
-    ws.autofilter(header_row, 0, last, len(headers) - 1)
-    ws.freeze_panes(header_row + 1, 0)
-    ws.repeat_rows(header_row, header_row)
+    ws.freeze_panes(6, 0)
     ws.set_zoom(110)
 
 
@@ -990,9 +1037,11 @@ def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: l
     )
 
     # Summary is the first sheet so the file opens on the at-a-glance view.
+    chart_end = period_end.normalize()
+    chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
     _write_summary(book, styles, source_name, period_txt, n_sites, records)
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
-    _write_snapshots(book, styles, work, records, period_txt)
+    _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
     _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
     book.close()
@@ -1098,26 +1147,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, 11, "How to read Finding", styles["section"])
-    notes = [
-        (
-            "At Tx BW",
-            "Stuck level is 85% to 120% of the FEGE Tx Total BW counter. "
-            "This is the sample-snap case: nominal bandwidth is 250 Mbit/s and the "
-            "measured cap sits around 220–280 Mbit/s. The port is full.",
-        ),
-        (
-            "Above Tx BW",
-            "The trace is flat, and the cap is more than 20% above the Tx Total BW "
-            "counter. Speed is still stuck; the bandwidth counter and the real limit "
-            "do not agree.",
-        ),
-        (
-            "Below Tx BW",
-            "The trace is flat at less than 85% of Tx Total BW. RxMaxSpeed is stuck, "
-            "so transmission is limited below the configured FEGE bandwidth.",
-        ),
-    ]
-    for offset, (name, text) in enumerate(notes):
+    for offset, (name, text) in enumerate(FINDING_NOTES):
         r = note_row + 1 + offset
         ws.set_row(r, 32)
         ws.merge_range(r, 0, r, 1, name, _finding_format(styles, name, False))
