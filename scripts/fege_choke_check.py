@@ -10,9 +10,11 @@ A site is listed only when RxMaxSpeed is pinned to one hard ceiling the way
 the sample charts show for DHAPT35 and DHAPT48: after the night dip the line
 sits flat, and it cannot climb above that level.
 
-The rule is applied to every site over the latest seven days in the file.
-Every hour is scored, including night and other off-peak hours.
-Each snapshot chart shows only the latest three days.
+The rule is applied to every site over the latest seven days in the file
+(16–22 Sep 2026 in the current source). Every hour is scored, including
+night and other off-peak hours. A site is listed when at least three of
+those days have three hours on the cap, or when the last day has two
+hours on the cap. Each snapshot chart shows only the latest three days.
 """
 
 from __future__ import annotations
@@ -32,21 +34,22 @@ BUSY_END = 22  # inclusive
 NIGHT_START = 2
 NIGHT_END = 6  # inclusive, the valley on the sample charts
 
-# Flat-cap test. A site is listed when at least 10% of all hours (busy and
-# off-peak) sit on one hard ceiling. The sample snaps are fully pinned; the
-# same shape with fewer hours on the ceiling is still listed, down to this
-# 10% cutoff. DHAPT35 sits near 269–270 and DHAPT48 near 240–243.
+# Flat-cap test on the latest 7 days (16–22 Sep in this file).
+# A day is on-cap when at least 3 hours (busy or off-peak) sit on the ceiling.
+# A site is listed when that happens on at least 3 of the 7 days.
+# Separately, the last day is flagged when at least 2 hours sit on the ceiling.
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
 # A few hours may sit a little above the crowded level. 40 Mbit/s (or 12% of
 # the level) still reads as a ceiling; a trace that keeps climbing past that
-# is not a flat cap.
+# is not a hard week-long cap, but the site can still be listed on the
+# 3-day / last-day rules below.
 OVERSHOOT_MBPS = 40.0
 OVERSHOOT_FRAC = 0.12
-MIN_CAP_PCT = 10.0
 MIN_RUN_HOURS = 3
-STUCK_DAY_HOURS = 2
-MIN_DAY_FRACTION = 0.20
+STUCK_DAY_HOURS = 3
+MIN_DAYS_ON_CAP = 3
+LAST_DAY_HOURS = 2
 ANALYSIS_DAYS = 7
 STD_MBPS = 2.5
 STD_FRAC = 0.01
@@ -158,17 +161,33 @@ SNAP_DAYS = 3
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
-def cap_window(busy_pct: float, off_pct: float) -> str:
+def cap_window(busy_on: int, off_on: int) -> str:
     """Where the flat ceiling sits across the day."""
-    busy_hit = busy_pct >= MIN_CAP_PCT
-    off_hit = off_pct >= MIN_CAP_PCT
-    if busy_hit and off_hit:
+    if busy_on > 0 and off_on > 0:
         return "Busy + off-peak"
-    if busy_hit:
+    if busy_on > 0:
         return "Busy hours"
-    if off_hit:
+    if off_on > 0:
         return "Off-peak"
     return "Partial"
+
+
+def last_day_text(rec: dict) -> str:
+    """Label for the last-day flag column. Always includes the date when flagged."""
+    if not rec.get("last_flag"):
+        return "—"
+    return (
+        f"{rec['last_day_label']} · {rec['last_on']}h "
+        f"(busy {rec['last_busy']}, off-peak {rec['last_off']})"
+    )
+
+
+def listed_by_text(week_flag: bool, last_flag: bool) -> str:
+    if week_flag and last_flag:
+        return "≥3 days + last day"
+    if week_flag:
+        return "≥3 days"
+    return "Last day"
 
 
 def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
@@ -186,6 +205,8 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     window_start = period_end - pd.Timedelta(days=ANALYSIS_DAYS - 1)
     work = work[(work["Date"] >= window_start) & (work["Date"] <= period_end)].copy()
     work = work.reset_index(drop=True)
+    last_day = period_end.date()
+    last_day_label = period_end.strftime("%-d-%b-%y")
 
     records: list[dict] = []
     on_cap = np.zeros(len(work), dtype=bool)
@@ -203,29 +224,33 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         busy = (hours >= BUSY_START) & (hours <= BUSY_END)
         offpeak = ~busy
         night = (hours >= NIGHT_START) & (hours <= NIGHT_END)
-        # 99th percentile, so one stray hour above the cap does not hide a flat site.
         overshoot = float(np.quantile(rx, 0.99) - center)
-        overshoot_limit = max(OVERSHOOT_MBPS, OVERSHOOT_FRAC * center)
-        if overshoot > overshoot_limit:
-            continue
         in_band_std = float(np.std(rx[band])) if band.any() else 999.0
         if in_band_std > max(STD_MBPS, STD_FRAC * center):
             continue
 
         hours_pct = 100.0 * float(band.mean())
-        if hours_pct < MIN_CAP_PCT:
-            continue
         run = longest_run(s["ts"].to_numpy(), band)
-        if run < MIN_RUN_HOURS:
-            continue
 
         day_on: dict = defaultdict(int)
-        for day, flag in zip(s["Date"].dt.date, band):
-            day_on[day] += int(flag)
+        day_busy: dict = defaultdict(int)
+        day_off: dict = defaultdict(int)
+        for day, flag, is_busy in zip(s["Date"].dt.date, band, busy):
+            if not flag:
+                continue
+            day_on[day] += 1
+            if is_busy:
+                day_busy[day] += 1
+            else:
+                day_off[day] += 1
         days_on_cap = sum(v >= STUCK_DAY_HOURS for v in day_on.values())
         days_total = int(s["Date"].dt.normalize().nunique())
-        days_needed = max(3, int(np.ceil(MIN_DAY_FRACTION * days_total)))
-        if days_on_cap < days_needed:
+        week_flag = days_on_cap >= MIN_DAYS_ON_CAP
+        last_on = int(day_on.get(last_day, 0))
+        last_busy = int(day_busy.get(last_day, 0))
+        last_off = int(day_off.get(last_day, 0))
+        last_flag = last_on >= LAST_DAY_HOURS
+        if not week_flag and not last_flag:
             continue
 
         bw = float(np.median(s["TxBW"].to_numpy()))
@@ -233,8 +258,10 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
             continue
         util = center / bw
         night_rx = float(np.median(rx[night])) if night.any() else float("nan")
-        busy_pct = 100.0 * float(band[busy].mean()) if busy.any() else 0.0
-        off_pct = 100.0 * float(band[offpeak].mean()) if offpeak.any() else 0.0
+        busy_on = int(band[busy].sum()) if busy.any() else 0
+        off_on = int(band[offpeak].sum()) if offpeak.any() else 0
+        busy_n = int(busy.sum())
+        off_n = int(offpeak.sum())
         pos = work.index.get_indexer(s.index)
         on_cap[pos] = band
         stuck_level[pos] = center
@@ -253,16 +280,24 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
                 "hours_on": int(band.sum()),
                 "hours_n": int(len(band)),
                 "hours_pct": hours_pct,
-                "busy_on": int(band[busy].sum()) if busy.any() else 0,
-                "busy_n": int(busy.sum()),
-                "busy_pct": busy_pct,
-                "off_on": int(band[offpeak].sum()) if offpeak.any() else 0,
-                "off_n": int(offpeak.sum()),
-                "off_pct": off_pct,
-                "cap_when": cap_window(busy_pct, off_pct),
+                "busy_on": busy_on,
+                "busy_n": busy_n,
+                "busy_pct": 100.0 * busy_on / busy_n if busy_n else 0.0,
+                "off_on": off_on,
+                "off_n": off_n,
+                "off_pct": 100.0 * off_on / off_n if off_n else 0.0,
+                "cap_when": cap_window(busy_on, off_on),
                 "all_pct": hours_pct,
                 "days_on_cap": days_on_cap,
                 "days_total": days_total,
+                "week_flag": week_flag,
+                "last_flag": last_flag,
+                "last_day": last_day,
+                "last_day_label": last_day_label,
+                "last_on": last_on,
+                "last_busy": last_busy,
+                "last_off": last_off,
+                "listed_by": listed_by_text(week_flag, last_flag),
                 "longest": run,
                 "night_rx": night_rx,
                 "reference": site in REFERENCE_SITES,
@@ -274,7 +309,15 @@ def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
 
     work["OnCap"] = on_cap
     work["StuckLevel"] = stuck_level
-    records.sort(key=lambda r: (FINDING_ORDER[r["finding"]], -r["hours_pct"], r["site"]))
+    listed_order = {"≥3 days + last day": 0, "≥3 days": 1, "Last day": 2}
+    records.sort(
+        key=lambda r: (
+            FINDING_ORDER[r["finding"]],
+            listed_order[r["listed_by"]],
+            -r["hours_pct"],
+            r["site"],
+        )
+    )
     return work, records
 
 
@@ -543,7 +586,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             (0, "Tx Total BW (Mbit/s)", f"{rec['bw']:.2f}"),
             (2, "Stuck RxMaxSpeed (Mbit/s)", f"{rec['center']:.2f}"),
             (4, "Hours on cap (all 24h)", f"{rec['hours_on']} / {rec['hours_n']}  ({rec['hours_pct']:.1f}%)"),
-            (6, "Days on cap", f"{rec['days_on_cap']} / {rec['days_total']}"),
+            (6, "Days on cap (≥3h)", f"{rec['days_on_cap']} / {rec['days_total']}"),
         ]
         ws.set_row(top + 1, 16)
         ws.set_row(top + 2, 20)
@@ -562,8 +605,10 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   vs Tx BW {rec['util']:.1f}%"
             f"   ·   longest flat run {rec['longest']} h"
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
-            f"   ·   scored on latest {ANALYSIS_DAYS} days, all hours"
+            f"   ·   scored on {rec['start'].strftime('%-d-%b-%y')} – {rec['end'].strftime('%-d-%b-%y')}, all hours"
             f"   ·   {rec['cap_when']}"
+            f"   ·   {rec['listed_by']}"
+            f"   ·   last day: {last_day_text(rec)}"
             f"   ·   snapshot is the latest 3 days "
             f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
             f"hourly 00:00–23:00 with date grouped by day",
@@ -825,21 +870,30 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Hours on the cap (all 24h)",
-            f"At least {MIN_CAP_PCT:.0f}% of all hourly samples — busy hours "
-            f"({BUSY_START:02d}:00–{BUSY_END:02d}:00) and off-peak / night hours — "
-            "fall inside the tolerance of the stuck level. A site that is only "
-            "flat at night is still listed.",
+            "Every hour is scored — busy hours "
+            f"({BUSY_START:02d}:00–{BUSY_END:02d}:00) and off-peak / night hours. "
+            "A site that is only flat at night is still listed.",
         ),
         (
             "Repeats across days",
             f"A day counts as on-cap when at least {STUCK_DAY_HOURS} hours "
-            "(any hour of the day) are on the stuck level. This must happen on at least "
-            f"{MIN_DAY_FRACTION:.0%} of the days in the window (and on at least 3 days).",
+            "(any hour of the day, busy or off-peak) sit on the stuck level. "
+            f"A site is listed when this happens on at least {MIN_DAYS_ON_CAP} of the "
+            f"{ANALYSIS_DAYS} days.",
+        ),
+        (
+            "Last day flag",
+            f"Independently, the last day of the window is flagged when at least "
+            f"{LAST_DAY_HOURS} hours that day (busy and/or off-peak) sit on the "
+            "stuck level. The date is written in the Last day cap column. "
+            "A site can be listed for the last-day flag even if it has fewer than "
+            f"{MIN_DAYS_ON_CAP} on-cap days.",
         ),
         (
             "Continuous flat run",
-            f"At least one run of {MIN_RUN_HOURS} consecutive hourly samples stays "
-            "on the cap. A single touched hour is not a flat line.",
+            f"Longest consecutive run on the cap is reported. A day still counts "
+            f"when {STUCK_DAY_HOURS} hours sit on the level even if they are not "
+            "adjacent.",
         ),
         (
             "Tightness",
@@ -875,7 +929,7 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ws.write(r, 0, key, styles["method_key"])
         ws.write(r, 1, val, styles["method_val"])
 
-    foot = 23
+    foot = 24
     ws.set_row(foot, 20)
     ws.merge_range(foot, 0, foot, 1, "Check against the sample snaps", styles["section"])
     ws.set_row(foot + 1, 36)
@@ -885,7 +939,7 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         foot + 1,
         1,
         "DHAPT35 and DHAPT48 both pass this rule and are marked Sample snap = Yes "
-        "on the site list. Scoring uses the latest 7 days and every hour. "
+        "on the site list. Scoring uses 16-Sep-26 to 22-Sep-26 and every hour. "
         "Each snapshot is a clean chart of the latest 3 days: "
         "hourly timestamps 00:00 to 23:00, "
         "and the date is shown once under that day. The chart title is the site name.",
@@ -909,7 +963,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v11.xlsx",
+        default="FEGE_Choked_Flat_Sites_v12.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -938,8 +992,16 @@ def main() -> None:
     for name in ("At Tx BW", "Above Tx BW", "Below Tx BW"):
         print(f"  {name}: {by_finding[name]}")
     by_when = defaultdict(int)
+    by_listed = defaultdict(int)
+    last_n = 0
     for rec in records:
         by_when[rec["cap_when"]] += 1
+        by_listed[rec["listed_by"]] += 1
+        last_n += int(rec["last_flag"])
+    print("Listed because:")
+    for name in ("≥3 days + last day", "≥3 days", "Last day"):
+        print(f"  {name}: {by_listed[name]}")
+    print(f"Last-day cap flag ({records[0]['last_day_label'] if records else 'n/a'}): {last_n}")
     print("Where capped:")
     for name in ("Busy + off-peak", "Busy hours", "Off-peak", "Partial"):
         print(f"  {name}: {by_when[name]}")
@@ -949,7 +1011,8 @@ def main() -> None:
             print(
                 f"  {rec['site']}: stuck {rec['center']:.2f} Mbit/s, "
                 f"Tx BW {rec['bw']:.0f}, hours {rec['hours_pct']:.1f}%, "
-                f"days {rec['days_on_cap']}/{rec['days_total']}"
+                f"days {rec['days_on_cap']}/{rec['days_total']}, "
+                f"{last_day_text(rec)}"
             )
     print(f"Wrote {output}")
 
@@ -960,7 +1023,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
     _page(ws, "FEGE choke check — at a glance")
     ws.set_tab_color("#C65911")
 
-    widths = [6, 16, 16, 14, 18, 16, 14, 16]
+    widths = [6, 14, 14, 14, 12, 14, 32, 18]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
@@ -1045,11 +1108,10 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         0,
         5,
         7,
-        f"The list uses the latest {ANALYSIS_DAYS} days only. A site is listed when at least "
-        f"{MIN_CAP_PCT:.0f}% of all hours (busy and off-peak / night) sit on one flat ceiling. "
-        "Each snapshot is the latest 3 days only: hourly timestamps 00:00 to 23:00 "
-        "with the date grouped cleanly once under each 24-hour day block. "
-        "Open a site name to see it.",
+        f"Scored on {period_txt} (latest {ANALYSIS_DAYS} days). "
+        f"Listed when ≥{MIN_DAYS_ON_CAP} days have ≥{STUCK_DAY_HOURS} hours on the cap "
+        f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
+        "Each snapshot is the latest 3 days only. Open a site name to see it.",
         styles["note"],
     )
 
@@ -1059,9 +1121,9 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         "Tx BW (Mbit/s)",
         "Stuck Rx (Mbit/s)",
         "vs Tx BW (%)",
-        "Hours on cap (≥10%)",
-        "Days on cap",
-        "Longest flat (h)",
+        "Days on cap (≥3h)",
+        "Last day cap",
+        "Listed because",
     ]
     row = 7
     indexed = list(enumerate(records))
@@ -1102,9 +1164,9 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
             ws.write_number(row, 2, rec["bw"], nfmt)
             ws.write_number(row, 3, rec["center"], nfmt)
             ws.write_number(row, 4, rec["util"], styles["pct_z"] if zebra else styles["pct"])
-            ws.write_string(row, 5, f"{rec['hours_pct']:.0f}%", cfmt)
-            ws.write_string(row, 6, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
-            ws.write_number(row, 7, rec["longest"], styles["int_z"] if zebra else styles["int"])
+            ws.write_string(row, 5, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
+            ws.write_string(row, 6, last_day_text(rec), cfmt)
+            ws.write_string(row, 7, rec["listed_by"], cfmt)
             row += 1
         row += 1
 
@@ -1141,22 +1203,23 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws = book.add_worksheet("1. Site List")
     _page(ws, "FEGE choked / flat sites")
 
-    widths = [5, 14, 14, 12, 14, 13, 11, 18, 16, 12, 12, 14, 12]
+    widths = [5, 14, 14, 12, 14, 13, 11, 16, 16, 12, 32, 18, 12, 14, 12]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
+    last_day_hdr = records[0]["last_day_label"] if records else "last day"
     ws.set_row(0, 28)
-    ws.merge_range("A1:M1", "FEGE transmission — choked and flat sites (latest 7 days)", styles["title"])
+    ws.merge_range("A1:O1", "FEGE transmission — choked and flat sites (latest 7 days)", styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
-        "A2:M2",
+        "A2:O2",
         f"DHK 5G sites    ·    {period_txt}    ·    hourly    ·    "
         f"{n_sites} sites checked    ·    {len(records)} with RxMaxSpeed stuck flat",
         styles["subtitle"],
     )
     ws.set_row(2, 32)
     ws.merge_range(
-        "A3:M3",
+        "A3:O3",
         "RxMaxSpeed (Mbit/s)  =  VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000"
         "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000"
         f"          Source: {source_name}",
@@ -1164,12 +1227,12 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     )
     ws.set_row(3, 32)
     ws.merge_range(
-        "A4:M4",
-        f"Scored on the latest {ANALYSIS_DAYS} days only. "
-        "Cutoff is 10% of all hours — busy (08:00–22:00) and off-peak / night — "
-        "on the same flat top as DHAPT35 and DHAPT48, within ±4 Mbit/s. "
-        "The snapshot is the latest 3 days only. "
-        "Open a site name to jump to its snapshot. The full rule is on sheet 4.",
+        "A4:O4",
+        f"Scored on {period_txt} (16-Sep-26 to 22-Sep-26). "
+        f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
+        f"(busy 08:00–22:00 and off-peak / night). "
+        f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day sit on the cap. "
+        "The snapshot is the latest 3 days only. Open a site name to jump to it. Full rule on sheet 4.",
         styles["note"],
     )
 
@@ -1181,9 +1244,11 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         "Stuck RxMaxSpeed (Mbit/s)",
         "Max RxMaxSpeed (Mbit/s)",
         "vs Tx BW (%)",
-        "Hours on cap (≥10%, all 24h)",
+        "Hours on cap (all 24h)",
         "Where capped",
-        "Days on cap",
+        "Days on cap (≥3h)",
+        f"Last day cap ({last_day_hdr})",
+        "Listed because",
         "Longest flat run (h)",
         "Night Rx 02–06 (Mbit/s)",
         "Sample snap",
@@ -1222,33 +1287,37 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         )
         ws.write_string(row, 8, rec["cap_when"], c)
         ws.write_string(row, 9, f"{rec['days_on_cap']}/{rec['days_total']}", c)
-        ws.write_number(row, 10, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        last_txt = last_day_text(rec)
+        ws.write_string(row, 10, last_txt, styles["yes"] if rec["last_flag"] else c)
+        ws.write_string(row, 11, rec["listed_by"], c)
+        ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
         if np.isfinite(rec["night_rx"]):
-            ws.write_number(row, 11, rec["night_rx"], n)
+            ws.write_number(row, 13, rec["night_rx"], n)
         else:
-            ws.write_string(row, 11, "—", c)
+            ws.write_string(row, 13, "—", c)
         if rec["reference"]:
-            ws.write_string(row, 12, "Yes", styles["yes"])
+            ws.write_string(row, 14, "Yes", styles["yes"])
         else:
-            ws.write_string(row, 12, "—", c)
+            ws.write_string(row, 14, "—", c)
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.freeze_panes(header_row + 1, 0)
     ws.repeat_rows(header_row, header_row)
 
+    last_col = 14
     note_row = last + 2
     ws.set_row(note_row, 20)
-    ws.merge_range(note_row, 0, note_row, 12, "How to read Finding", styles["section"])
+    ws.merge_range(note_row, 0, note_row, last_col, "How to read Finding", styles["section"])
     for offset, (name, text) in enumerate(FINDING_NOTES):
         r = note_row + 1 + offset
         ws.set_row(r, 32)
         ws.merge_range(r, 0, r, 1, name, _finding_format(styles, name, False))
-        ws.merge_range(r, 2, r, 12, text, styles["body"])
+        ws.merge_range(r, 2, r, last_col, text, styles["body"])
 
     where_row = note_row + 5
     ws.set_row(where_row, 20)
-    ws.merge_range(where_row, 0, where_row, 12, "How to read Where capped", styles["section"])
+    ws.merge_range(where_row, 0, where_row, last_col, "How to read Where capped", styles["section"])
     where_notes = (
         (
             "Busy + off-peak",
@@ -1263,19 +1332,42 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         (
             "Off-peak",
             "The ceiling is clear in night / off-peak hours even if daytime "
-            "busy hours are less flat. These sites are now listed.",
+            "busy hours are less flat. These sites are still listed.",
         ),
     )
     for offset, (name, text) in enumerate(where_notes):
         r = where_row + 1 + offset
         ws.set_row(r, 28)
         ws.merge_range(r, 0, r, 1, name, styles["center"])
-        ws.merge_range(r, 2, r, 12, text, styles["body"])
+        ws.merge_range(r, 2, r, last_col, text, styles["body"])
+
+    last_help = where_row + 5
+    ws.set_row(last_help, 20)
+    ws.merge_range(last_help, 0, last_help, last_col, "How to read Last day cap", styles["section"])
+    ws.set_row(last_help + 1, 36)
+    ws.merge_range(
+        last_help + 1,
+        0,
+        last_help + 1,
+        last_col,
+        f"Green cell with a date means {last_day_hdr} had at least {LAST_DAY_HOURS} hours "
+        "on the same stuck level (busy and/or off-peak). Example: "
+        f"'{last_day_hdr} · 6h (busy 4, off-peak 2)'. "
+        "A dash means that last day was not on the cap. "
+        "Listed because = Last day means the site is in this file only for that last-day flag.",
+        styles["body"],
+    )
 
     counts = defaultdict(int)
+    listed = defaultdict(int)
+    when = defaultdict(int)
+    last_n = 0
     for rec in records:
         counts[rec["finding"]] += 1
-    count_row = where_row + 5
+        listed[rec["listed_by"]] += 1
+        when[rec["cap_when"]] += 1
+        last_n += int(rec["last_flag"])
+    count_row = last_help + 3
     ws.write(count_row, 0, "Count", styles["label"])
     ws.merge_range(count_row, 1, count_row, 2, f"At Tx BW: {counts['At Tx BW']}", styles["meta"])
     ws.merge_range(
@@ -1288,42 +1380,54 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         count_row,
         7,
         count_row,
-        12,
+        last_col,
         f"Sample snaps in the list: {', '.join(REFERENCE_SITES)}",
         styles["meta"],
     )
-    when = defaultdict(int)
-    for rec in records:
-        when[rec["cap_when"]] += 1
     ws.set_row(count_row + 1, 18)
-    ws.write(count_row + 1, 0, "Where", styles["label"])
+    ws.write(count_row + 1, 0, "Listed", styles["label"])
     ws.merge_range(
-        count_row + 1, 1, count_row + 1, 3,
+        count_row + 1, 1, count_row + 1, 4,
+        f"≥3 days + last day: {listed['≥3 days + last day']}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 1, 5, count_row + 1, 8,
+        f"≥3 days: {listed['≥3 days']}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 1, 9, count_row + 1, last_col,
+        f"Last day only: {listed['Last day']}    ·    last-day flag: {last_n}",
+        styles["meta"],
+    )
+    ws.set_row(count_row + 2, 18)
+    ws.write(count_row + 2, 0, "Where", styles["label"])
+    ws.merge_range(
+        count_row + 2, 1, count_row + 2, 4,
         f"Busy + off-peak: {when['Busy + off-peak']}",
         styles["meta"],
     )
     ws.merge_range(
-        count_row + 1, 4, count_row + 1, 6,
+        count_row + 2, 5, count_row + 2, 8,
         f"Busy hours: {when['Busy hours']}",
         styles["meta"],
     )
     ws.merge_range(
-        count_row + 1, 7, count_row + 1, 12,
+        count_row + 2, 9, count_row + 2, last_col,
         f"Off-peak: {when['Off-peak']}    ·    Partial: {when['Partial']}",
         styles["meta"],
     )
-    lowest = min(records, key=lambda r: r["hours_pct"])
-    ws.set_row(count_row + 2, 20)
+    ws.set_row(count_row + 3, 20)
     ws.merge_range(
-        count_row + 2,
+        count_row + 3,
         0,
-        count_row + 2,
-        12,
-        f"Hours on cap cutoff is {MIN_CAP_PCT:.0f}% of all 24 hours "
-        f"(busy 08:00–22:00 and off-peak). "
-        f"Lowest site in this list: {lowest['site']}  "
-        f"{lowest['hours_on']}/{lowest['hours_n']} ({lowest['hours_pct']:.1f}%). "
-        "Sites under 10% are not listed.",
+        count_row + 3,
+        last_col,
+        f"Window is {period_txt}. "
+        f"7-day rule: ≥{MIN_DAYS_ON_CAP} days with ≥{STUCK_DAY_HOURS} hours on the cap. "
+        f"Last-day rule: {last_day_hdr} with ≥{LAST_DAY_HOURS} hours on the cap "
+        "(busy and/or off-peak).",
         styles["note"],
     )
 
