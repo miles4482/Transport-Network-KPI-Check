@@ -454,7 +454,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
     # strip, so the columns under it stay wide enough for the hour labels.
     for col, width in enumerate([22, 20, 22, 20, 24, 20, 22, 20]):
         ws.set_column(col, col, width)
-    ws.set_column(8, 28, 12)
+    ws.set_column(8, 50, 12)
 
     anchors: dict[str, int] = {}
     # Fixed stride so the site list can link to row i * BLOCK_ROWS + 1.
@@ -469,29 +469,35 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         s = work.loc[work["eNodeB Name"] == site].sort_values("ts")
         s = s[(s["Date"] >= chart_start) & (s["Date"] <= chart_end)]
 
-        # Two category columns give the same axis as the sample snap:
-        # the hour sits next to the line, and the date sits under that day.
+        # Two category levels, same axis as the sample snap.
+        # Inner level: 00:00, 01:00, … 23:00, repeated for each day.
+        # Outer level: the same date on every hour of that day, so Excel draws
+        # the date once, centered, inside the box under those 24 hours.
         c0 = i * 3
         data.write(0, c0, "Date")
         data.write(0, c0 + 1, "Time")
         data.write(0, c0 + 2, "Rx")
+        rx_by_key = {
+            (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
+            for _, row in s.iterrows()
+        }
         dates: list[str] = []
         times: list[str] = []
-        # One point every 2 hours, so the axis matches the sample snap:
-        # 00:00, 02:00, 04:00 ... under the line, and 20/Sep centered under that day.
         r = 0
-        for _, row in s.iterrows():
-            stamp = row["ts"].to_pydatetime()
-            if stamp.hour % 2 != 0:
-                continue
-            r += 1
-            date_label = f"{stamp.day}/{MONTHS[stamp.month - 1]}"
-            hour_label = f"{stamp.hour:02d}:00"
-            dates.append(date_label)
-            times.append(hour_label)
-            data.write_string(r, c0, date_label, cat_fmt)
-            data.write_string(r, c0 + 1, hour_label, cat_fmt)
-            data.write_number(r, c0 + 2, float(row["Rx"]))
+        for day in pd.date_range(chart_start, chart_end, freq="D"):
+            date_label = f"{int(day.day)}/{MONTHS[int(day.month) - 1]}"
+            for hour in range(24):
+                r += 1
+                hour_label = f"{hour:02d}:00"
+                dates.append(date_label)
+                times.append(hour_label)
+                data.write_string(r, c0, date_label, cat_fmt)
+                data.write_string(r, c0 + 1, hour_label, cat_fmt)
+                value = rx_by_key.get((day.normalize(), hour))
+                if value is None:
+                    data.write_blank(r, c0 + 2, None)
+                else:
+                    data.write_number(r, c0 + 2, value)
         n = r
 
         ws.set_row(top, 26)
@@ -526,7 +532,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
             f"   ·   chart is the latest {SNAP_DAYS} days "
             f"({chart_start.strftime('%-d/%b')} – {chart_end.strftime('%-d/%b %Y')}), "
-            f"point every 2 hours (00:00, 02:00, …)",
+            f"hours 00:00–23:00 under each date",
             styles["note"],
         )
 
@@ -544,6 +550,7 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             continue
 
         chart = book.add_chart({"type": "line"})
+        chart.show_blanks_as("gap")
         chart.set_title(
             {
                 "name": f"RxMaxSpeed(Mbit/s)_{site}",
@@ -564,16 +571,15 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         )
         chart.set_x_axis(
             {
-                "name": "Date & Time",
-                "name_font": {"name": "Calibri", "size": 11, "bold": True, "color": "black"},
+                # No axis title. The sample has the hours and the date only.
                 "num_font": {
                     "name": "Calibri",
-                    "size": 9,
+                    "size": 8,
                     "color": "black",
                     "rotation": 0,
                 },
-                # Hour labels sit on the tick, centered, on their own row.
-                # The date level is the row under that, centered on each day.
+                # 00:00–23:00 on the row next to the plot. The date is the
+                # level under that row, one label centered in each day's box.
                 "label_position": "nextTo",
                 "label_align": "center",
                 "position_axis": "on_tick",
@@ -600,21 +606,18 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         )
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
-        # Leave the bottom third of the chart for two label rows plus the title:
-        # 00:00 02:00 … on the first row, 20/Sep centered under the day on the
-        # second row, and "Date & Time" under both. A short plot area is what
-        # stacked those three lines on top of each other.
+        # Bottom band is the hour row (00:00–23:00) and, under it, one date
+        # in the box for that day. No "Date & Time" title.
         chart.set_plotarea(
             {
                 "border": {"color": "#BFBFBF"},
                 "fill": {"color": "white"},
-                "layout": {"x": 0.06, "y": 0.14, "width": 0.90, "height": 0.52},
+                "layout": {"x": 0.05, "y": 0.12, "width": 0.93, "height": 0.58},
             }
         )
-        # 36 labels (3 days × 12 even hours). About 58 px each, so "00:00"
-        # sits clear of the next hour. Height leaves a band under the plot
-        # for the hour row, the date row, and the axis title.
-        chart.set_size({"width": 2100, "height": 540})
+        # 72 labels (3 days × 24 hours). About 44 px each, so 00:00 does not
+        # collide with 01:00, and each date stays centered under its own day.
+        chart.set_size({"width": 3400, "height": 500})
         # Don't let the chart shrink when the sheet is scaled or columns move.
         ws.insert_chart(
             top + 4,
@@ -875,7 +878,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v6.xlsx",
+        default="FEGE_Choked_Flat_Sites_v7.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1006,8 +1009,9 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         7,
         "Sites are grouped by the finding note. A site is listed when at least "
         f"{MIN_BUSY_PCT:.0f}% of busy hours (08:00–22:00) sit on one flat ceiling. "
-        "Snapshots show only the latest 3 days, with the hour on the first axis row "
-        "and the date centered under each day. Open a site name to see its chart.",
+        "Snapshots show only the latest 3 days. Each day has hours 00:00–23:00 "
+        "on the top axis row, and the date once in the box under that day. "
+        "Open a site name to see its chart.",
         styles["note"],
     )
 
