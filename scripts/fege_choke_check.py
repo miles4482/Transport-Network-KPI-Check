@@ -31,13 +31,16 @@ NIGHT_START = 2
 NIGHT_END = 6  # inclusive, the valley on the sample charts
 
 # Flat-cap test. A site is listed when at least 10% of busy hours sit on
-# one hard ceiling (the second sample snap is the shape; the share of hours
-# on that ceiling can be much lower than a fully pinned day).
+# one hard ceiling. The sample snaps are fully pinned; the same shape with
+# fewer hours on the ceiling is still listed, down to this 10% cutoff.
 # DHAPT35 sits near 269–270 and DHAPT48 near 240–243, both well inside this band.
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
-OVERSHOOT_MBPS = 10.0
-OVERSHOOT_FRAC = 0.04
+# A few hours may sit a little above the crowded level. 40 Mbit/s (or 12% of
+# the level) still reads as a ceiling; a trace that keeps climbing past that
+# is not a flat cap.
+OVERSHOOT_MBPS = 40.0
+OVERSHOOT_FRAC = 0.12
 MIN_BUSY_PCT = 10.0
 MIN_RUN_HOURS = 3
 STUCK_DAY_BUSY_HOURS = 2
@@ -416,11 +419,14 @@ def _finding_format(styles, finding: str, zebra: bool):
     return styles["below"]
 
 
-def _page(ws, title: str):
+def _page(ws, title: str, *, fit_width: bool = True):
     ws.set_landscape()
     ws.set_paper(9)  # A4
     ws.set_margins(left=0.45, right=0.45, top=0.6, bottom=0.5)
-    ws.fit_to_pages(1, 0)
+    # Snapshots must not be scaled onto the page width: that crushes the
+    # two-row date/time axis into one overlapping band.
+    if fit_width:
+        ws.fit_to_pages(1, 0)
     ws.set_header(f"&L&8&K1F4E79{title}&R&8FEGE port  |  DHK")
     ws.set_footer("&L&8Choked = RxMaxSpeed stuck flat&R&8Page &P of &N")
     ws.hide_gridlines(2)
@@ -437,14 +443,18 @@ def _y_max(rec: dict) -> int:
 
 def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
     ws = book.add_worksheet("2. Snapshots")
-    _page(ws, "RxMaxSpeed snapshots")
+    _page(ws, "RxMaxSpeed snapshots", fit_width=False)
+    ws.set_zoom(100)
+    ws.set_print_scale(100)
     ws.set_tab_color(BLUE)
     data = book.add_worksheet("_ChartData")
     data.hide()
 
-    # Width sums to about one A4 landscape page so the chart is not scaled down.
-    for col, width in enumerate([18, 16, 18, 16, 20, 16, 18, 16]):
+    # KPI strip uses the first eight columns. The chart is wider than that
+    # strip, so the columns under it stay wide enough for the hour labels.
+    for col, width in enumerate([22, 20, 22, 20, 24, 20, 22, 20]):
         ws.set_column(col, col, width)
+    ws.set_column(8, 28, 12)
 
     anchors: dict[str, int] = {}
     # Fixed stride so the site list can link to row i * BLOCK_ROWS + 1.
@@ -555,39 +565,69 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         chart.set_x_axis(
             {
                 "name": "Date & Time",
-                "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
-                "num_font": {"name": "Calibri", "size": 9},
-                "label_position": "low",
-                "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
+                "name_font": {"name": "Calibri", "size": 11, "bold": True, "color": "black"},
+                "num_font": {
+                    "name": "Calibri",
+                    "size": 9,
+                    "color": "black",
+                    "rotation": 0,
+                },
+                # Hour labels sit on the tick, centered, on their own row.
+                # The date level is the row under that, centered on each day.
+                "label_position": "nextTo",
+                "label_align": "center",
+                "position_axis": "on_tick",
+                "major_tick_mark": "outside",
+                "major_gridlines": {
+                    "visible": True,
+                    "line": {"color": "#D9D9D9", "width": 0.75},
+                },
                 "minor_gridlines": {"visible": False},
+                "line": {"color": "#7F7F7F"},
             }
         )
         chart.set_y_axis(
             {
                 "name": "MB/s",
                 "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
-                "num_font": {"name": "Calibri", "size": 9},
+                "num_font": {"name": "Calibri", "size": 9, "color": "black"},
                 "min": 0,
                 "max": _y_max(rec),
                 "major_unit": 50,
                 "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
+                "line": {"color": "#7F7F7F"},
             }
         )
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
-        chart.set_plotarea({"border": {"color": "#BFBFBF"}, "fill": {"color": "white"}})
-        # Three days at a 2-hour step, same date/time axis as the sample snap.
-        chart.set_size({"width": 1100, "height": 380})
-        ws.insert_chart(top + 4, 0, chart, {"x_offset": 6, "y_offset": 6})
+        # Leave the bottom third of the chart for two label rows plus the title:
+        # 00:00 02:00 … on the first row, 20/Sep centered under the day on the
+        # second row, and "Date & Time" under both. A short plot area is what
+        # stacked those three lines on top of each other.
+        chart.set_plotarea(
+            {
+                "border": {"color": "#BFBFBF"},
+                "fill": {"color": "white"},
+                "layout": {"x": 0.06, "y": 0.14, "width": 0.90, "height": 0.52},
+            }
+        )
+        # 36 labels (3 days × 12 even hours). About 58 px each, so "00:00"
+        # sits clear of the next hour. Height leaves a band under the plot
+        # for the hour row, the date row, and the axis title.
+        chart.set_size({"width": 2100, "height": 540})
+        # Don't let the chart shrink when the sheet is scaled or columns move.
+        ws.insert_chart(
+            top + 4,
+            0,
+            chart,
+            {"x_offset": 6, "y_offset": 6, "object_position": 2},
+        )
 
         for r in range(top + 4, top + block):
-            ws.set_row(r, 15)
+            ws.set_row(r, 16)
 
     if records:
         ws.set_h_pagebreaks([i * block for i in range(1, len(records))])
-    ws.set_print_scale(100)
-    # fit_to_pages would shrink every snapshot onto conflicting pages; print at 100%.
-    ws.fit_to_pages(1, 0)
     return anchors
 
 
@@ -820,7 +860,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
 
 
 
-BLOCK_ROWS = 36
+# Banner + KPI strip + a 520 px chart with a two-row axis under the plot.
+BLOCK_ROWS = 42
 
 
 def main() -> None:
@@ -834,7 +875,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v5.xlsx",
+        default="FEGE_Choked_Flat_Sites_v6.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -963,9 +1004,10 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         0,
         5,
         7,
-        "Sites are grouped by the finding note. Stuck RxMaxSpeed is the flat ceiling "
-        "over the full period. Busy on cap is the share of 08:00–22:00 hours on that "
-        "ceiling. Snapshots show only the latest 3 days. Open a site name to see its chart.",
+        "Sites are grouped by the finding note. A site is listed when at least "
+        f"{MIN_BUSY_PCT:.0f}% of busy hours (08:00–22:00) sit on one flat ceiling. "
+        "Snapshots show only the latest 3 days, with the hour on the first axis row "
+        "and the date centered under each day. Open a site name to see its chart.",
         styles["note"],
     )
 
@@ -975,7 +1017,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         "Tx BW (Mbit/s)",
         "Stuck Rx (Mbit/s)",
         "vs Tx BW (%)",
-        "Busy on cap",
+        "Busy on cap (≥10%)",
         "Days on cap",
         "Longest flat (h)",
     ]
@@ -1081,8 +1123,9 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(3, 32)
     ws.merge_range(
         "A4:L4",
-        "Flexible rule: listed when at least 10% of busy hours (08:00–22:00) sit "
-        "within ±4 Mbit/s of one hard ceiling, the same flat top as DHAPT35 and DHAPT48. "
+        "Cutoff on Busy hours on cap is 10% of 08:00–22:00 (same flat top as "
+        "DHAPT35 and DHAPT48, within ±4 Mbit/s). Sites from 10% upward are listed, "
+        "including ones that are flat for only part of the period. "
         "Open a site name to jump to its snapshot. The full rule is on sheet 4.",
         styles["note"],
     )
@@ -1095,7 +1138,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         "Stuck RxMaxSpeed (Mbit/s)",
         "Max RxMaxSpeed (Mbit/s)",
         "vs Tx BW (%)",
-        "Busy hours on cap",
+        "Busy hours on cap (≥10%)",
         "Days on cap",
         "Longest flat run (h)",
         "Night Rx 02–06 (Mbit/s)",
@@ -1177,6 +1220,19 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         11,
         f"Sample snaps in the list: {', '.join(REFERENCE_SITES)}",
         styles["meta"],
+    )
+    lowest = min(records, key=lambda r: r["busy_pct"])
+    ws.set_row(count_row + 1, 20)
+    ws.merge_range(
+        count_row + 1,
+        0,
+        count_row + 1,
+        11,
+        f"Busy hours on cap cutoff is {MIN_BUSY_PCT:.0f}%. "
+        f"Lowest site in this list: {lowest['site']}  "
+        f"{lowest['busy_on']}/{lowest['busy_n']} ({lowest['busy_pct']:.1f}%). "
+        "Sites under 10% are not listed.",
+        styles["note"],
     )
 
 
