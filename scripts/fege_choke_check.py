@@ -430,7 +430,7 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
     # Fixed stride so the site list can link to row i * BLOCK_ROWS + 1.
     block = BLOCK_ROWS
 
-    date_fmt = book.add_format({"num_format": "dd-mmm-yyyy hh:mm", "font_name": "Calibri"})
+    cat_fmt = book.add_format({"font_name": "Calibri", "font_size": 8, "align": "center"})
 
     for i, rec in enumerate(records):
         top = i * block
@@ -438,18 +438,25 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
         site = rec["site"]
         s = work.loc[work["eNodeB Name"] == site].sort_values("ts")
 
-        # Chart source block: 4 columns per site, starting at column 0 of _ChartData
-        # stacked vertically would be slow to chart; side by side is direct.
-        c0 = i * 4
-        data.write(0, c0, "DateTime")
-        data.write(0, c0 + 1, "Rx")
-        data.write(0, c0 + 2, "Stuck")
-        data.write(0, c0 + 3, "BW")
+        # Two category columns give the same axis as the sample snap:
+        # the hour sits next to the line, and the date sits under that day.
+        c0 = i * 3
+        data.write(0, c0, "Date")
+        data.write(0, c0 + 1, "Time")
+        data.write(0, c0 + 2, "Rx")
+        dates: list[str] = []
+        times: list[str] = []
         for r, (_, row) in enumerate(s.iterrows(), start=1):
-            data.write_datetime(r, c0, row["ts"].to_pydatetime(), date_fmt)
-            data.write_number(r, c0 + 1, float(row["Rx"]))
-            data.write_number(r, c0 + 2, float(rec["center"]))
-            data.write_number(r, c0 + 3, float(rec["bw"]))
+            stamp = row["ts"].to_pydatetime()
+            date_label = f"{stamp.day}/{stamp.strftime('%b')}"
+            # Label every 2 hours (00:00, 02:00, ...) the way the sample snap does.
+            # The point itself is still plotted for every hour.
+            hour_label = f"{stamp.hour:02d}:00" if stamp.hour % 2 == 0 else ""
+            dates.append(date_label)
+            times.append(hour_label)
+            data.write_string(r, c0, date_label, cat_fmt)
+            data.write_string(r, c0 + 1, hour_label, cat_fmt)
+            data.write_number(r, c0 + 2, float(row["Rx"]))
         n = len(s)
 
         ws.set_row(top, 26)
@@ -482,7 +489,7 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
             f"   ·   vs Tx BW {rec['util']:.1f}%"
             f"   ·   longest flat run {rec['longest']} h"
             f"   ·   night Rx 02:00–06:00 {rec['night_rx']:.2f} Mbit/s"
-            f"   ·   red dash = stuck level, grey dash = Tx Total BW",
+            f"   ·   each point is one hour; axis shows hour and date",
             styles["note"],
         )
 
@@ -493,51 +500,33 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
                 "name_font": {"name": "Calibri", "size": 14, "bold": True, "color": NAVY},
             }
         )
+        # Categories cover Date and Time, so Excel draws both levels.
         chart.add_series(
             {
                 "name": "RxMaxSpeed (Mbit/s)",
-                "categories": ["_ChartData", 1, c0, n, c0],
-                "values": ["_ChartData", 1, c0 + 1, n, c0 + 1],
-                "line": {"color": "#2F5496", "width": 1.5},
-                "marker": {"type": "none"},
-            }
-        )
-        chart.add_series(
-            {
-                "name": "Stuck level",
-                "categories": ["_ChartData", 1, c0, n, c0],
+                "categories": ["_ChartData", 1, c0, n, c0 + 1],
+                # Date is the outer axis level, hour is the level next to the line.
+                "categories_data": [dates, times],
                 "values": ["_ChartData", 1, c0 + 2, n, c0 + 2],
-                "line": {"color": RED, "width": 1.25, "dash_type": "dash"},
-                "marker": {"type": "none"},
-            }
-        )
-        chart.add_series(
-            {
-                "name": "Tx Total BW",
-                "categories": ["_ChartData", 1, c0, n, c0],
-                "values": ["_ChartData", 1, c0 + 3, n, c0 + 3],
-                "line": {"color": "#808080", "width": 1.0, "dash_type": "dash"},
+                "line": {"color": "#5B9BD5", "width": 1.5},
                 "marker": {"type": "none"},
             }
         )
         chart.set_x_axis(
             {
                 "name": "Date & Time",
-                "name_font": {"name": "Calibri", "size": 9, "bold": True, "color": GREY},
-                "num_font": {"name": "Calibri", "size": 8, "rotation": -45},
-                "date_axis": True,
-                "num_format": "dd-mmm",
-                "major_unit": 1,
-                "major_unit_type": "days",
+                "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
+                "num_font": {"name": "Calibri", "size": 8},
                 "label_position": "low",
-                "major_gridlines": {"visible": True, "line": {"color": "#E6E6E6"}},
+                "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
+                "minor_gridlines": {"visible": False},
             }
         )
         chart.set_y_axis(
             {
                 "name": "Mbit/s",
-                "name_font": {"name": "Calibri", "size": 9, "bold": True, "color": GREY},
-                "num_font": {"name": "Calibri", "size": 8},
+                "name_font": {"name": "Calibri", "size": 10, "bold": True, "color": "black"},
+                "num_font": {"name": "Calibri", "size": 9},
                 "min": 0,
                 "max": _y_max(rec),
                 "major_unit": 50,
@@ -546,9 +535,11 @@ def _write_snapshots(book, styles, work, records, period_txt) -> dict[str, int]:
         )
         chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
-        chart.set_plotarea({"border": {"color": "#D0D0D0"}, "fill": {"color": "white"}})
-        chart.set_size({"width": 860, "height": 320})
-        ws.insert_chart(top + 4, 0, chart, {"x_offset": 8, "y_offset": 4})
+        chart.set_plotarea({"border": {"color": "#BFBFBF"}, "fill": {"color": "white"}})
+        # Wide enough that 00:00, 02:00, 04:00 stay readable across every day,
+        # the same axis as the sample snap. Scroll right to see later days.
+        chart.set_size({"width": 5400, "height": 420})
+        ws.insert_chart(top + 4, 0, chart, {"x_offset": 6, "y_offset": 6})
 
         for r in range(top + 4, top + block):
             ws.set_row(r, 15)
@@ -790,7 +781,7 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
 
 
 
-BLOCK_ROWS = 28
+BLOCK_ROWS = 36
 
 
 def main() -> None:
@@ -804,7 +795,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v2.xlsx",
+        default="FEGE_Choked_Flat_Sites_v3.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -842,6 +833,149 @@ def main() -> None:
     print(f"Wrote {output}")
 
 
+def _write_summary(book, styles, source_name, period_txt, n_sites, records):
+    """One sheet that shows the result without opening the other pages."""
+    ws = book.add_worksheet("Summary")
+    _page(ws, "FEGE choke check — at a glance")
+    ws.set_tab_color("#C65911")
+
+    widths = [6, 16, 16, 14, 18, 16, 14, 16]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    big = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 22,
+            "bold": True,
+            "font_color": NAVY,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": PALE,
+        }
+    )
+    big_alert = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 22,
+            "bold": True,
+            "font_color": ORANGE_FONT,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": ORANGE,
+        }
+    )
+    tile = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 9,
+            "bold": True,
+            "font_color": GREY,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": PALE,
+        }
+    )
+    tile_alert = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 9,
+            "bold": True,
+            "font_color": ORANGE_FONT,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": ORANGE,
+        }
+    )
+
+    counts = defaultdict(int)
+    for rec in records:
+        counts[rec["finding"]] += 1
+
+    ws.set_row(0, 28)
+    ws.merge_range("A1:H1", "FEGE choke check — at a glance", styles["title"])
+    ws.set_row(1, 18)
+    ws.merge_range(
+        "A2:H2",
+        f"DHK 5G    ·    {period_txt}    ·    hourly    ·    {source_name}",
+        styles["subtitle"],
+    )
+
+    tiles = [
+        (0, "Sites checked", n_sites, False),
+        (2, "Choked / flat", len(records), True),
+        (4, "At Tx BW", counts["At Tx BW"], True),
+        (6, "Above / below Tx BW", f"{counts['Above Tx BW']}  /  {counts['Below Tx BW']}", False),
+    ]
+    ws.set_row(3, 18)
+    ws.set_row(4, 32)
+    for col, label, value, alert in tiles:
+        label_fmt = tile_alert if alert else tile
+        value_fmt = big_alert if alert else big
+        ws.merge_range(3, col, 3, col + 1, label, label_fmt)
+        if isinstance(value, int):
+            ws.merge_range(4, col, 4, col + 1, value, value_fmt)
+        else:
+            ws.merge_range(4, col, 4, col + 1, value, value_fmt)
+
+    ws.set_row(5, 28)
+    ws.merge_range(
+        5,
+        0,
+        5,
+        7,
+        "Stuck RxMaxSpeed is the flat ceiling. Busy on cap is the share of hours "
+        "from 08:00 to 22:00 sitting on that ceiling. Open a site name for its snapshot. "
+        "At Tx BW = ceiling is 85–120% of FEGE bandwidth. Above = higher than the counter. "
+        "Below = stuck under 85% of FEGE bandwidth.",
+        styles["note"],
+    )
+
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Finding",
+        "Tx BW (Mbit/s)",
+        "Stuck Rx (Mbit/s)",
+        "Busy on cap",
+        "Days on cap",
+        "Longest flat (h)",
+    ]
+    header_row = 7
+    ws.set_row(header_row, 22)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, styles["header"])
+
+    for i, rec in enumerate(records):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 18)
+        nfmt = styles["num_z"] if zebra else styles["num"]
+        cfmt = styles["center_z"] if zebra else styles["center"]
+        link = styles["link_z"] if zebra else styles["link"]
+        excel_anchor = i * BLOCK_ROWS + 1
+        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        ws.write_url(
+            row,
+            1,
+            f"internal:'2. Snapshots'!A{excel_anchor}",
+            link,
+            string=rec["site"],
+        )
+        ws.write_string(row, 2, rec["finding"], _finding_format(styles, rec["finding"], zebra))
+        ws.write_number(row, 3, rec["bw"], nfmt)
+        ws.write_number(row, 4, rec["center"], nfmt)
+        ws.write_string(row, 5, f"{rec['busy_pct']:.0f}%", cfmt)
+        ws.write_string(row, 6, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
+        ws.write_number(row, 7, rec["longest"], styles["int_z"] if zebra else styles["int"])
+
+    last = header_row + len(records)
+    ws.autofilter(header_row, 0, last, len(headers) - 1)
+    ws.freeze_panes(header_row + 1, 0)
+    ws.repeat_rows(header_row, header_row)
+    ws.set_zoom(110)
+
+
 def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: list[dict]) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
@@ -855,7 +989,8 @@ def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: l
         f"{period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')}"
     )
 
-    # Build list with links now that the stride is fixed, then snapshots.
+    # Summary is the first sheet so the file opens on the at-a-glance view.
+    _write_summary(book, styles, source_name, period_txt, n_sites, records)
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
     _write_snapshots(book, styles, work, records, period_txt)
     _write_hourly(book, styles, work, records)
