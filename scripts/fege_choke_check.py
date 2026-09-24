@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from xlsxwriter.utility import xl_rowcol_to_cell
 
 # Busy window used by the sample snaps: the line is flat through the day
 # and only leaves the cap in the night valley.
@@ -1229,7 +1230,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         lat_min = min(issue_lats) - lat_pad
         lat_max = max(issue_lats) + lat_pad
         lon_min = min(issue_lons) - lon_pad
-        lon_max = max(issue_lons) + lon_pad
+        lon_max = max(issue_lons) + lon_pad * 1.55
         zoom_other = [
             row
             for row in other_rows
@@ -1238,7 +1239,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
 
         # Store compact zoom-only ranges on the hidden sheet so each inset
         # does not duplicate the full 21,693-point national chart cache.
-        c0 = 8 + zoom_index * 4
+        c0 = 8 + zoom_index * 5
         data_ws.write_row(
             0,
             c0,
@@ -1247,6 +1248,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                 f"{label} Non-issue Longitude",
                 f"{label} Issue Latitude",
                 f"{label} Issue Longitude",
+                f"{label} Issue Label",
             ],
         )
         for row_index, row in enumerate(zoom_other, start=1):
@@ -1255,6 +1257,9 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         for row_index, row in enumerate(zoom_issues, start=1):
             data_ws.write_number(row_index, c0 + 2, row["lat"])
             data_ws.write_number(row_index, c0 + 3, row["lon"])
+            data_ws.write_string(
+                row_index, c0 + 4, f"{row['site']} ({row['severity']})"
+            )
 
         zoom_specs.append(
             {
@@ -1418,6 +1423,27 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                         "border": {"color": "#000000", "width": 0.5},
                         "fill": {"color": GEO_ISSUE},
                     },
+                    "data_labels": {
+                        "position": "right",
+                        "font": {
+                            "name": "Calibri",
+                            "size": 7,
+                            "bold": True,
+                            "color": "#C00000",
+                        },
+                        "custom": [
+                            {
+                                "value": "=%s!%s"
+                                % (
+                                    GEO_DATA_SHEET,
+                                    xl_rowcol_to_cell(
+                                        i + 1, c0 + 4, row_abs=True, col_abs=True
+                                    ),
+                                )
+                            }
+                            for i in range(zoom["issue_count"])
+                        ],
+                    },
                 }
             )
             zoom_chart.set_title(
@@ -1460,7 +1486,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "layout": {"x": 0.03, "y": 0.10, "width": 0.94, "height": 0.86},
                 }
             )
-            zoom_chart.set_size({"width": 420, "height": 390})
+            zoom_chart.set_size({"width": 460, "height": 420})
             ws.insert_chart(
                 anchor,
                 zoom_chart,
@@ -1485,7 +1511,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v20.xlsx",
+        default="FEGE_Choked_Flat_Sites_v21.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
