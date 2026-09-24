@@ -1112,7 +1112,7 @@ def load_site_geo(path: Path) -> pd.DataFrame:
 
 def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path) -> None:
     """Google-satellite GeoPlot: 4G / 5G / issue sites, plus area zooms."""
-    from geoplot_satellite import classify_rows, render_html, render_jpeg
+    from geoplot_satellite import classify_rows, render_html, render_map_images
 
     ws = book.add_worksheet(GEO_SHEET)
     _page(ws, "GeoPlot — 4G / 5G / issue sites")
@@ -1218,9 +1218,8 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
             }
         )
 
-    jpg_path = output.with_name(output.stem + "_GeoPlot.jpg")
     html_path = output.with_name(output.stem + "_GeoPlot.html")
-    render_jpeg(classified, zoom_specs, jpg_path)
+    maps = render_map_images(classified, zoom_specs, output.parent, output.stem + "_GeoPlot")
     render_html(classified, zoom_specs, html_path, f"{REPORT_TITLE} — GeoPlot")
 
     ws.set_column(0, 16, 14)
@@ -1237,11 +1236,15 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:N3",
-        "Cyan = 4G, Yellow = 5G, Red = issue sites. "
-        "Zoom maps show site names only. Open the HTML file for the interactive satellite map.",
+        "Each map is separate. Cyan = 4G, Yellow = 5G (larger on the national map), Red = issue sites. "
+        "Zoom maps show site names only. Open the HTML file for the interactive satellite maps.",
         styles["note"],
     )
-    ws.insert_image("A5", str(jpg_path), {"x_scale": 0.52, "y_scale": 0.52, "object_position": 2})
+    row = 5
+    for title, path in maps:
+        ws.merge_range(row, 0, row, 13, title, styles["section"])
+        ws.insert_image(row + 1, 0, str(path), {"x_scale": 0.62, "y_scale": 0.62, "object_position": 2})
+        row += 42
     ws.set_zoom(100)
 
 
@@ -1260,7 +1263,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v23.xlsx",
+        default="FEGE_Choked_Flat_Sites_v24.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

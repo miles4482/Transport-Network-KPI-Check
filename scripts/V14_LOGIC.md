@@ -69,6 +69,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v21 adds site-name labels on the four zoom maps only, each showing `Site (Severity)`. The national map stays unlabeled. File: `FEGE_Choked_Flat_Sites_v21.xlsx`.
 - v22 keeps zoom-only labels but drops severity from the text (`DHAPT35`) and uses a smaller 5-pt site-name font. File: `FEGE_Choked_Flat_Sites_v22.xlsx`.
 - v23 uses the updated physical-site database (`Tech` column). GeoPlot is a Google-satellite map with a three-entry legend: cyan 4G, yellow 5G, red issue sites. Interactive HTML plus a JPEG embedded on `5. GeoPlot`. File: `FEGE_Choked_Flat_Sites_v23.xlsx`.
+- v24 separates every map (national + four zooms) into individual JPEGs and full-width HTML sections. 5G markers are larger with a white halo so they stay visible on the national satellite map. File: `FEGE_Choked_Flat_Sites_v24.xlsx`.
 
 ## Jupyter (for local Windows use)
 
