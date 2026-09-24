@@ -1193,114 +1193,91 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         data_ws.write_string(r_idx, 6, row["severity"])
     issue_last = issue_first + len(issue_rows) - 1
 
-    # Minimal clean header on the GeoPlot sheet
-    widths = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]
-    for i, w in enumerate(widths):
-        ws.set_column(i, i, w)
-
+    # Map only: one title line, then the dot map. No table, no axes.
+    ws.set_column(0, 13, 16)
     ws.set_row(0, 28)
     ws.merge_range("A1:N1", f"{REPORT_TITLE} — GeoPlot", styles["title"])
-    ws.set_row(1, 18)
-    ws.merge_range(
-        "A2:N2",
-        f"Checked sites with coordinates: {len(issue_rows) + len(other_rows)}"
-        f"    ·    Issue sites (Dark Red): {len(issue_rows)}"
-        f"    ·    Non-issue sites (WhiteSmoke): {len(other_rows)}"
-        f"    ·    Source: {GEO_FILE}",
-        styles["subtitle"],
-    )
-    ws.set_row(2, 22)
-    ws.merge_range(
-        "A3:N3",
-        "Each circle represents a physical site. Dark Red = Choked issue site. "
-        "WhiteSmoke = Non-issue site. X = Longitude, Y = Latitude.",
-        styles["note"],
-    )
-    ws.set_row(3, 10)
+    ws.set_row(1, 8)
 
     lats = [r["lat"] for r in issue_rows + other_rows]
     lons = [r["lon"] for r in issue_rows + other_rows]
     if lats and lons:
-        lat_pad = max(0.02, (max(lats) - min(lats)) * 0.05)
-        lon_pad = max(0.02, (max(lons) - min(lons)) * 0.05)
+        # Square plot with true map proportions: one degree of longitude is
+        # shorter than one degree of latitude at this latitude, so the shorter
+        # side of the bounding box is widened until both sides match.
+        plot_px = 760
+        mid_lat = (min(lats) + max(lats)) / 2
+        cos_lat = max(0.2, float(np.cos(np.radians(mid_lat))))
+        lat_span = (max(lats) - min(lats)) * 1.06 or 0.02
+        lon_span = (max(lons) - min(lons)) * 1.06 or 0.02
+        lat_span = max(lat_span, lon_span * cos_lat)
+        lon_span = max(lon_span, lat_span / cos_lat)
+        lat_mid = (min(lats) + max(lats)) / 2
+        lon_mid = (min(lons) + max(lons)) / 2
+
         chart = book.add_chart({"type": "scatter", "subtype": "marker"})
         chart.show_hidden_data()
 
+        marker = {
+            "type": "circle",
+            "size": 7,
+            "border": {"color": "#000000", "width": 0.5},
+        }
         # Non-issue first so Dark Red issue points sit on top
         if other_rows:
             chart.add_series(
                 {
-                    "name": "Non-issue sites",
+                    "name": f"Non-issue sites ({len(other_rows)})",
                     "categories": [GEO_DATA_SHEET, other_first, 2, other_last, 2],
                     "values": [GEO_DATA_SHEET, other_first, 1, other_last, 1],
-                    "marker": {
-                        "type": "circle",
-                        "size": 7,
-                        "border": {"color": "#000000", "width": 0.75},
-                        "fill": {"color": WHITE_SMOKE},
-                    },
+                    "marker": {**marker, "fill": {"color": WHITE_SMOKE}},
                 }
             )
         if issue_rows:
             chart.add_series(
                 {
-                    "name": "Issue sites",
+                    "name": f"Issue sites ({len(issue_rows)})",
                     "categories": [GEO_DATA_SHEET, issue_first, 2, issue_last, 2],
                     "values": [GEO_DATA_SHEET, issue_first, 1, issue_last, 1],
-                    "marker": {
-                        "type": "circle",
-                        "size": 8,
-                        "border": {"color": "#000000", "width": 0.75},
-                        "fill": {"color": DARK_RED},
-                    },
+                    "marker": {**marker, "fill": {"color": DARK_RED}},
                 }
             )
 
-        chart.set_title(
-            {
-                "name": "TX Port Choke Check — Site Distribution Map",
-                "name_font": {"name": "Calibri", "size": 13, "bold": True, "color": "#1F4E79"},
-            }
-        )
+        chart.set_title({"none": True})
         chart.set_x_axis(
             {
-                "name": "Longitude",
-                "min": min(lons) - lon_pad,
-                "max": max(lons) + lon_pad,
-                "num_font": {"name": "Calibri", "size": 9, "color": "#595959"},
-                "name_font": {"name": "Calibri", "size": 10, "color": "#595959"},
+                "visible": False,
+                "min": lon_mid - lon_span / 2,
+                "max": lon_mid + lon_span / 2,
                 "major_gridlines": {"visible": False},
                 "minor_gridlines": {"visible": False},
-                "line": {"color": "#D0D0D0"},
             }
         )
         chart.set_y_axis(
             {
-                "name": "Latitude",
-                "min": min(lats) - lat_pad,
-                "max": max(lats) + lat_pad,
-                "num_font": {"name": "Calibri", "size": 9, "color": "#595959"},
-                "name_font": {"name": "Calibri", "size": 10, "color": "#595959"},
+                "visible": False,
+                "min": lat_mid - lat_span / 2,
+                "max": lat_mid + lat_span / 2,
                 "major_gridlines": {"visible": False},
                 "minor_gridlines": {"visible": False},
-                "line": {"color": "#D0D0D0"},
             }
         )
         chart.set_legend(
             {
                 "position": "bottom",
-                "font": {"name": "Calibri", "size": 10},
+                "font": {"name": "Calibri", "size": 10, "color": GREY},
             }
         )
-        chart.set_chartarea({"border": {"color": "#D0D0D0"}, "fill": {"color": "white"}})
+        chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
         chart.set_plotarea(
             {
                 "border": {"none": True},
                 "fill": {"color": "white"},
+                "layout": {"x": 0.02, "y": 0.02, "width": 0.96, "height": 0.90},
             }
         )
-        chart.set_size({"width": 1180, "height": 650})
-        ws.insert_chart("A5", chart, {"x_offset": 5, "y_offset": 5, "object_position": 2})
+        chart.set_size({"width": plot_px + 40, "height": plot_px + 90})
+        ws.insert_chart("A3", chart, {"x_offset": 5, "y_offset": 5, "object_position": 2})
 
     ws.set_zoom(100)
 
