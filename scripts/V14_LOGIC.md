@@ -62,7 +62,8 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - The long note under each chart KPI strip is removed.
 - File: `FEGE_Choked_Flat_Sites_v15.xlsx`
 - Each hourly chart has a red dashed straight line at **Stuck RxMaxSpeed**.
-- v17 adds sheet `5. GeoPlot`: Clean minimalist scatter map with Dark Red issue sites and WhiteSmoke non-issue sites; underlying data kept in hidden sheet `_GeoData` (no visible table on the map sheet). Coordinates from `Physical_Site_Database_24Sep26.xlsx`.
+- v17 adds sheet `5. GeoPlot`: Dark Red = issue sites, WhiteSmoke = non-issue sites, from `Physical_Site_Database_24Sep26.xlsx`.
+- v18: `5. GeoPlot` is map-only (no visible table). Coordinate series live on hidden `_GeoData`. Dark Red / WhiteSmoke circles with thin black borders on a white plot. File: `FEGE_Choked_Flat_Sites_v18.xlsx`.
 
 ## Jupyter (for local Windows use)
 

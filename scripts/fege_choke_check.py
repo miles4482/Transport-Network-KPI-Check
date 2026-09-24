@@ -1320,7 +1320,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v17.xlsx",
+        default="FEGE_Choked_Flat_Sites_v18.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
