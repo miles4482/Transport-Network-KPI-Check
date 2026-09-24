@@ -63,7 +63,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - File: `FEGE_Choked_Flat_Sites_v15.xlsx`
 - Each hourly chart has a red dashed straight line at **Stuck RxMaxSpeed**.
 - v17 adds sheet `5. GeoPlot`: Dark Red = issue sites, WhiteSmoke = non-issue sites, from `Physical_Site_Database_24Sep26.xlsx`.
-- v18: `5. GeoPlot` is map-only (no visible table). Coordinate series live on hidden `_GeoData`. Dark Red / WhiteSmoke circles with thin black borders on a white plot. File: `FEGE_Choked_Flat_Sites_v18.xlsx`.
+- v18: `5. GeoPlot` is map-only (no visible table). The full 21,693-site physical database forms the Bangladesh map: 78 issue sites are Dark Red and the other 21,615 physical sites are WhiteSmoke, with exactly two legend entries. Coordinate series live on hidden `_GeoData`. File: `FEGE_Choked_Flat_Sites_v18.xlsx`.
 
 ## Jupyter (for local Windows use)
 

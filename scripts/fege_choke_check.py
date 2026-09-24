@@ -1126,7 +1126,6 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
     issue_order = [rec["site"] for rec in records]
     issue_set = set(issue_order)
     sev_by_site = {rec["site"]: rec["severity"] for rec in records}
-    checked = sorted(set(work["eNodeB Name"].astype(str).str.strip()))
     by_code = geo.set_index("site")
 
     def lookup(site: str) -> dict | None:
@@ -1146,13 +1145,23 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
 
     issue_rows = [lookup(site) for site in issue_order]
     issue_rows = [r for r in issue_rows if r]
-    other_rows = []
-    for site in checked:
-        if site in issue_set:
-            continue
-        row = lookup(site)
-        if row:
-            other_rows.append(row)
+    # Use the complete physical-site database as the map background. Plotting
+    # only the 356 KPI-checked sites produces a small Dhaka-area cluster rather
+    # than the Bangladesh-shaped map requested by the user. The two categories
+    # remain unchanged: listed/choked sites are Issue; every other physical
+    # site is Non-issue.
+    other_rows = [
+        {
+            "site": str(row.site),
+            "lat": float(row.lat),
+            "lon": float(row.lon),
+            "district": str(row.district),
+            "region": str(row.region),
+            "severity": "—",
+        }
+        for row in geo.itertuples(index=False)
+        if str(row.site) not in issue_set
+    ]
 
     # Column headers in hidden sheet
     headers = [
@@ -1220,8 +1229,8 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
 
         marker = {
             "type": "circle",
-            "size": 7,
-            "border": {"color": "#000000", "width": 0.5},
+            "size": 5,
+            "border": {"color": "#000000", "width": 0.25},
         }
         # Non-issue first so Dark Red issue points sit on top
         if other_rows:
@@ -1239,7 +1248,11 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "name": f"Issue sites ({len(issue_rows)})",
                     "categories": [GEO_DATA_SHEET, issue_first, 2, issue_last, 2],
                     "values": [GEO_DATA_SHEET, issue_first, 1, issue_last, 1],
-                    "marker": {**marker, "fill": {"color": DARK_RED}},
+                    "marker": {
+                        **marker,
+                        "size": 7,
+                        "fill": {"color": DARK_RED},
+                    },
                 }
             )
 
