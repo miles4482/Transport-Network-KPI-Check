@@ -1202,8 +1202,75 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         data_ws.write_string(r_idx, 6, row["severity"])
     issue_last = issue_first + len(issue_rows) - 1
 
-    # Map only: one title line, then the dot map. No table, no axes.
-    ws.set_column(0, 13, 16)
+    # Four area-level zooms: the issue sites naturally form these four
+    # operational clusters. Each zoom includes every physical site inside its
+    # padded issue bounding box, not a separate zoom for each issue site.
+    zoom_groups = [
+        ("Dhaka Metro", "Dhaka", "Dhaka Metro"),
+        ("Dhaka North", "Dhaka", "Dhaka North"),
+        ("Dhaka West", "Dhaka", "Dhaka West"),
+        ("Gazipur", "Gazipur", "Dhaka North"),
+    ]
+    zoom_specs = []
+    for zoom_index, (label, district, region) in enumerate(zoom_groups):
+        zoom_issues = [
+            row
+            for row in issue_rows
+            if row["district"] == district and row["region"] == region
+        ]
+        if not zoom_issues:
+            continue
+
+        issue_lats = [row["lat"] for row in zoom_issues]
+        issue_lons = [row["lon"] for row in zoom_issues]
+        lat_pad = max(0.012, (max(issue_lats) - min(issue_lats)) * 0.22)
+        lon_pad = max(0.012, (max(issue_lons) - min(issue_lons)) * 0.22)
+        lat_min = min(issue_lats) - lat_pad
+        lat_max = max(issue_lats) + lat_pad
+        lon_min = min(issue_lons) - lon_pad
+        lon_max = max(issue_lons) + lon_pad
+        zoom_other = [
+            row
+            for row in other_rows
+            if lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max
+        ]
+
+        # Store compact zoom-only ranges on the hidden sheet so each inset
+        # does not duplicate the full 21,693-point national chart cache.
+        c0 = 8 + zoom_index * 4
+        data_ws.write_row(
+            0,
+            c0,
+            [
+                f"{label} Non-issue Latitude",
+                f"{label} Non-issue Longitude",
+                f"{label} Issue Latitude",
+                f"{label} Issue Longitude",
+            ],
+        )
+        for row_index, row in enumerate(zoom_other, start=1):
+            data_ws.write_number(row_index, c0, row["lat"])
+            data_ws.write_number(row_index, c0 + 1, row["lon"])
+        for row_index, row in enumerate(zoom_issues, start=1):
+            data_ws.write_number(row_index, c0 + 2, row["lat"])
+            data_ws.write_number(row_index, c0 + 3, row["lon"])
+
+        zoom_specs.append(
+            {
+                "label": label,
+                "issue_count": len(zoom_issues),
+                "other_count": len(zoom_other),
+                "col": c0,
+                "lat_min": lat_min,
+                "lat_max": lat_max,
+                "lon_min": lon_min,
+                "lon_max": lon_max,
+            }
+        )
+
+    # Map only: one title line, then the national map and four zoom panels.
+    # No table, visible axes, gridlines, or connector lines.
+    ws.set_column(0, 20, 12)
     ws.set_row(0, 28)
     ws.merge_range("A1:N1", f"{REPORT_TITLE} — GeoPlot", styles["title"])
     ws.set_row(1, 8)
@@ -1239,6 +1306,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "name": f"Non-issue sites ({len(other_rows)})",
                     "categories": [GEO_DATA_SHEET, other_first, 2, other_last, 2],
                     "values": [GEO_DATA_SHEET, other_first, 1, other_last, 1],
+                    "line": {"none": True},
                     "marker": {**marker, "fill": {"color": WHITE_SMOKE}},
                 }
             )
@@ -1248,6 +1316,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "name": f"Issue sites ({len(issue_rows)})",
                     "categories": [GEO_DATA_SHEET, issue_first, 2, issue_last, 2],
                     "values": [GEO_DATA_SHEET, issue_first, 1, issue_last, 1],
+                    "line": {"none": True},
                     "marker": {
                         **marker,
                         "size": 7,
@@ -1291,6 +1360,111 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         )
         chart.set_size({"width": plot_px + 40, "height": plot_px + 90})
         ws.insert_chart("A3", chart, {"x_offset": 5, "y_offset": 5, "object_position": 2})
+
+        zoom_anchors = ("J3", "O3", "J30", "O30")
+        for zoom, anchor in zip(zoom_specs, zoom_anchors):
+            zoom_chart = book.add_chart({"type": "scatter", "subtype": "marker"})
+            zoom_chart.show_hidden_data()
+            c0 = zoom["col"]
+            if zoom["other_count"]:
+                zoom_chart.add_series(
+                    {
+                        "name": "Non-issue sites",
+                        "categories": [
+                            GEO_DATA_SHEET,
+                            1,
+                            c0 + 1,
+                            zoom["other_count"],
+                            c0 + 1,
+                        ],
+                        "values": [
+                            GEO_DATA_SHEET,
+                            1,
+                            c0,
+                            zoom["other_count"],
+                            c0,
+                        ],
+                        "line": {"none": True},
+                        "marker": {
+                            "type": "circle",
+                            "size": 5,
+                            "border": {"color": "#000000", "width": 0.25},
+                            "fill": {"color": WHITE_SMOKE},
+                        },
+                    }
+                )
+            zoom_chart.add_series(
+                {
+                    "name": "Issue sites",
+                    "categories": [
+                        GEO_DATA_SHEET,
+                        1,
+                        c0 + 3,
+                        zoom["issue_count"],
+                        c0 + 3,
+                    ],
+                    "values": [
+                        GEO_DATA_SHEET,
+                        1,
+                        c0 + 2,
+                        zoom["issue_count"],
+                        c0 + 2,
+                    ],
+                    "line": {"none": True},
+                    "marker": {
+                        "type": "circle",
+                        "size": 8,
+                        "border": {"color": "#000000", "width": 0.35},
+                        "fill": {"color": DARK_RED},
+                    },
+                }
+            )
+            zoom_chart.set_title(
+                {
+                    "name": f"{zoom['label']} — {zoom['issue_count']} issue sites",
+                    "name_font": {
+                        "name": "Calibri",
+                        "size": 11,
+                        "bold": True,
+                        "color": NAVY,
+                    },
+                }
+            )
+            zoom_chart.set_x_axis(
+                {
+                    "visible": False,
+                    "min": zoom["lon_min"],
+                    "max": zoom["lon_max"],
+                    "major_gridlines": {"visible": False},
+                    "minor_gridlines": {"visible": False},
+                }
+            )
+            zoom_chart.set_y_axis(
+                {
+                    "visible": False,
+                    "min": zoom["lat_min"],
+                    "max": zoom["lat_max"],
+                    "major_gridlines": {"visible": False},
+                    "minor_gridlines": {"visible": False},
+                }
+            )
+            zoom_chart.set_legend({"none": True})
+            zoom_chart.set_chartarea(
+                {"border": {"color": "#D9E2F3", "width": 0.75}, "fill": {"color": "white"}}
+            )
+            zoom_chart.set_plotarea(
+                {
+                    "border": {"none": True},
+                    "fill": {"color": "white"},
+                    "layout": {"x": 0.03, "y": 0.10, "width": 0.94, "height": 0.86},
+                }
+            )
+            zoom_chart.set_size({"width": 420, "height": 390})
+            ws.insert_chart(
+                anchor,
+                zoom_chart,
+                {"x_offset": 5, "y_offset": 5, "object_position": 2},
+            )
 
     ws.set_zoom(100)
 
