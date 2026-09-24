@@ -75,6 +75,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v27 shrinks 4G markers on the national map and enlarges 5G so the 357 5G sites stay visible against the dense 4G layer. File: `FEGE_Choked_Flat_Sites_v27.xlsx`.
 - v28 uses the same compact marker size for 4G, 5G, and issue sites on the national map. Zoom-map marker sizes are unchanged. File: `FEGE_Choked_Flat_Sites_v28.xlsx`.
 - v29 draws antialiased circular markers so 4G/5G/issue dots stay round, not square. File: `FEGE_Choked_Flat_Sites_v29.xlsx`.
+- v30 is presentation only: Summary is renamed Dashboard; GeoPlot title is Transmission Link Health Monitoring; the Dashboard scored-on note and Site List formula/scoring lines move to 4. Method; freeze panes are removed. Detection stays at the v14/v17 78-site baseline. File: `FEGE_Choked_Flat_Sites_v30.xlsx`.
 
 ## Jupyter (for local Windows use)
 

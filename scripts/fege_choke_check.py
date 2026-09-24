@@ -84,6 +84,7 @@ SEV_LOW = "Low"
 REPORT_TITLE = "TX Port Choke Check"
 SNAP_SHEET = "2. HourlyChartOfIssueSites"
 GEO_SHEET = "5. GeoPlot"
+GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
 GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
 DARK_RED = "#8B0000"
@@ -900,7 +901,6 @@ def _write_hourly(book, styles, work, records):
 
     last = len(hourly)
     ws.autofilter(0, 0, max(last, 1), len(headers) - 1)
-    ws.freeze_panes(1, 0)
     ws.repeat_rows(0, 0)
     ws.set_zoom(110)
 
@@ -1074,6 +1074,53 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         styles["method_val"],
     )
 
+    last_day_hdr = records[0]["last_day_label"] if records else "last day"
+    kept_head = foot + 3
+    ws.set_row(kept_head, 20)
+    ws.merge_range(
+        kept_head,
+        0,
+        kept_head,
+        1,
+        "Notes kept from Dashboard and Site List",
+        styles["section"],
+    )
+    kept = [
+        (
+            "Dashboard listing note",
+            f"Scored on {period_txt} (latest {ANALYSIS_DAYS} days). "
+            f"Listed when ≥{MIN_DAYS_ON_CAP} days have ≥{STUCK_DAY_HOURS} hours on the cap "
+            f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
+            "Two cap shapes count: a crowded flat level (DHAPT35 shape) or a hard ceiling "
+            "the trace is clipped at and never rises above. Jagged traces with changing "
+            "peaks are not listed. Each hourly chart is the latest 3 days only. "
+            "Open a site name to see it.",
+        ),
+        (
+            "Site List counters",
+            "RxMaxSpeed (Mbit/s)  =  VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000"
+            "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000  "
+            f"(RAN-side, reference only)          Source: {source_name}",
+        ),
+        (
+            "Site List scoring note",
+            f"Scored on {period_txt} (16-Sep-26 to 22-Sep-26). "
+            f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
+            f"(busy 08:00–22:00 and off-peak / night). "
+            f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day "
+            "sit on the cap. "
+            f"Severity is hours on the cap: Severe ≥{SEV_SEVERE_PCT:.0f}%, "
+            f"High ≥{SEV_HIGH_PCT:.0f}%, Moderate ≥{SEV_MODERATE_PCT:.0f}%, Low below that. "
+            f"Cap shape: '{CAP_CROWDED}' or '{CAP_CEILING}'. "
+            "The hourly chart is the latest 3 days only. Open a site name to jump to it.",
+        ),
+    ]
+    for i, (key, val) in enumerate(kept):
+        r = kept_head + 1 + i
+        ws.set_row(r, 56)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
 
 
 def load_site_geo(path: Path) -> pd.DataFrame:
@@ -1228,11 +1275,11 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
 
     html_path = output.with_name(output.stem + "_GeoPlot.html")
     maps = render_map_images(classified, zoom_specs, output.parent, output.stem + "_GeoPlot")
-    render_html(classified, zoom_specs, html_path, f"{REPORT_TITLE} — GeoPlot")
+    render_html(classified, zoom_specs, html_path, GEO_TITLE)
 
     ws.set_column(0, 16, 14)
     ws.set_row(0, 28)
-    ws.merge_range("A1:N1", f"{REPORT_TITLE} — GeoPlot", styles["title"])
+    ws.merge_range("A1:N1", GEO_TITLE, styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
         "A2:N2",
@@ -1271,7 +1318,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v29.xlsx",
+        default="FEGE_Choked_Flat_Sites_v30.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1341,7 +1388,7 @@ def main() -> None:
 
 def _write_summary(book, styles, source_name, period_txt, n_sites, records):
     """One sheet that shows the result without opening the other pages."""
-    ws = book.add_worksheet("Summary")
+    ws = book.add_worksheet("Dashboard")
     _page(ws, REPORT_TITLE)
     ws.set_tab_color("#C65911")
 
@@ -1429,21 +1476,6 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         else:
             ws.merge_range(4, col, 4, col + 1, value, value_fmt)
 
-    ws.set_row(5, 32)
-    ws.merge_range(
-        5,
-        0,
-        5,
-        7,
-        f"Scored on {period_txt} (latest {ANALYSIS_DAYS} days). "
-        f"Listed when ≥{MIN_DAYS_ON_CAP} days have ≥{STUCK_DAY_HOURS} hours on the cap "
-        f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
-        "Two cap shapes count: a crowded flat level (DHAPT35 shape) or a hard ceiling the trace "
-        "is clipped at and never rises above. Jagged traces with changing peaks are not listed. "
-        "Each hourly chart is the latest 3 days only. Open a site name to see it.",
-        styles["note"],
-    )
-
     headers = [
         "No.",
         "eNodeB Name",
@@ -1454,7 +1486,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         "Last day cap",
         "Listed because",
     ]
-    row = 7
+    row = 6
     indexed = list(enumerate(records))
     for name, note in SEVERITY_NOTES:
         group = [(i, rec) for i, rec in indexed if rec["severity"] == name]
@@ -1499,7 +1531,6 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
             row += 1
         row += 1
 
-    ws.freeze_panes(6, 0)
     ws.set_zoom(110)
 
 
@@ -1522,7 +1553,7 @@ def _write_workbook(
         f"{period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')}"
     )
 
-    # Summary is the first sheet so the file opens on the report view.
+    # Dashboard is the first sheet so the file opens on the report view.
     chart_end = period_end.normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
     _write_summary(book, styles, source_name, period_txt, n_sites, records)
@@ -1555,27 +1586,6 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         f"{n_sites} sites checked    ·    {len(records)} issue sites",
         styles["subtitle"],
     )
-    ws.set_row(2, 32)
-    ws.merge_range(
-        f"A3:{last_col_letter}3",
-        "RxMaxSpeed (Mbit/s)  =  VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000"
-        "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000  (RAN-side, reference only)"
-        f"          Source: {source_name}",
-        styles["meta"],
-    )
-    ws.set_row(3, 40)
-    ws.merge_range(
-        f"A4:{last_col_letter}4",
-        f"Scored on {period_txt} (16-Sep-26 to 22-Sep-26). "
-        f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
-        f"(busy 08:00–22:00 and off-peak / night). "
-        f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day sit on the cap. "
-        f"Severity is hours on the cap: Severe ≥{SEV_SEVERE_PCT:.0f}%, High ≥{SEV_HIGH_PCT:.0f}%, "
-        f"Moderate ≥{SEV_MODERATE_PCT:.0f}%, Low below that. "
-        f"Cap shape: '{CAP_CROWDED}' or '{CAP_CEILING}'. "
-        "The hourly chart is the latest 3 days only. Open a site name to jump to it. Full rule on sheet 4.",
-        styles["note"],
-    )
 
     headers = [
         "No.",
@@ -1594,7 +1604,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         "Night Rx 02–06 (Mbit/s)",
         "Sample snap",
     ]
-    header_row = 5
+    header_row = 3
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
         ws.write(header_row, col, text, styles["header"])
@@ -1643,7 +1653,6 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
-    ws.freeze_panes(header_row + 1, 0)
     ws.repeat_rows(header_row, header_row)
 
     last_col = 14
