@@ -1178,8 +1178,8 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
         excel_row += 1
 
     classified = classify_rows(other_rows + issue_rows, issue_set)
-    n4 = sum(1 for r in classified if r["kind"] == "4G")
-    n5 = sum(1 for r in classified if r["kind"] == "5G")
+    n4 = sum(1 for r in classified if r["tech"] == "4G")
+    n5 = sum(1 for r in classified if r["tech"] == "5G")
     n_issue = sum(1 for r in classified if r["kind"] == "Issue")
 
     zoom_groups = [
@@ -1236,7 +1236,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:N3",
-        "Each map is separate. Cyan = 4G, Yellow = 5G (larger on the national map), Red = issue sites. "
+        "Each map is separate. Cyan = 4G, Yellow = 5G (357 total, including issue sites), Red = issue sites. "
         "Zoom maps show site names only. Open the HTML file for the interactive satellite maps.",
         styles["note"],
     )
@@ -1263,7 +1263,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v24.xlsx",
+        default="FEGE_Choked_Flat_Sites_v25.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

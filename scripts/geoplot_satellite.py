@@ -114,14 +114,14 @@ def _draw_points(
     # needs a larger marker and a white halo to stay visible.
     if emphasize_5g:
         styles = {
-            "4G": (COLOR_4G, 2, "#0B0E12", 1),
-            "5G": (COLOR_5G, 8, "#FFFFFF", 2),
+            "4G": (COLOR_4G, 4, "#0B0E12", 1),
+            "5G": (COLOR_5G, 6, "#FFFFFF", 1),
             "Issue": (COLOR_ISSUE, 7, "#FFFFFF", 2),
         }
     else:
         styles = {
-            "4G": (COLOR_4G, 3, "#111111", 1),
-            "5G": (COLOR_5G, 6, "#FFFFFF", 2),
+            "4G": (COLOR_4G, 4, "#111111", 1),
+            "5G": (COLOR_5G, 5, "#FFFFFF", 1),
             "Issue": (COLOR_ISSUE, 7, "#111111", 1),
         }
     for kind in ("4G", "5G", "Issue"):
@@ -140,16 +140,23 @@ def _draw_points(
                 draw.text((x + radius + 2, y - 5), row["site"], fill="#FFFFFF", font=font)
 
 
-def _legend_strip(width: int) -> Image.Image:
-    strip = Image.new("RGB", (width, 42), "#101418")
+def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Image:
+    strip = Image.new("RGB", (width, 48), "#101418")
     draw = ImageDraw.Draw(strip)
     font = _font(16)
-    items = [("4G sites", COLOR_4G), ("5G sites", COLOR_5G), ("Issue sites", COLOR_ISSUE)]
+    items = [
+        ("4G sites", COLOR_4G, 9),
+        ("5G sites", COLOR_5G, 6),
+        ("Issue sites", COLOR_ISSUE, 7),
+    ]
     x = 18
-    for name, color in items:
-        draw.ellipse((x, 12, x + 16, 28), fill=color, outline="#FFFFFF")
-        draw.text((x + 24, 11), name, fill="#F5F5F5", font=font)
-        x += 180
+    for name, color, radius in items:
+        count = (counts or {}).get(name.split()[0], None)
+        label = f"{name} ({count:,})" if count is not None else name
+        cy = 24
+        draw.ellipse((x - radius, cy - radius, x + radius, cy + radius), fill=color, outline="#FFFFFF")
+        draw.text((x + radius + 8, 14), label, fill="#F5F5F5", font=font)
+        x += 220
     return strip
 
 
@@ -162,8 +169,8 @@ def classify_rows(geo_rows: list[dict], issue_set: set[str]) -> list[dict]:
     return classified
 
 
-def _frame_map(panel: Image.Image, title: str) -> Image.Image:
-    legend = _legend_strip(max(panel.width, 720))
+def _frame_map(panel: Image.Image, title: str, counts: dict[str, int] | None = None) -> Image.Image:
+    legend = _legend_strip(max(panel.width, 780), counts)
     canvas = Image.new("RGB", (max(panel.width, legend.width), panel.height + legend.height + 36), "#0B0E12")
     canvas.paste(legend, (0, 0))
     ImageDraw.Draw(canvas).text((12, legend.height + 6), title, fill="#F5F5F5", font=_font(18))
@@ -171,10 +178,19 @@ def _frame_map(panel: Image.Image, title: str) -> Image.Image:
     return canvas
 
 
+def tech_counts(rows: list[dict]) -> dict[str, int]:
+    return {
+        "4G": sum(1 for r in rows if r.get("tech") == "4G"),
+        "5G": sum(1 for r in rows if r.get("tech") == "5G"),
+        "Issue": sum(1 for r in rows if r.get("kind") == "Issue"),
+    }
+
+
 def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, stem: str) -> list[tuple[str, Path]]:
     """Write one JPEG per map: national, then each zoom area."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     outputs: list[tuple[str, Path]] = []
+    counts = tech_counts(rows)
 
     lats = [r["lat"] for r in rows]
     lons = [r["lon"] for r in rows]
@@ -189,7 +205,7 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
     )
     _draw_points(national, rows, zoom, x0, y0, labels=False, emphasize_5g=True)
     national_path = dest_dir / f"{stem}_National.jpg"
-    _frame_map(national, "National map").save(national_path, format="JPEG", quality=92)
+    _frame_map(national, "National map", counts).save(national_path, format="JPEG", quality=92)
     outputs.append(("National map", national_path))
 
     for spec in zoom_specs:
@@ -197,7 +213,7 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
         _draw_points(panel, spec["rows"], z, zx, zy, labels=True, emphasize_5g=True)
         slug = spec["label"].replace(" ", "_")
         path = dest_dir / f"{stem}_{slug}.jpg"
-        _frame_map(panel, f"{spec['label']} — {spec['issue_count']} issue sites").save(
+        _frame_map(panel, f"{spec['label']} — {spec['issue_count']} issue sites", counts).save(
             path, format="JPEG", quality=92
         )
         outputs.append((f"{spec['label']} — {spec['issue_count']} issue sites", path))
@@ -225,6 +241,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
             for spec in zoom_specs
         ],
         "colors": {"4G": COLOR_4G, "5G": COLOR_5G, "Issue": COLOR_ISSUE},
+        "counts": tech_counts(rows),
         "title": title,
     }
     html = f"""<!DOCTYPE html>
@@ -246,13 +263,16 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
     .legend {{
       background: rgba(16,20,24,.86); padding: 8px 12px; border-radius: 6px; font-size: 13px;
     }}
-    .swatch {{ display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; border: 1px solid #fff; }}
+    .swatch {{ display: inline-block; border-radius: 50%; margin-right: 8px; border: 1px solid #fff; vertical-align: middle; }}
+    .swatch-4g {{ width: 16px; height: 16px; }}
+    .swatch-5g {{ width: 11px; height: 11px; }}
+    .swatch-issue {{ width: 13px; height: 13px; }}
     .leaflet-tooltip.site-label {{ background: rgba(16,20,24,.75); color: #fff; border: none; font-size: 10px; box-shadow: none; }}
   </style>
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · each map is separate · 5G markers are larger so they stay visible on the national map</p>
+  <p class="sub">Google satellite · each map is separate · 4G / 5G / issue legend uses database Tech counts</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>
@@ -266,9 +286,9 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       ];
       for (const p of ordered) {{
         const color = DATA.colors[p.kind] || "#ffffff";
-        const radius = p.kind === "5G" ? (national ? 8 : 7) : (p.kind === "Issue" ? 7 : (national ? 3 : 4));
+        const radius = p.kind === "5G" ? 6 : (p.kind === "Issue" ? 7 : 5);
         const marker = L.circleMarker([p.lat, p.lon], {{
-          radius, color: p.kind === "5G" ? "#ffffff" : "#111", weight: p.kind === "5G" ? 2 : 1,
+          radius, color: "#111", weight: 1,
           fillColor: color, fillOpacity: 0.98
         }});
         if (withLabels && p.kind === "Issue") {{
@@ -288,9 +308,10 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       const legend = L.control({{position: "topright"}});
       legend.onAdd = function () {{
         const div = L.DomUtil.create("div", "legend");
-        div.innerHTML = "<div><span class='swatch' style='background:{COLOR_4G}'></span>4G sites</div>"
-          + "<div><span class='swatch' style='background:{COLOR_5G}'></span>5G sites</div>"
-          + "<div><span class='swatch' style='background:{COLOR_ISSUE}'></span>Issue sites</div>";
+        const c = DATA.counts;
+        div.innerHTML = "<div><span class='swatch swatch-4g' style='background:{COLOR_4G}'></span>4G sites (" + c["4G"].toLocaleString() + ")</div>"
+          + "<div><span class='swatch swatch-5g' style='background:{COLOR_5G}'></span>5G sites (" + c["5G"].toLocaleString() + ")</div>"
+          + "<div><span class='swatch swatch-issue' style='background:{COLOR_ISSUE}'></span>Issue sites (" + c.Issue.toLocaleString() + ")</div>";
         return div;
       }};
       legend.addTo(map);
