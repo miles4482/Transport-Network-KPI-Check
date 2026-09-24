@@ -114,8 +114,8 @@ def _draw_points(
     # needs a larger marker and a white halo to stay visible.
     if emphasize_5g:
         styles = {
-            "4G": (COLOR_4G, 4, "#0B0E12", 1),
-            "5G": (COLOR_5G, 6, "#FFFFFF", 1),
+            "4G": (COLOR_4G, 2, "#0B0E12", 1),
+            "5G": (COLOR_5G, 8, "#FFFFFF", 2),
             "Issue": (COLOR_ISSUE, 7, "#FFFFFF", 2),
         }
     else:
@@ -210,7 +210,7 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
 
     for spec in zoom_specs:
         panel, z, zx, zy = _stitch(spec["lat_min"], spec["lat_max"], spec["lon_min"], spec["lon_max"], 1100)
-        _draw_points(panel, spec["rows"], z, zx, zy, labels=True, emphasize_5g=True)
+        _draw_points(panel, spec["rows"], z, zx, zy, labels=True, emphasize_5g=False)
         slug = spec["label"].replace(" ", "_")
         path = dest_dir / f"{stem}_{slug}.jpg"
         _frame_map(panel, f"{spec['label']} — {spec['issue_count']} issue sites", counts).save(
@@ -287,7 +287,9 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       ];
       for (const p of ordered) {{
         const color = DATA.colors[p.kind] || "#ffffff";
-        const radius = p.kind === "5G" ? 6 : (p.kind === "Issue" ? 7 : 5);
+        const radius = national
+          ? (p.kind === "5G" ? 8 : (p.kind === "Issue" ? 7 : 3))
+          : (p.kind === "5G" ? 6 : (p.kind === "Issue" ? 7 : 5));
         const marker = L.circleMarker([p.lat, p.lon], {{
           radius, color: "#111", weight: 1,
           fillColor: color, fillOpacity: 0.98
