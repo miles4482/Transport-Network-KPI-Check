@@ -67,6 +67,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v19 freezes that GeoPlot layout with no further map-logic change. File: `FEGE_Choked_Flat_Sites_v19.xlsx`.
 - v20 keeps the same map and zooms, but changes marker colours: non-issue sites are mid-gray `#B0B0B0` (less white), issue sites are bright red `#FF2B2B` and slightly larger. File: `FEGE_Choked_Flat_Sites_v20.xlsx`.
 - v21 adds site-name labels on the four zoom maps only, each showing `Site (Severity)`. The national map stays unlabeled. File: `FEGE_Choked_Flat_Sites_v21.xlsx`.
+- v22 keeps zoom-only labels but drops severity from the text (`DHAPT35`) and uses a smaller 5-pt site-name font. File: `FEGE_Choked_Flat_Sites_v22.xlsx`.
 
 ## Jupyter (for local Windows use)
 

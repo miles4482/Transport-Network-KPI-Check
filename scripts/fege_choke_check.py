@@ -1257,9 +1257,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         for row_index, row in enumerate(zoom_issues, start=1):
             data_ws.write_number(row_index, c0 + 2, row["lat"])
             data_ws.write_number(row_index, c0 + 3, row["lon"])
-            data_ws.write_string(
-                row_index, c0 + 4, f"{row['site']} ({row['severity']})"
-            )
+            data_ws.write_string(row_index, c0 + 4, row["site"])
 
         zoom_specs.append(
             {
@@ -1427,8 +1425,8 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                         "position": "right",
                         "font": {
                             "name": "Calibri",
-                            "size": 7,
-                            "bold": True,
+                            "size": 5,
+                            "bold": False,
                             "color": "#C00000",
                         },
                         "custom": [
@@ -1511,7 +1509,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v21.xlsx",
+        default="FEGE_Choked_Flat_Sites_v22.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
