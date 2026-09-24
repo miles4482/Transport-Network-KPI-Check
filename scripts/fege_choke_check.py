@@ -1202,14 +1202,22 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
         lon_pad = max(0.012, (max(issue_lons) - min(issue_lons)) * 0.22)
         lat_min, lat_max = min(issue_lats) - lat_pad, max(issue_lats) + lat_pad
         lon_min, lon_max = min(issue_lons) - lon_pad, max(issue_lons) + lon_pad * 1.35
-        zoom_rows = [
-            row for row in classified
-            if lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max
-        ]
+        issue_names = {row["site"] for row in zoom_issues}
+        zoom_rows = []
+        for row in classified:
+            if not (lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max):
+                continue
+            # Keep this zoom's issue count exact: neighbouring issue sites
+            # stay on the map as 5G context, not extra red dots.
+            if row["kind"] == "Issue" and row["site"] not in issue_names:
+                zoom_rows.append({**row, "kind": "5G"})
+            else:
+                zoom_rows.append(row)
         zoom_specs.append(
             {
                 "label": label,
                 "issue_count": len(zoom_issues),
+                "issue_sites": [row["site"] for row in zoom_issues],
                 "rows": zoom_rows,
                 "lat_min": lat_min,
                 "lat_max": lat_max,
@@ -1263,7 +1271,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v25.xlsx",
+        default="FEGE_Choked_Flat_Sites_v26.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

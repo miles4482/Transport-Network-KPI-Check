@@ -236,6 +236,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
             {
                 "label": spec["label"],
                 "issueCount": spec["issue_count"],
+                "issueSites": spec.get("issue_sites", []),
                 "bounds": [spec["lat_min"], spec["lon_min"], spec["lat_max"], spec["lon_max"]],
             }
             for spec in zoom_specs
@@ -332,7 +333,12 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         return {{
           id: "zoom" + i,
           title: z.label + " — " + z.issueCount + " issue sites",
-          points: DATA.points.filter(p => p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e),
+          points: DATA.points.filter(p => p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e).map(p => {{
+            if (p.kind === "Issue" && z.issueSites.length && !z.issueSites.includes(p.site)) {{
+              return Object.assign({{}}, p, {{kind: "5G"}});
+            }}
+            return p;
+          }}),
           bounds: [[s, w], [n, e]],
           labels: true,
           national: false

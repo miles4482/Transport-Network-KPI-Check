@@ -71,6 +71,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v23 uses the updated physical-site database (`Tech` column). GeoPlot is a Google-satellite map with a three-entry legend: cyan 4G, yellow 5G, red issue sites. Interactive HTML plus a JPEG embedded on `5. GeoPlot`. File: `FEGE_Choked_Flat_Sites_v23.xlsx`.
 - v24 separates every map (national + four zooms) into individual JPEGs and full-width HTML sections. 5G markers are larger with a white halo so they stay visible on the national satellite map. File: `FEGE_Choked_Flat_Sites_v24.xlsx`.
 - v25 adjusts marker/legend sizes (4G larger, 5G smaller) and reports the true Tech counts: 7,087 4G, 357 5G, 78 issue (all issue sites are 5G). File: `FEGE_Choked_Flat_Sites_v25.xlsx`.
+- v26 keeps each zoom map's red issue count exact (Dhaka Metro 27, Dhaka North 17, Dhaka West 16, Gazipur 18). Neighbouring issue sites in the padded view stay yellow 5G, not extra red. File: `FEGE_Choked_Flat_Sites_v26.xlsx`.
 
 ## Jupyter (for local Windows use)
 
