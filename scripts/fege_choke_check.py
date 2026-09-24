@@ -86,7 +86,8 @@ GEO_SHEET = "5. GeoPlot"
 GEO_DATA_SHEET = "_GeoData"
 GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
 DARK_RED = "#8B0000"
-WHITE_SMOKE = "#F5F5F5"
+GEO_ISSUE = "#FF2B2B"
+GEO_OTHER = "#B0B0B0"
 
 # Sites on the two sample charts. The report must contain both.
 REFERENCE_SITES = ("DHAPT35", "DHAPT48")
@@ -1106,13 +1107,13 @@ def load_site_geo(path: Path) -> pd.DataFrame:
 
 
 def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
-    """Lat/lon scatter: Dark Red issue sites, WhiteSmoke non-issue sites.
+    """Lat/lon scatter: bright-red issue sites, mid-gray non-issue sites.
 
     Clean map view matching the user reference:
     - Data stored in hidden sheet _GeoData (no tables on the map sheet).
     - Scatter chart with clean white plot area and chart area.
-    - Issue sites in Dark Red (#8B0000) with thin black border (#000000).
-    - Non-issue sites in WhiteSmoke (#F5F5F5) with thin black border (#000000).
+    - Issue sites in bright red (#FF2B2B) with a thin black border.
+    - Non-issue sites in mid-gray (#B0B0B0) with a thin black border.
     """
     ws = book.add_worksheet(GEO_SHEET)
     _page(ws, "GeoPlot — issue vs other sites")
@@ -1177,7 +1178,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         data_ws.write_string(0, col, text)
 
     # Write Non-issue rows first so they appear in rows 1..N
-    # (Non-issue plotted first so Dark Red issue points sit clearly on top)
+    # (Non-issue plotted first so issue points sit clearly on top)
     other_first = 1
     for i, row in enumerate(other_rows):
         r_idx = other_first + i
@@ -1299,7 +1300,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
             "size": 5,
             "border": {"color": "#000000", "width": 0.25},
         }
-        # Non-issue first so Dark Red issue points sit on top
+        # Non-issue first so highlighted issue points sit on top
         if other_rows:
             chart.add_series(
                 {
@@ -1307,7 +1308,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "categories": [GEO_DATA_SHEET, other_first, 2, other_last, 2],
                     "values": [GEO_DATA_SHEET, other_first, 1, other_last, 1],
                     "line": {"none": True},
-                    "marker": {**marker, "fill": {"color": WHITE_SMOKE}},
+                    "marker": {**marker, "fill": {"color": GEO_OTHER}},
                 }
             )
         if issue_rows:
@@ -1319,8 +1320,8 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "line": {"none": True},
                     "marker": {
                         **marker,
-                        "size": 7,
-                        "fill": {"color": DARK_RED},
+                        "size": 9,
+                        "fill": {"color": GEO_ISSUE},
                     },
                 }
             )
@@ -1389,7 +1390,7 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                             "type": "circle",
                             "size": 5,
                             "border": {"color": "#000000", "width": 0.25},
-                            "fill": {"color": WHITE_SMOKE},
+                            "fill": {"color": GEO_OTHER},
                         },
                     }
                 )
@@ -1413,9 +1414,9 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
                     "line": {"none": True},
                     "marker": {
                         "type": "circle",
-                        "size": 8,
-                        "border": {"color": "#000000", "width": 0.35},
-                        "fill": {"color": DARK_RED},
+                        "size": 10,
+                        "border": {"color": "#000000", "width": 0.5},
+                        "fill": {"color": GEO_ISSUE},
                     },
                 }
             )
@@ -1484,7 +1485,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v19.xlsx",
+        default="FEGE_Choked_Flat_Sites_v20.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

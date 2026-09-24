@@ -65,6 +65,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v17 adds sheet `5. GeoPlot`: Dark Red = issue sites, WhiteSmoke = non-issue sites, from `Physical_Site_Database_24Sep26.xlsx`.
 - v18: `5. GeoPlot` is map-only (no visible table). The full 21,693-site physical database forms the Bangladesh map: 78 issue sites are Dark Red and the other 21,615 physical sites are WhiteSmoke, with exactly two legend entries and no connecting lines. Four area-level inset maps zoom Dhaka Metro, Dhaka North, Dhaka West, and Gazipur; inset legends are suppressed so the national map remains the only two-entry legend. Coordinate series live on hidden `_GeoData`. File: `FEGE_Choked_Flat_Sites_v18.xlsx`.
 - v19 freezes that GeoPlot layout with no further map-logic change. File: `FEGE_Choked_Flat_Sites_v19.xlsx`.
+- v20 keeps the same map and zooms, but changes marker colours: non-issue sites are mid-gray `#B0B0B0` (less white), issue sites are bright red `#FF2B2B` and slightly larger. File: `FEGE_Choked_Flat_Sites_v20.xlsx`.
 
 ## Jupyter (for local Windows use)
 
