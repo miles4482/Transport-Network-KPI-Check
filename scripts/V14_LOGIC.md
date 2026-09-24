@@ -61,6 +61,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - Sheet `2. Snapshots` renamed to `2. HourlyChartOfIssueSites`.
 - The long note under each chart KPI strip is removed.
 - File: `FEGE_Choked_Flat_Sites_v15.xlsx`
+- Each hourly chart has a red dashed straight line at **Stuck RxMaxSpeed**.
 
 ## Jupyter (for local Windows use)
 
