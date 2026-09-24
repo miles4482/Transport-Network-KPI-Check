@@ -87,8 +87,9 @@ GEO_SHEET = "5. GeoPlot"
 GEO_DATA_SHEET = "_GeoData"
 GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
 DARK_RED = "#8B0000"
-GEO_ISSUE = "#FF2B2B"
-GEO_OTHER = "#B0B0B0"
+GEO_ISSUE = "#FF1744"
+GEO_4G = "#00E5FF"
+GEO_5G = "#FFD600"
 
 # Sites on the two sample charts. The report must contain both.
 REFERENCE_SITES = ("DHAPT35", "DHAPT48")
@@ -1093,6 +1094,7 @@ def load_site_geo(path: Path) -> pd.DataFrame:
     lon_col = pick("longitude", "lon", "long")
     district_col = cols.get("district")
     region_col = cols.get("region")
+    tech_col = cols.get("tech")
     geo = pd.DataFrame(
         {
             "site": raw[site_col].astype(str).str.strip(),
@@ -1100,6 +1102,7 @@ def load_site_geo(path: Path) -> pd.DataFrame:
             "lon": pd.to_numeric(raw[lon_col], errors="coerce"),
             "district": raw[district_col].astype(str) if district_col else "",
             "region": raw[region_col].astype(str) if region_col else "",
+            "tech": raw[tech_col].astype(str).str.strip() if tech_col else "",
         }
     )
     geo = geo.dropna(subset=["lat", "lon"])
@@ -1107,21 +1110,15 @@ def load_site_geo(path: Path) -> pd.DataFrame:
     return geo.drop_duplicates("site", keep="last")
 
 
-def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
-    """Lat/lon scatter: bright-red issue sites, mid-gray non-issue sites.
+def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path) -> None:
+    """Google-satellite GeoPlot: 4G / 5G / issue sites, plus area zooms."""
+    from geoplot_satellite import classify_rows, render_html, render_jpeg
 
-    Clean map view matching the user reference:
-    - Data stored in hidden sheet _GeoData (no tables on the map sheet).
-    - Scatter chart with clean white plot area and chart area.
-    - Issue sites in bright red (#FF2B2B) with a thin black border.
-    - Non-issue sites in mid-gray (#B0B0B0) with a thin black border.
-    """
     ws = book.add_worksheet(GEO_SHEET)
-    _page(ws, "GeoPlot — issue vs other sites")
+    _page(ws, "GeoPlot — 4G / 5G / issue sites")
     ws.set_tab_color(DARK_RED)
     ws.hide_gridlines(2)
 
-    # Hidden data sheet powering the chart
     data_ws = book.add_worksheet(GEO_DATA_SHEET)
     data_ws.hide()
 
@@ -1142,71 +1139,49 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
             "lon": float(row["lon"]),
             "district": str(row["district"]),
             "region": str(row["region"]),
+            "tech": str(row.get("tech", "")),
             "severity": sev_by_site.get(site, "—"),
         }
 
-    issue_rows = [lookup(site) for site in issue_order]
-    issue_rows = [r for r in issue_rows if r]
-    # Use the complete physical-site database as the map background. Plotting
-    # only the 356 KPI-checked sites produces a small Dhaka-area cluster rather
-    # than the Bangladesh-shaped map requested by the user. The two categories
-    # remain unchanged: listed/choked sites are Issue; every other physical
-    # site is Non-issue.
-    other_rows = [
-        {
-            "site": str(row.site),
-            "lat": float(row.lat),
-            "lon": float(row.lon),
-            "district": str(row.district),
-            "region": str(row.region),
-            "severity": "—",
-        }
-        for row in geo.itertuples(index=False)
-        if str(row.site) not in issue_set
-    ]
+    issue_rows = [r for r in (lookup(site) for site in issue_order) if r]
+    other_rows = []
+    for row in geo.itertuples(index=False):
+        site = str(row.site)
+        if site in issue_set:
+            continue
+        other_rows.append(
+            {
+                "site": site,
+                "lat": float(row.lat),
+                "lon": float(row.lon),
+                "district": str(row.district),
+                "region": str(row.region),
+                "tech": str(getattr(row, "tech", "")),
+                "severity": "—",
+            }
+        )
 
-    # Column headers in hidden sheet
-    headers = [
-        "Site",
-        "Latitude",
-        "Longitude",
-        "Status",
-        "District",
-        "Region",
-        "Severity",
-    ]
+    headers = ["Site", "Latitude", "Longitude", "Status", "Tech", "District", "Region", "Severity"]
     for col, text in enumerate(headers):
         data_ws.write_string(0, col, text)
+    excel_row = 1
+    for row in other_rows + issue_rows:
+        status = "Issue" if row["site"] in issue_set else "Non-issue"
+        data_ws.write_string(excel_row, 0, row["site"])
+        data_ws.write_number(excel_row, 1, row["lat"])
+        data_ws.write_number(excel_row, 2, row["lon"])
+        data_ws.write_string(excel_row, 3, status)
+        data_ws.write_string(excel_row, 4, row["tech"])
+        data_ws.write_string(excel_row, 5, row["district"])
+        data_ws.write_string(excel_row, 6, row["region"])
+        data_ws.write_string(excel_row, 7, row["severity"])
+        excel_row += 1
 
-    # Write Non-issue rows first so they appear in rows 1..N
-    # (Non-issue plotted first so issue points sit clearly on top)
-    other_first = 1
-    for i, row in enumerate(other_rows):
-        r_idx = other_first + i
-        data_ws.write_string(r_idx, 0, row["site"])
-        data_ws.write_number(r_idx, 1, row["lat"])
-        data_ws.write_number(r_idx, 2, row["lon"])
-        data_ws.write_string(r_idx, 3, "Non-issue")
-        data_ws.write_string(r_idx, 4, row["district"])
-        data_ws.write_string(r_idx, 5, row["region"])
-        data_ws.write_string(r_idx, 6, row["severity"])
-    other_last = other_first + len(other_rows) - 1
+    classified = classify_rows(other_rows + issue_rows, issue_set)
+    n4 = sum(1 for r in classified if r["kind"] == "4G")
+    n5 = sum(1 for r in classified if r["kind"] == "5G")
+    n_issue = sum(1 for r in classified if r["kind"] == "Issue")
 
-    issue_first = other_last + 1
-    for i, row in enumerate(issue_rows):
-        r_idx = issue_first + i
-        data_ws.write_string(r_idx, 0, row["site"])
-        data_ws.write_number(r_idx, 1, row["lat"])
-        data_ws.write_number(r_idx, 2, row["lon"])
-        data_ws.write_string(r_idx, 3, "Issue")
-        data_ws.write_string(r_idx, 4, row["district"])
-        data_ws.write_string(r_idx, 5, row["region"])
-        data_ws.write_string(r_idx, 6, row["severity"])
-    issue_last = issue_first + len(issue_rows) - 1
-
-    # Four area-level zooms: the issue sites naturally form these four
-    # operational clusters. Each zoom includes every physical site inside its
-    # padded issue bounding box, not a separate zoom for each issue site.
     zoom_groups = [
         ("Dhaka Metro", "Dhaka", "Dhaka Metro"),
         ("Dhaka North", "Dhaka", "Dhaka North"),
@@ -1214,57 +1189,28 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
         ("Gazipur", "Gazipur", "Dhaka North"),
     ]
     zoom_specs = []
-    for zoom_index, (label, district, region) in enumerate(zoom_groups):
+    for label, district, region in zoom_groups:
         zoom_issues = [
-            row
-            for row in issue_rows
+            row for row in issue_rows
             if row["district"] == district and row["region"] == region
         ]
         if not zoom_issues:
             continue
-
         issue_lats = [row["lat"] for row in zoom_issues]
         issue_lons = [row["lon"] for row in zoom_issues]
         lat_pad = max(0.012, (max(issue_lats) - min(issue_lats)) * 0.22)
         lon_pad = max(0.012, (max(issue_lons) - min(issue_lons)) * 0.22)
-        lat_min = min(issue_lats) - lat_pad
-        lat_max = max(issue_lats) + lat_pad
-        lon_min = min(issue_lons) - lon_pad
-        lon_max = max(issue_lons) + lon_pad * 1.55
-        zoom_other = [
-            row
-            for row in other_rows
+        lat_min, lat_max = min(issue_lats) - lat_pad, max(issue_lats) + lat_pad
+        lon_min, lon_max = min(issue_lons) - lon_pad, max(issue_lons) + lon_pad * 1.35
+        zoom_rows = [
+            row for row in classified
             if lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max
         ]
-
-        # Store compact zoom-only ranges on the hidden sheet so each inset
-        # does not duplicate the full 21,693-point national chart cache.
-        c0 = 8 + zoom_index * 5
-        data_ws.write_row(
-            0,
-            c0,
-            [
-                f"{label} Non-issue Latitude",
-                f"{label} Non-issue Longitude",
-                f"{label} Issue Latitude",
-                f"{label} Issue Longitude",
-                f"{label} Issue Label",
-            ],
-        )
-        for row_index, row in enumerate(zoom_other, start=1):
-            data_ws.write_number(row_index, c0, row["lat"])
-            data_ws.write_number(row_index, c0 + 1, row["lon"])
-        for row_index, row in enumerate(zoom_issues, start=1):
-            data_ws.write_number(row_index, c0 + 2, row["lat"])
-            data_ws.write_number(row_index, c0 + 3, row["lon"])
-            data_ws.write_string(row_index, c0 + 4, row["site"])
-
         zoom_specs.append(
             {
                 "label": label,
                 "issue_count": len(zoom_issues),
-                "other_count": len(zoom_other),
-                "col": c0,
+                "rows": zoom_rows,
                 "lat_min": lat_min,
                 "lat_max": lat_max,
                 "lon_min": lon_min,
@@ -1272,225 +1218,30 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
             }
         )
 
-    # Map only: one title line, then the national map and four zoom panels.
-    # No table, visible axes, gridlines, or connector lines.
-    ws.set_column(0, 20, 12)
+    jpg_path = output.with_name(output.stem + "_GeoPlot.jpg")
+    html_path = output.with_name(output.stem + "_GeoPlot.html")
+    render_jpeg(classified, zoom_specs, jpg_path)
+    render_html(classified, zoom_specs, html_path, f"{REPORT_TITLE} — GeoPlot")
+
+    ws.set_column(0, 16, 14)
     ws.set_row(0, 28)
     ws.merge_range("A1:N1", f"{REPORT_TITLE} — GeoPlot", styles["title"])
-    ws.set_row(1, 8)
-
-    lats = [r["lat"] for r in issue_rows + other_rows]
-    lons = [r["lon"] for r in issue_rows + other_rows]
-    if lats and lons:
-        # Square plot with true map proportions: one degree of longitude is
-        # shorter than one degree of latitude at this latitude, so the shorter
-        # side of the bounding box is widened until both sides match.
-        plot_px = 760
-        mid_lat = (min(lats) + max(lats)) / 2
-        cos_lat = max(0.2, float(np.cos(np.radians(mid_lat))))
-        lat_span = (max(lats) - min(lats)) * 1.06 or 0.02
-        lon_span = (max(lons) - min(lons)) * 1.06 or 0.02
-        lat_span = max(lat_span, lon_span * cos_lat)
-        lon_span = max(lon_span, lat_span / cos_lat)
-        lat_mid = (min(lats) + max(lats)) / 2
-        lon_mid = (min(lons) + max(lons)) / 2
-
-        chart = book.add_chart({"type": "scatter", "subtype": "marker"})
-        chart.show_hidden_data()
-
-        marker = {
-            "type": "circle",
-            "size": 5,
-            "border": {"color": "#000000", "width": 0.25},
-        }
-        # Non-issue first so highlighted issue points sit on top
-        if other_rows:
-            chart.add_series(
-                {
-                    "name": f"Non-issue sites ({len(other_rows)})",
-                    "categories": [GEO_DATA_SHEET, other_first, 2, other_last, 2],
-                    "values": [GEO_DATA_SHEET, other_first, 1, other_last, 1],
-                    "line": {"none": True},
-                    "marker": {**marker, "fill": {"color": GEO_OTHER}},
-                }
-            )
-        if issue_rows:
-            chart.add_series(
-                {
-                    "name": f"Issue sites ({len(issue_rows)})",
-                    "categories": [GEO_DATA_SHEET, issue_first, 2, issue_last, 2],
-                    "values": [GEO_DATA_SHEET, issue_first, 1, issue_last, 1],
-                    "line": {"none": True},
-                    "marker": {
-                        **marker,
-                        "size": 9,
-                        "fill": {"color": GEO_ISSUE},
-                    },
-                }
-            )
-
-        chart.set_title({"none": True})
-        chart.set_x_axis(
-            {
-                "visible": False,
-                "min": lon_mid - lon_span / 2,
-                "max": lon_mid + lon_span / 2,
-                "major_gridlines": {"visible": False},
-                "minor_gridlines": {"visible": False},
-            }
-        )
-        chart.set_y_axis(
-            {
-                "visible": False,
-                "min": lat_mid - lat_span / 2,
-                "max": lat_mid + lat_span / 2,
-                "major_gridlines": {"visible": False},
-                "minor_gridlines": {"visible": False},
-            }
-        )
-        chart.set_legend(
-            {
-                "position": "bottom",
-                "font": {"name": "Calibri", "size": 10, "color": GREY},
-            }
-        )
-        chart.set_chartarea({"border": {"none": True}, "fill": {"color": "white"}})
-        chart.set_plotarea(
-            {
-                "border": {"none": True},
-                "fill": {"color": "white"},
-                "layout": {"x": 0.02, "y": 0.02, "width": 0.96, "height": 0.90},
-            }
-        )
-        chart.set_size({"width": plot_px + 40, "height": plot_px + 90})
-        ws.insert_chart("A3", chart, {"x_offset": 5, "y_offset": 5, "object_position": 2})
-
-        zoom_anchors = ("J3", "O3", "J30", "O30")
-        for zoom, anchor in zip(zoom_specs, zoom_anchors):
-            zoom_chart = book.add_chart({"type": "scatter", "subtype": "marker"})
-            zoom_chart.show_hidden_data()
-            c0 = zoom["col"]
-            if zoom["other_count"]:
-                zoom_chart.add_series(
-                    {
-                        "name": "Non-issue sites",
-                        "categories": [
-                            GEO_DATA_SHEET,
-                            1,
-                            c0 + 1,
-                            zoom["other_count"],
-                            c0 + 1,
-                        ],
-                        "values": [
-                            GEO_DATA_SHEET,
-                            1,
-                            c0,
-                            zoom["other_count"],
-                            c0,
-                        ],
-                        "line": {"none": True},
-                        "marker": {
-                            "type": "circle",
-                            "size": 5,
-                            "border": {"color": "#000000", "width": 0.25},
-                            "fill": {"color": GEO_OTHER},
-                        },
-                    }
-                )
-            zoom_chart.add_series(
-                {
-                    "name": "Issue sites",
-                    "categories": [
-                        GEO_DATA_SHEET,
-                        1,
-                        c0 + 3,
-                        zoom["issue_count"],
-                        c0 + 3,
-                    ],
-                    "values": [
-                        GEO_DATA_SHEET,
-                        1,
-                        c0 + 2,
-                        zoom["issue_count"],
-                        c0 + 2,
-                    ],
-                    "line": {"none": True},
-                    "marker": {
-                        "type": "circle",
-                        "size": 10,
-                        "border": {"color": "#000000", "width": 0.5},
-                        "fill": {"color": GEO_ISSUE},
-                    },
-                    "data_labels": {
-                        "position": "right",
-                        "font": {
-                            "name": "Calibri",
-                            "size": 5,
-                            "bold": False,
-                            "color": "#C00000",
-                        },
-                        "custom": [
-                            {
-                                "value": "=%s!%s"
-                                % (
-                                    GEO_DATA_SHEET,
-                                    xl_rowcol_to_cell(
-                                        i + 1, c0 + 4, row_abs=True, col_abs=True
-                                    ),
-                                )
-                            }
-                            for i in range(zoom["issue_count"])
-                        ],
-                    },
-                }
-            )
-            zoom_chart.set_title(
-                {
-                    "name": f"{zoom['label']} — {zoom['issue_count']} issue sites",
-                    "name_font": {
-                        "name": "Calibri",
-                        "size": 11,
-                        "bold": True,
-                        "color": NAVY,
-                    },
-                }
-            )
-            zoom_chart.set_x_axis(
-                {
-                    "visible": False,
-                    "min": zoom["lon_min"],
-                    "max": zoom["lon_max"],
-                    "major_gridlines": {"visible": False},
-                    "minor_gridlines": {"visible": False},
-                }
-            )
-            zoom_chart.set_y_axis(
-                {
-                    "visible": False,
-                    "min": zoom["lat_min"],
-                    "max": zoom["lat_max"],
-                    "major_gridlines": {"visible": False},
-                    "minor_gridlines": {"visible": False},
-                }
-            )
-            zoom_chart.set_legend({"none": True})
-            zoom_chart.set_chartarea(
-                {"border": {"color": "#D9E2F3", "width": 0.75}, "fill": {"color": "white"}}
-            )
-            zoom_chart.set_plotarea(
-                {
-                    "border": {"none": True},
-                    "fill": {"color": "white"},
-                    "layout": {"x": 0.03, "y": 0.10, "width": 0.94, "height": 0.86},
-                }
-            )
-            zoom_chart.set_size({"width": 460, "height": 420})
-            ws.insert_chart(
-                anchor,
-                zoom_chart,
-                {"x_offset": 5, "y_offset": 5, "object_position": 2},
-            )
-
+    ws.set_row(1, 18)
+    ws.merge_range(
+        "A2:N2",
+        f"Google satellite    ·    Physical sites: {len(classified)}"
+        f"    ·    4G: {n4}    ·    5G: {n5}    ·    Issue: {n_issue}"
+        f"    ·    Source: {GEO_FILE}",
+        styles["subtitle"],
+    )
+    ws.set_row(2, 20)
+    ws.merge_range(
+        "A3:N3",
+        "Cyan = 4G, Yellow = 5G, Red = issue sites. "
+        "Zoom maps show site names only. Open the HTML file for the interactive satellite map.",
+        styles["note"],
+    )
+    ws.insert_image("A5", str(jpg_path), {"x_scale": 0.52, "y_scale": 0.52, "object_position": 2})
     ws.set_zoom(100)
 
 
@@ -1509,7 +1260,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v22.xlsx",
+        default="FEGE_Choked_Flat_Sites_v23.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1769,7 +1520,7 @@ def _write_workbook(
     _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
     if geo is not None and len(geo):
-        _write_geoplot(book, styles, work, records, geo)
+        _write_geoplot(book, styles, work, records, geo, path)
     book.close()
 
 
