@@ -110,13 +110,14 @@ def _draw_points(
         "5G": [r for r in rows if r["kind"] == "5G"],
         "Issue": [r for r in rows if r["kind"] == "Issue"],
     }
-    # On the national map, 5G is a small set inside a dense 4G layer, so it
-    # needs a larger marker and a white halo to stay visible.
+    # The national overview uses one compact marker size for all technologies.
+    # Only colour distinguishes 4G, 5G, and issue sites. Zoom maps retain their
+    # larger, category-specific marker sizes.
     if emphasize_5g:
         styles = {
             "4G": (COLOR_4G, 2, "#0B0E12", 1),
-            "5G": (COLOR_5G, 8, "#FFFFFF", 2),
-            "Issue": (COLOR_ISSUE, 7, "#FFFFFF", 2),
+            "5G": (COLOR_5G, 2, "#0B0E12", 1),
+            "Issue": (COLOR_ISSUE, 2, "#0B0E12", 1),
         }
     else:
         styles = {
@@ -288,7 +289,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       for (const p of ordered) {{
         const color = DATA.colors[p.kind] || "#ffffff";
         const radius = national
-          ? (p.kind === "5G" ? 8 : (p.kind === "Issue" ? 7 : 3))
+          ? 3
           : (p.kind === "5G" ? 6 : (p.kind === "Issue" ? 7 : 5));
         const marker = L.circleMarker([p.lat, p.lon], {{
           radius, color: "#111", weight: 1,

@@ -73,6 +73,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v25 adjusts marker/legend sizes (4G larger, 5G smaller) and reports the true Tech counts: 7,087 4G, 357 5G, 78 issue (all issue sites are 5G). File: `FEGE_Choked_Flat_Sites_v25.xlsx`.
 - v26 keeps each zoom map's red issue count exact (Dhaka Metro 27, Dhaka North 17, Dhaka West 16, Gazipur 18). Neighbouring issue sites in the padded view stay yellow 5G, not extra red. File: `FEGE_Choked_Flat_Sites_v26.xlsx`.
 - v27 shrinks 4G markers on the national map and enlarges 5G so the 357 5G sites stay visible against the dense 4G layer. File: `FEGE_Choked_Flat_Sites_v27.xlsx`.
+- v28 uses the same compact marker size for 4G, 5G, and issue sites on the national map. Zoom-map marker sizes are unchanged. File: `FEGE_Choked_Flat_Sites_v28.xlsx`.
 
 ## Jupyter (for local Windows use)
 
