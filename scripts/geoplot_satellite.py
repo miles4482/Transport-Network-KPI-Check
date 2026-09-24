@@ -93,6 +93,33 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _hex_rgba(color: str, alpha: int = 255) -> tuple[int, int, int, int]:
+    text = color.lstrip("#")
+    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16), alpha)
+
+
+def _circle_stamp(radius: int, fill: str, outline: str, ring: int = 1) -> Image.Image:
+    """Antialiased circle so small markers stay round instead of square."""
+    scale = 4
+    pad = max(ring, 1) + 2
+    outer = radius + pad
+    size = outer * 2 * scale
+    stamp = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(stamp)
+    cx = cy = size // 2
+    r = radius * scale
+    extra = max(ring, 1) * scale
+    draw.ellipse((cx - r - extra, cy - r - extra, cx + r + extra, cy + r + extra), fill=_hex_rgba(outline))
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=_hex_rgba(fill))
+    return stamp.resize((outer * 2, outer * 2), Image.Resampling.LANCZOS)
+
+
+def _paste_circle(img: Image.Image, x: int, y: int, stamp: Image.Image) -> None:
+    px = x - stamp.width // 2
+    py = y - stamp.height // 2
+    img.paste(stamp, (px, py), stamp)
+
+
 def _draw_points(
     img: Image.Image,
     rows: list[dict],
@@ -103,7 +130,6 @@ def _draw_points(
     labels: bool,
     emphasize_5g: bool = False,
 ) -> None:
-    draw = ImageDraw.Draw(img)
     font = _font(9)
     groups = {
         "4G": [r for r in rows if r["kind"] == "4G"],
@@ -125,20 +151,27 @@ def _draw_points(
             "5G": (COLOR_5G, 5, "#FFFFFF", 1),
             "Issue": (COLOR_ISSUE, 7, "#111111", 1),
         }
+    stamps = {
+        kind: _circle_stamp(radius, fill, outline, ring)
+        for kind, (fill, radius, outline, ring) in styles.items()
+    }
+    if img.mode != "RGBA":
+        base = img.convert("RGBA")
+    else:
+        base = img
     for kind in ("4G", "5G", "Issue"):
-        fill, radius, outline, ring = styles[kind]
+        _fill, radius, _outline, _ring = styles[kind]
+        stamp = stamps[kind]
         for row in groups[kind]:
             x, y = _to_px(row["lat"], row["lon"], zoom, x_origin, y_origin)
-            if not (0 <= x < img.width and 0 <= y < img.height):
+            if not (0 <= x < base.width and 0 <= y < base.height):
                 continue
-            if ring > 1:
-                draw.ellipse(
-                    (x - radius - ring, y - radius - ring, x + radius + ring, y + radius + ring),
-                    fill=outline,
-                )
-            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill, outline=outline)
+            _paste_circle(base, x, y, stamp)
             if labels and kind == "Issue":
+                draw = ImageDraw.Draw(base)
                 draw.text((x + radius + 2, y - 5), row["site"], fill="#FFFFFF", font=font)
+    finished = base.convert("RGB")
+    img.paste(finished)
 
 
 def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Image:
@@ -151,13 +184,15 @@ def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Ima
         ("Issue sites", COLOR_ISSUE, 7),
     ]
     x = 18
+    overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
     for name, color, radius in items:
         count = (counts or {}).get(name.split()[0], None)
         label = f"{name} ({count:,})" if count is not None else name
-        cy = 24
-        draw.ellipse((x - radius, cy - radius, x + radius, cy + radius), fill=color, outline="#FFFFFF")
-        draw.text((x + radius + 8, 14), label, fill="#F5F5F5", font=font)
+        stamp = _circle_stamp(radius, color, "#FFFFFF", 1)
+        _paste_circle(overlay, x, 24, stamp)
+        draw.text((x + radius + 10, 14), label, fill="#F5F5F5", font=font)
         x += 220
+    strip = Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
     return strip
 
 
