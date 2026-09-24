@@ -82,6 +82,10 @@ SEV_MODERATE = "Moderate"
 SEV_LOW = "Low"
 REPORT_TITLE = "TX Port Choke Check"
 SNAP_SHEET = "2. HourlyChartOfIssueSites"
+GEO_SHEET = "5. GeoPlot"
+GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
+DARK_RED = "#8B0000"
+WHITE_SMOKE = "#F5F5F5"
 
 # Sites on the two sample charts. The report must contain both.
 REFERENCE_SITES = ("DHAPT35", "DHAPT48")
@@ -1068,6 +1072,233 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
 
 
 
+def load_site_geo(path: Path) -> pd.DataFrame:
+    """Read the physical site database (Site Code, Latitude, Longitude)."""
+    raw = pd.read_excel(path)
+    cols = {str(c).strip().lower(): c for c in raw.columns}
+
+    def pick(*names):
+        for name in names:
+            if name in cols:
+                return cols[name]
+        raise SystemExit(
+            f"{path.name} is missing a required column. Need one of: {', '.join(names)}"
+        )
+
+    site_col = pick("site code", "sitecode", "site", "enodeb name")
+    lat_col = pick("latitude", "lat")
+    lon_col = pick("longitude", "lon", "long")
+    district_col = cols.get("district")
+    region_col = cols.get("region")
+    geo = pd.DataFrame(
+        {
+            "site": raw[site_col].astype(str).str.strip(),
+            "lat": pd.to_numeric(raw[lat_col], errors="coerce"),
+            "lon": pd.to_numeric(raw[lon_col], errors="coerce"),
+            "district": raw[district_col].astype(str) if district_col else "",
+            "region": raw[region_col].astype(str) if region_col else "",
+        }
+    )
+    geo = geo.dropna(subset=["lat", "lon"])
+    geo = geo[geo["site"] != ""]
+    return geo.drop_duplicates("site", keep="last")
+
+
+def _write_geoplot(book, styles, work, records, geo: pd.DataFrame) -> None:
+    """Lat/lon scatter: Dark Red issue sites, WhiteSmoke non-issue sites."""
+    ws = book.add_worksheet(GEO_SHEET)
+    _page(ws, "GeoPlot — issue vs other sites")
+    ws.set_tab_color(DARK_RED)
+
+    issue_order = [rec["site"] for rec in records]
+    issue_set = set(issue_order)
+    sev_by_site = {rec["site"]: rec["severity"] for rec in records}
+    checked = sorted(set(work["eNodeB Name"].astype(str).str.strip()))
+    by_code = geo.set_index("site")
+
+    def lookup(site: str) -> dict | None:
+        if site not in by_code.index:
+            return None
+        row = by_code.loc[site]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        return {
+            "site": site,
+            "lat": float(row["lat"]),
+            "lon": float(row["lon"]),
+            "district": str(row["district"]),
+            "region": str(row["region"]),
+            "severity": sev_by_site.get(site, "—"),
+        }
+
+    issue_rows = [lookup(site) for site in issue_order]
+    issue_rows = [r for r in issue_rows if r]
+    other_rows = []
+    for site in checked:
+        if site in issue_set:
+            continue
+        row = lookup(site)
+        if row:
+            other_rows.append(row)
+
+    widths = [6, 16, 12, 14, 14, 16, 18]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+    ws.set_column(8, 20, 12)
+
+    ws.set_row(0, 28)
+    ws.merge_range("A1:G1", f"{REPORT_TITLE} — GeoPlot", styles["title"])
+    ws.set_row(1, 18)
+    ws.merge_range(
+        "A2:G2",
+        f"Checked sites with coordinates: {len(issue_rows) + len(other_rows)}"
+        f"    ·    Issue sites (Dark Red): {len(issue_rows)}"
+        f"    ·    Non-issue sites (WhiteSmoke): {len(other_rows)}"
+        f"    ·    Source: {GEO_FILE}",
+        styles["subtitle"],
+    )
+    ws.set_row(2, 28)
+    ws.merge_range(
+        "A3:G3",
+        "Each point is a physical site. Dark Red = RxMaxSpeed choked / listed. "
+        "WhiteSmoke = checked in the KPI file but not listed. "
+        "X = Longitude, Y = Latitude.",
+        styles["note"],
+    )
+
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Status",
+        "Latitude",
+        "Longitude",
+        "District",
+        "Region",
+    ]
+
+    issue_head = 5
+    ws.set_row(issue_head, 20)
+    ws.merge_range(issue_head, 0, issue_head, 6, "Issue sites  ·  Dark Red", styles["section"])
+    ws.set_row(issue_head + 1, 22)
+    for col, text in enumerate(headers):
+        ws.write(issue_head + 1, col, text, styles["header"])
+
+    issue_first = issue_head + 2
+    for i, row in enumerate(issue_rows):
+        excel_row = issue_first + i
+        ws.set_row(excel_row, 16)
+        ws.write_number(excel_row, 0, i + 1, styles["int"])
+        ws.write_string(excel_row, 1, row["site"], styles["text"])
+        ws.write_string(excel_row, 2, "Issue", styles["severe"])
+        ws.write_number(excel_row, 3, row["lat"], styles["num"])
+        ws.write_number(excel_row, 4, row["lon"], styles["num"])
+        ws.write_string(excel_row, 5, row["district"], styles["text"])
+        ws.write_string(excel_row, 6, row["region"], styles["text"])
+    issue_last = issue_first + max(len(issue_rows), 1) - 1
+
+    other_head = issue_last + 2
+    ws.set_row(other_head, 20)
+    ws.merge_range(other_head, 0, other_head, 6, "Non-issue sites  ·  WhiteSmoke", styles["section"])
+    ws.set_row(other_head + 1, 22)
+    for col, text in enumerate(headers):
+        ws.write(other_head + 1, col, text, styles["header"])
+    other_first = other_head + 2
+    for i, row in enumerate(other_rows):
+        excel_row = other_first + i
+        zebra = i % 2 == 1
+        ws.set_row(excel_row, 16)
+        ws.write_number(excel_row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        ws.write_string(excel_row, 1, row["site"], styles["text_z"] if zebra else styles["text"])
+        ws.write_string(excel_row, 2, "Non-issue", styles["center_z"] if zebra else styles["center"])
+        ws.write_number(excel_row, 3, row["lat"], styles["num_z"] if zebra else styles["num"])
+        ws.write_number(excel_row, 4, row["lon"], styles["num_z"] if zebra else styles["num"])
+        ws.write_string(excel_row, 5, row["district"], styles["text_z"] if zebra else styles["text"])
+        ws.write_string(excel_row, 6, row["region"], styles["text_z"] if zebra else styles["text"])
+    other_last = other_first + max(len(other_rows), 1) - 1
+
+    lats = [r["lat"] for r in issue_rows + other_rows]
+    lons = [r["lon"] for r in issue_rows + other_rows]
+    if lats and lons:
+        lat_pad = max(0.02, (max(lats) - min(lats)) * 0.08)
+        lon_pad = max(0.02, (max(lons) - min(lons)) * 0.08)
+        chart = book.add_chart({"type": "scatter", "subtype": "marker"})
+        # Non-issue first so Dark Red issue points sit on top.
+        if other_rows:
+            chart.add_series(
+                {
+                    "name": "Non-issue sites",
+                    "categories": [GEO_SHEET, other_first, 4, other_last, 4],
+                    "values": [GEO_SHEET, other_first, 3, other_last, 3],
+                    "marker": {
+                        "type": "circle",
+                        "size": 7,
+                        "border": {"color": "#B0B0B0", "width": 0.75},
+                        "fill": {"color": WHITE_SMOKE},
+                    },
+                }
+            )
+        if issue_rows:
+            chart.add_series(
+                {
+                    "name": "Issue sites",
+                    "categories": [GEO_SHEET, issue_first, 4, issue_last, 4],
+                    "values": [GEO_SHEET, issue_first, 3, issue_last, 3],
+                    "marker": {
+                        "type": "circle",
+                        "size": 9,
+                        "border": {"color": "#5A0000", "width": 0.75},
+                        "fill": {"color": DARK_RED},
+                    },
+                }
+            )
+        chart.set_title(
+            {
+                "name": "TX issue sites — map view",
+                "name_font": {"name": "Calibri", "size": 14, "color": "#595959"},
+            }
+        )
+        chart.set_x_axis(
+            {
+                "name": "Longitude",
+                "min": min(lons) - lon_pad,
+                "max": max(lons) + lon_pad,
+                "num_font": {"name": "Calibri", "size": 8, "color": "#595959"},
+                "name_font": {"name": "Calibri", "size": 9, "color": "#595959"},
+                "major_gridlines": {"visible": True, "line": {"color": "#D0D0D0"}},
+                "line": {"color": "#B0B0B0"},
+            }
+        )
+        chart.set_y_axis(
+            {
+                "name": "Latitude",
+                "min": min(lats) - lat_pad,
+                "max": max(lats) + lat_pad,
+                "num_font": {"name": "Calibri", "size": 8, "color": "#595959"},
+                "name_font": {"name": "Calibri", "size": 9, "color": "#595959"},
+                "major_gridlines": {"visible": True, "line": {"color": "#D0D0D0"}},
+                "line": {"color": "#B0B0B0"},
+            }
+        )
+        chart.set_legend(
+            {
+                "position": "bottom",
+                "font": {"name": "Calibri", "size": 10},
+            }
+        )
+        chart.set_chartarea({"border": {"color": "#D0D0D0"}, "fill": {"color": "white"}})
+        chart.set_plotarea(
+            {
+                "border": {"none": True},
+                "fill": {"color": "#C5D0DC"},
+            }
+        )
+        chart.set_size({"width": 1180, "height": 620})
+        ws.insert_chart(4, 8, chart, {"x_offset": 8, "y_offset": 8, "object_position": 2})
+
+    ws.freeze_panes(issue_head + 2, 0)
+    ws.set_zoom(110)
+
+
 # Banner + KPI strip + a compact chart (about 1120 × 400 px).
 BLOCK_ROWS = 32
 
@@ -1083,7 +1314,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v15.xlsx",
+        default="FEGE_Choked_Flat_Sites_v17.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1099,9 +1330,16 @@ def main() -> None:
     work, records = analyse(raw)
     _require_references(records)
 
+    geo_path = source.parent / GEO_FILE
+    if not geo_path.exists():
+        geo_path = Path(GEO_FILE)
+    if not geo_path.exists():
+        raise SystemExit(f"Physical site database not found: {GEO_FILE}")
+    geo = load_site_geo(geo_path)
+
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
-    _write_workbook(output, source.name, work, records)
+    _write_workbook(output, source.name, work, records, geo)
 
     by_sev = defaultdict(int)
     for rec in records:
@@ -1308,7 +1546,13 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
     ws.set_zoom(110)
 
 
-def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: list[dict]) -> None:
+def _write_workbook(
+    path: Path,
+    source_name: str,
+    work: pd.DataFrame,
+    records: list[dict],
+    geo: pd.DataFrame | None = None,
+) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
 
@@ -1329,6 +1573,8 @@ def _write_workbook(path: Path, source_name: str, work: pd.DataFrame, records: l
     _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
     _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
+    if geo is not None and len(geo):
+        _write_geoplot(book, styles, work, records, geo)
     book.close()
 
 
