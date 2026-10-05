@@ -92,6 +92,9 @@ GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
 GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
+TECH_FILE = "Site list_Dhaka_Tech_5oct.xlsx"
+TECH_4G = "4G"
+TECH_4G5G = "4G+5G"
 DARK_RED = "#8B0000"
 GEO_ISSUE = "#FF1744"
 GEO_4G = "#00E5FF"
@@ -1254,6 +1257,62 @@ def load_site_geo(path: Path) -> pd.DataFrame:
     return geo.drop_duplicates("site", keep="last")
 
 
+def _find_input(name: str, source: Path | None = None) -> Path | None:
+    candidates = []
+    if source is not None:
+        candidates.append(source.parent / name)
+    candidates.extend((Path(name), Path("/workspace") / name))
+    return next((path for path in candidates if path.exists()), None)
+
+
+def _norm_list_tech(value: object) -> str:
+    key = str(value or "").strip().upper().replace(" ", "")
+    if key in ("4G+5G", "4G5G"):
+        return TECH_4G5G
+    if key == "4G":
+        return TECH_4G
+    return str(value or "").strip()
+
+
+def load_site_tech(path: Path) -> dict[str, str]:
+    """Site Name / Tech list (4G vs 4G+5G) used only for the Dashboard summary."""
+    raw = pd.read_excel(path)
+    cols = {str(c).strip().lower(): c for c in raw.columns}
+    site_col = cols.get("site name") or cols.get("sitename") or cols.get("site")
+    tech_col = cols.get("tech")
+    if site_col is None or tech_col is None:
+        raise SystemExit(f"{path.name} needs Site Name and Tech columns")
+    out: dict[str, str] = {}
+    for site, tech in zip(raw[site_col], raw[tech_col]):
+        name = str(site).strip()
+        if name and name.lower() != "nan":
+            out[name] = _norm_list_tech(tech)
+    return out
+
+
+def summarise_tech(records: list[dict], tech_by_site: dict[str, str]) -> dict[str, int]:
+    checked_4g = sum(1 for tech in tech_by_site.values() if tech == TECH_4G)
+    checked_4g5g = sum(1 for tech in tech_by_site.values() if tech == TECH_4G5G)
+    choked_4g = 0
+    choked_4g5g = 0
+    unmapped = 0
+    for rec in records:
+        tech = tech_by_site.get(rec["site"])
+        if tech == TECH_4G:
+            choked_4g += 1
+        elif tech == TECH_4G5G:
+            choked_4g5g += 1
+        else:
+            unmapped += 1
+    return {
+        "checked_4g": checked_4g,
+        "checked_4g5g": checked_4g5g,
+        "choked_4g": choked_4g,
+        "choked_4g5g": choked_4g5g,
+        "unmapped": unmapped,
+    }
+
+
 def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path) -> None:
     """Google-satellite GeoPlot: 4G / 5G / issue sites, plus area zooms."""
     from geoplot_satellite import classify_rows, render_html, render_map_images
@@ -1415,7 +1474,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v32.xlsx",
+        default="FEGE_Choked_Flat_Sites_v33.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1431,25 +1490,19 @@ def main() -> None:
     work, records = analyse(raw)
     _require_references(records)
 
-    geo_path = next(
-        (
-            candidate
-            for candidate in (
-                source.parent / GEO_FILE,
-                Path(GEO_FILE),
-                Path("/workspace") / GEO_FILE,
-            )
-            if candidate.exists()
-        ),
-        None,
-    )
+    geo_path = _find_input(GEO_FILE, source)
     if geo_path is None:
         raise SystemExit(f"Physical site database not found: {GEO_FILE}")
     geo = load_site_geo(geo_path)
 
+    tech_path = _find_input(TECH_FILE, source)
+    if tech_path is None:
+        raise SystemExit(f"Dhaka tech site list not found: {TECH_FILE}")
+    tech_summary = summarise_tech(records, load_site_tech(tech_path))
+
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
-    _write_workbook(output, source.name, work, records, geo)
+    _write_workbook(output, source.name, work, records, geo, tech_summary)
 
     by_sev = defaultdict(int)
     for rec in records:
@@ -1457,6 +1510,12 @@ def main() -> None:
     print(f"Window: {work['Date'].min().date()} – {work['Date'].max().date()} ({ANALYSIS_DAYS} days, all hours)")
     print(f"Sites checked: {work['eNodeB Name'].nunique()}")
     print(f"Issue sites: {len(records)}")
+    print(
+        f"4G choked: {tech_summary['choked_4g']} of {tech_summary['checked_4g']}"
+    )
+    print(
+        f"4G+5G choked: {tech_summary['choked_4g5g']} of {tech_summary['checked_4g5g']}"
+    )
     print("Severity (hours on cap):")
     for name in (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW):
         print(f"  {name}: {by_sev[name]}")
@@ -1492,7 +1551,7 @@ def main() -> None:
     print(f"Wrote {output}")
 
 
-def _write_summary(book, styles, source_name, period_txt, n_sites, records):
+def _write_summary(book, styles, source_name, period_txt, n_sites, records, tech_summary=None):
     """One sheet that shows the result without opening the other pages."""
     ws = book.add_worksheet("Dashboard")
     _page(ws, REPORT_TITLE)
@@ -1582,6 +1641,31 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         else:
             ws.merge_range(4, col, 4, col + 1, value, value_fmt)
 
+    tech_summary = tech_summary or {}
+    if tech_summary:
+        ws.set_row(5, 20)
+        ws.merge_range(
+            5,
+            0,
+            5,
+            7,
+            f"4G / 4G+5G choke summary    ·    source: {TECH_FILE}",
+            styles["section"],
+        )
+        tech_tiles = [
+            (0, "4G sites checked", tech_summary["checked_4g"], False),
+            (2, "4G sites choked", tech_summary["choked_4g"], True),
+            (4, "4G+5G sites checked", tech_summary["checked_4g5g"], False),
+            (6, "4G+5G sites choked", tech_summary["choked_4g5g"], True),
+        ]
+        ws.set_row(6, 18)
+        ws.set_row(7, 32)
+        for col, label, value, alert in tech_tiles:
+            label_fmt = tile_alert if alert else tile
+            value_fmt = big_alert if alert else big
+            ws.merge_range(6, col, 6, col + 1, label, label_fmt)
+            ws.merge_range(7, col, 7, col + 1, value, value_fmt)
+
     headers = [
         "No.",
         "eNodeB Name",
@@ -1592,7 +1676,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
         "Last day cap",
         "Listed because",
     ]
-    row = 6
+    row = 9 if tech_summary else 6
     indexed = list(enumerate(records))
     for name, note in SEVERITY_NOTES:
         group = [(i, rec) for i, rec in indexed if rec["severity"] == name]
@@ -1646,6 +1730,7 @@ def _write_workbook(
     work: pd.DataFrame,
     records: list[dict],
     geo: pd.DataFrame | None = None,
+    tech_summary: dict[str, int] | None = None,
 ) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
@@ -1662,7 +1747,7 @@ def _write_workbook(
     # Dashboard is the first sheet so the file opens on the report view.
     chart_end = period_end.normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
-    _write_summary(book, styles, source_name, period_txt, n_sites, records)
+    _write_summary(book, styles, source_name, period_txt, n_sites, records, tech_summary)
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
     _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
     _write_hourly(book, styles, work, records)
