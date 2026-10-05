@@ -689,10 +689,38 @@ def _page(ws, title: str, *, fit_width: bool = True):
 
 
 
-def _chart_y_max(values: list[float]) -> int:
-    """Round the visible peak up to the next 100, with a little headroom."""
-    peak = max(values) if values else 100.0
-    return max(100, int(np.ceil(peak * 1.12 / 100.0) * 100))
+def _chart_y_scale(values: list[float]) -> tuple[int, int]:
+    """Pick Y max and tick size so a low stuck level is not lost on a 0–100 axis.
+
+    Example: DHDRS99 at 33.31 Mbit/s uses 0–50 with ticks of 10, not 0–100 / 50.
+    """
+    finite = [float(v) for v in values if np.isfinite(v)]
+    peak = max(finite) if finite else 50.0
+    target = max(peak * 1.15, peak + 4.0)
+    brackets = (
+        (25, 5),
+        (50, 10),
+        (75, 25),
+        (100, 25),
+        (125, 25),
+        (150, 25),
+        (200, 50),
+        (250, 50),
+        (300, 50),
+        (350, 50),
+        (400, 50),
+        (500, 100),
+        (600, 100),
+        (800, 100),
+        (1000, 200),
+        (1500, 250),
+        (2000, 250),
+    )
+    for y_max, unit in brackets:
+        if target <= y_max:
+            return y_max, unit
+    y_max = int(np.ceil(target / 200.0) * 200)
+    return max(y_max, 200), 200
 
 
 def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
@@ -845,12 +873,13 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                 "line": {"color": "#B0B0B0"},
             }
         )
+        y_max, y_unit = _chart_y_scale(plotted)
         chart.set_y_axis(
             {
                 "num_font": {"name": "Calibri", "size": 9, "color": "#595959"},
                 "min": 0,
-                "max": _chart_y_max(plotted),
-                "major_unit": 50,
+                "max": y_max,
+                "major_unit": y_unit,
                 "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
                 "line": {"none": True},
             }
@@ -1386,7 +1415,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v31.xlsx",
+        default="FEGE_Choked_Flat_Sites_v32.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

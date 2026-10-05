@@ -77,6 +77,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v29 draws antialiased circular markers so 4G/5G/issue dots stay round, not square. File: `FEGE_Choked_Flat_Sites_v29.xlsx`.
 - v30 is presentation only: Summary is renamed Dashboard; GeoPlot title is Transmission Link Health Monitoring; the Dashboard scored-on note and Site List formula/scoring lines move to 4. Method; freeze panes are removed. Detection stays at the v14/v17 78-site baseline. File: `FEGE_Choked_Flat_Sites_v30.xlsx`.
 - v31 rebuilds the report from the split Dhaka upload (`FEG_KPI_DHAKA_5Oct.part1.rar` + `.part2.rar`, combined to `FEG_KPI_DHAKA_5Oct.csv`). Scoring is 2–4 Oct 2026 only. The 28 Sep–1 Oct rows in that file are ignored. Listing thresholds are unchanged. File: `FEGE_Choked_Flat_Sites_v31.xlsx`.
+- v32 keeps that window and listing. Snapshot Y-axes are adaptive (DHDRS99 at 33.31 Mbit/s uses 0–50, not 0–100). File: `FEGE_Choked_Flat_Sites_v32.xlsx`.
 
 ## Jupyter (for local Windows use)
 
