@@ -1,4 +1,4 @@
-"""Google-satellite GeoPlot renderer for 4G / 5G / issue sites."""
+"""Google-satellite GeoPlot renderer for 4G / 5G coverage and 4G / 4G+5G issues."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ from PIL import Image, ImageDraw, ImageFont
 # Colours chosen to stay visible on Google satellite (dark greens / roofs).
 COLOR_4G = "#00E5FF"
 COLOR_5G = "#FFD600"
-COLOR_ISSUE = "#FF1744"
+COLOR_ISSUE_4G = "#FF1744"
+COLOR_ISSUE_4G5G = "#FF6D00"
+KIND_ISSUE_4G = "Issue 4G"
+KIND_ISSUE_4G5G = "Issue 4G+5G"
+ISSUE_KINDS = (KIND_ISSUE_4G, KIND_ISSUE_4G5G)
 TILE_SIZE = 256
 TILE_CACHE = Path("/tmp/google_sat_tiles")
 UA = "Mozilla/5.0 (compatible; TXPortChokeGeoPlot/1.0)"
@@ -134,6 +138,20 @@ def _paste_circle(img: Image.Image, x: int, y: int, stamp: Image.Image) -> None:
     img.paste(stamp, (px, py), stamp)
 
 
+def _is_issue_kind(kind: object) -> bool:
+    return str(kind or "") in ISSUE_KINDS
+
+
+def _issue_kind(site: str, physical_tech: str, tech_by_site: dict[str, str] | None) -> str:
+    """Map an issue site to 4G or 4G+5G using the Dhaka tech list."""
+    listed = str((tech_by_site or {}).get(site) or "").strip()
+    if listed == "4G+5G":
+        return KIND_ISSUE_4G5G
+    if listed == "4G":
+        return KIND_ISSUE_4G
+    return KIND_ISSUE_4G5G if physical_tech == "5G" else KIND_ISSUE_4G
+
+
 def _draw_points(
     img: Image.Image,
     rows: list[dict],
@@ -145,25 +163,23 @@ def _draw_points(
     emphasize_5g: bool = False,
 ) -> None:
     font = _font(9)
-    groups = {
-        "4G": [r for r in rows if r["kind"] == "4G"],
-        "5G": [r for r in rows if r["kind"] == "5G"],
-        "Issue": [r for r in rows if r["kind"] == "Issue"],
-    }
+    draw_order = ("4G", "5G", KIND_ISSUE_4G, KIND_ISSUE_4G5G)
+    groups = {kind: [r for r in rows if r["kind"] == kind] for kind in draw_order}
     # The national overview uses one compact marker size for all technologies.
-    # Only colour distinguishes 4G, 5G, and issue sites. Zoom maps retain their
-    # larger, category-specific marker sizes.
+    # Colour distinguishes 4G, 5G, and the two issue-tech legends.
     if emphasize_5g:
         styles = {
             "4G": (COLOR_4G, 2, "#0B0E12", 1),
             "5G": (COLOR_5G, 2, "#0B0E12", 1),
-            "Issue": (COLOR_ISSUE, 2, "#0B0E12", 1),
+            KIND_ISSUE_4G: (COLOR_ISSUE_4G, 2, "#0B0E12", 1),
+            KIND_ISSUE_4G5G: (COLOR_ISSUE_4G5G, 2, "#0B0E12", 1),
         }
     else:
         styles = {
             "4G": (COLOR_4G, 4, "#111111", 1),
             "5G": (COLOR_5G, 5, "#FFFFFF", 1),
-            "Issue": (COLOR_ISSUE, 7, "#111111", 1),
+            KIND_ISSUE_4G: (COLOR_ISSUE_4G, 7, "#111111", 1),
+            KIND_ISSUE_4G5G: (COLOR_ISSUE_4G5G, 7, "#FFFFFF", 1),
         }
     stamps = {
         kind: _circle_stamp(radius, fill, outline, ring)
@@ -173,7 +189,7 @@ def _draw_points(
         base = img.convert("RGBA")
     else:
         base = img
-    for kind in ("4G", "5G", "Issue"):
+    for kind in draw_order:
         _fill, radius, _outline, _ring = styles[kind]
         stamp = stamps[kind]
         for row in groups[kind]:
@@ -181,7 +197,7 @@ def _draw_points(
             if not (0 <= x < base.width and 0 <= y < base.height):
                 continue
             _paste_circle(base, x, y, stamp)
-            if labels and kind == "Issue":
+            if labels and _is_issue_kind(kind):
                 draw = ImageDraw.Draw(base)
                 draw.text((x + radius + 2, y - 5), row["site"], fill="#FFFFFF", font=font)
     finished = base.convert("RGB")
@@ -189,32 +205,52 @@ def _draw_points(
 
 
 def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Image:
-    strip = Image.new("RGB", (width, 48), "#101418")
+    """Two legends: coverage (4G / 5G) and issue tech (4G / 4G+5G)."""
+    strip = Image.new("RGB", (width, 78), "#101418")
     draw = ImageDraw.Draw(strip)
-    font = _font(16)
-    items = [
-        ("4G sites", COLOR_4G, 9),
-        ("5G sites", COLOR_5G, 6),
-        ("Issue sites", COLOR_ISSUE, 7),
+    font = _font(15)
+    group_font = _font(13)
+    groups = [
+        (
+            "Coverage",
+            12,
+            [
+                ("4G sites", COLOR_4G, 8, "4G"),
+                ("5G sites", COLOR_5G, 6, "5G"),
+            ],
+        ),
+        (
+            "Issue sites",
+            46,
+            [
+                ("Issue 4G", COLOR_ISSUE_4G, 7, KIND_ISSUE_4G),
+                ("Issue 4G+5G", COLOR_ISSUE_4G5G, 7, KIND_ISSUE_4G5G),
+            ],
+        ),
     ]
-    x = 18
     overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
-    for name, color, radius in items:
-        count = (counts or {}).get(name.split()[0], None)
-        label = f"{name} ({count:,})" if count is not None else name
-        stamp = _circle_stamp(radius, color, "#FFFFFF", 1)
-        _paste_circle(overlay, x, 24, stamp)
-        draw.text((x + radius + 10, 14), label, fill="#F5F5F5", font=font)
-        x += 220
-    strip = Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
-    return strip
+    for group_name, y, items in groups:
+        draw.text((14, y - 4), group_name, fill="#90A4AE", font=group_font)
+        x = 118
+        for name, color, radius, key in items:
+            count = (counts or {}).get(key)
+            label = f"{name} ({count:,})" if count is not None else name
+            stamp = _circle_stamp(radius, color, "#FFFFFF", 1)
+            _paste_circle(overlay, x, y + 8, stamp)
+            draw.text((x + radius + 10, y), label, fill="#F5F5F5", font=font)
+            x += 250
+    return Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
 
 
-def classify_rows(geo_rows: list[dict], issue_set: set[str]) -> list[dict]:
+def classify_rows(
+    geo_rows: list[dict],
+    issue_set: set[str],
+    tech_by_site: dict[str, str] | None = None,
+) -> list[dict]:
     classified = []
     for row in geo_rows:
         tech = _norm_tech(row.get("tech"))
-        kind = "Issue" if row["site"] in issue_set else tech
+        kind = _issue_kind(row["site"], tech, tech_by_site) if row["site"] in issue_set else tech
         classified.append({**row, "tech": tech, "kind": kind})
     return classified
 
@@ -230,9 +266,10 @@ def _frame_map(panel: Image.Image, title: str, counts: dict[str, int] | None = N
 
 def tech_counts(rows: list[dict]) -> dict[str, int]:
     return {
-        "4G": sum(1 for r in rows if r.get("tech") == "4G"),
-        "5G": sum(1 for r in rows if r.get("tech") == "5G"),
-        "Issue": sum(1 for r in rows if r.get("kind") == "Issue"),
+        "4G": sum(1 for r in rows if r.get("kind") == "4G"),
+        "5G": sum(1 for r in rows if r.get("kind") == "5G"),
+        KIND_ISSUE_4G: sum(1 for r in rows if r.get("kind") == KIND_ISSUE_4G),
+        KIND_ISSUE_4G5G: sum(1 for r in rows if r.get("kind") == KIND_ISSUE_4G5G),
     }
 
 
@@ -406,7 +443,8 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
         local = {
             "4G": sum(1 for r in spec["rows"] if r.get("kind") == "4G"),
             "5G": sum(1 for r in spec["rows"] if r.get("kind") == "5G"),
-            "Issue": spec["issue_count"],
+            KIND_ISSUE_4G: spec.get("issue_4g_count", 0),
+            KIND_ISSUE_4G5G: spec.get("issue_4g5g_count", 0),
         }
         title = f"{spec['label']} — {spec['issue_count']} issue sites"
         _frame_map(panel, title, local).save(path, format="JPEG", quality=88)
@@ -435,7 +473,12 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
             }
             for spec in zoom_specs
         ],
-        "colors": {"4G": COLOR_4G, "5G": COLOR_5G, "Issue": COLOR_ISSUE},
+        "colors": {
+            "4G": COLOR_4G,
+            "5G": COLOR_5G,
+            KIND_ISSUE_4G: COLOR_ISSUE_4G,
+            KIND_ISSUE_4G5G: COLOR_ISSUE_4G5G,
+        },
         "counts": tech_counts(rows),
         "title": title,
     }
@@ -461,13 +504,14 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
     .swatch {{ display: inline-block; border-radius: 50%; margin-right: 8px; border: 1px solid #fff; vertical-align: middle; }}
     .swatch-4g {{ width: 16px; height: 16px; }}
     .swatch-5g {{ width: 11px; height: 11px; }}
-    .swatch-issue {{ width: 13px; height: 13px; }}
+    .swatch-issue-4g {{ width: 13px; height: 13px; }}
+    .swatch-issue-4g5g {{ width: 13px; height: 13px; }}
     .leaflet-tooltip.site-label {{ background: rgba(16,20,24,.75); color: #fff; border: none; font-size: 10px; box-shadow: none; }}
   </style>
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · each map is separate · 4G / 5G / issue legend uses database Tech counts</p>
+  <p class="sub">Google satellite · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>
@@ -477,23 +521,33 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       const ordered = [
         ...points.filter(p => p.kind === "4G"),
         ...points.filter(p => p.kind === "5G"),
-        ...points.filter(p => p.kind === "Issue"),
+        ...points.filter(p => p.kind === "Issue 4G"),
+        ...points.filter(p => p.kind === "Issue 4G+5G"),
       ];
       for (const p of ordered) {{
         const color = DATA.colors[p.kind] || "#ffffff";
+        const isIssue = p.kind === "Issue 4G" || p.kind === "Issue 4G+5G";
         const radius = national
           ? 3
-          : (p.kind === "5G" ? 6 : (p.kind === "Issue" ? 7 : 5));
+          : (isIssue ? 7 : (p.kind === "5G" ? 6 : 5));
         const marker = L.circleMarker([p.lat, p.lon], {{
           radius, color: "#111", weight: 1,
           fillColor: color, fillOpacity: 0.98
         }});
-        if (withLabels && p.kind === "Issue") {{
+        if (withLabels && isIssue) {{
           marker.bindTooltip(p.site, {{permanent: true, direction: "right", className: "site-label"}});
         }}
         marker.addTo(layer);
       }}
       layer.addTo(map);
+    }}
+    function kindCounts(points) {{
+      return {{
+        "4G": points.filter(p => p.kind === "4G").length,
+        "5G": points.filter(p => p.kind === "5G").length,
+        "Issue 4G": points.filter(p => p.kind === "Issue 4G").length,
+        "Issue 4G+5G": points.filter(p => p.kind === "Issue 4G+5G").length,
+      }};
     }}
     function makeMap(id, points, bounds, withLabels, national) {{
       const map = L.map(id, {{ preferCanvas: true }});
@@ -505,10 +559,13 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       const legend = L.control({{position: "topright"}});
       legend.onAdd = function () {{
         const div = L.DomUtil.create("div", "legend");
-        const c = DATA.counts;
-        div.innerHTML = "<div><span class='swatch swatch-4g' style='background:{COLOR_4G}'></span>4G sites (" + c["4G"].toLocaleString() + ")</div>"
+        const c = kindCounts(points);
+        div.innerHTML = "<div style='color:#90A4AE;margin-bottom:4px'>Coverage</div>"
+          + "<div><span class='swatch swatch-4g' style='background:{COLOR_4G}'></span>4G sites (" + c["4G"].toLocaleString() + ")</div>"
           + "<div><span class='swatch swatch-5g' style='background:{COLOR_5G}'></span>5G sites (" + c["5G"].toLocaleString() + ")</div>"
-          + "<div><span class='swatch swatch-issue' style='background:{COLOR_ISSUE}'></span>Issue sites (" + c.Issue.toLocaleString() + ")</div>";
+          + "<div style='color:#90A4AE;margin:8px 0 4px'>Issue sites</div>"
+          + "<div><span class='swatch swatch-issue-4g' style='background:{COLOR_ISSUE_4G}'></span>Issue 4G (" + (c["Issue 4G"] || 0).toLocaleString() + ")</div>"
+          + "<div><span class='swatch swatch-issue-4g5g' style='background:{COLOR_ISSUE_4G5G}'></span>Issue 4G+5G (" + (c["Issue 4G+5G"] || 0).toLocaleString() + ")</div>";
         return div;
       }};
       legend.addTo(map);
@@ -530,8 +587,8 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
           id: "zoom" + i,
           title: z.label + " — " + z.issueCount + " issue sites",
           points: DATA.points.filter(p => p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e).map(p => {{
-            if (p.kind === "Issue" && z.issueSites.length && !z.issueSites.includes(p.site)) {{
-              return Object.assign({{}}, p, {{kind: "5G"}});
+            if ((p.kind === "Issue 4G" || p.kind === "Issue 4G+5G") && z.issueSites.length && !z.issueSites.includes(p.site)) {{
+              return Object.assign({{}}, p, {{kind: p.tech === "5G" ? "5G" : "4G"}});
             }}
             return p;
           }}),

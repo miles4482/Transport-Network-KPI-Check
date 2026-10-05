@@ -1335,9 +1335,19 @@ def cap_when_matrix(records: list[dict], tech_by_site: dict[str, str]) -> dict:
     return matrix
 
 
-def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path) -> None:
-    """Google-satellite GeoPlot: 4G / 5G / issue sites, plus area zooms."""
+def _write_geoplot(
+    book,
+    styles,
+    work,
+    records,
+    geo: pd.DataFrame,
+    output: Path,
+    tech_by_site: dict[str, str] | None = None,
+) -> None:
+    """Google-satellite GeoPlot: 4G / 5G coverage plus 4G / 4G+5G issue legends."""
     from geoplot_satellite import (
+        KIND_ISSUE_4G,
+        KIND_ISSUE_4G5G,
         classify_rows,
         cluster_bounds,
         cluster_issue_sites,
@@ -1393,26 +1403,31 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
             }
         )
 
-    headers = ["Site", "Latitude", "Longitude", "Status", "Tech", "District", "Region", "Severity"]
+    headers = ["Site", "Latitude", "Longitude", "Status", "Tech", "Issue Tech", "District", "Region", "Severity"]
     for col, text in enumerate(headers):
         data_ws.write_string(0, col, text)
     excel_row = 1
     for row in other_rows + issue_rows:
         status = "Issue" if row["site"] in issue_set else "Non-issue"
+        listed = (tech_by_site or {}).get(row["site"], "")
         data_ws.write_string(excel_row, 0, row["site"])
         data_ws.write_number(excel_row, 1, row["lat"])
         data_ws.write_number(excel_row, 2, row["lon"])
         data_ws.write_string(excel_row, 3, status)
         data_ws.write_string(excel_row, 4, row["tech"])
-        data_ws.write_string(excel_row, 5, row["district"])
-        data_ws.write_string(excel_row, 6, row["region"])
-        data_ws.write_string(excel_row, 7, row["severity"])
+        data_ws.write_string(excel_row, 5, listed if status == "Issue" else "")
+        data_ws.write_string(excel_row, 6, row["district"])
+        data_ws.write_string(excel_row, 7, row["region"])
+        data_ws.write_string(excel_row, 8, row["severity"])
         excel_row += 1
 
-    classified = classify_rows(other_rows + issue_rows, issue_set)
+    classified = classify_rows(other_rows + issue_rows, issue_set, tech_by_site)
+    kind_by_site = {row["site"]: row["kind"] for row in classified}
     n4 = sum(1 for r in classified if r["tech"] == "4G")
     n5 = sum(1 for r in classified if r["tech"] == "5G")
-    n_issue = sum(1 for r in classified if r["kind"] == "Issue")
+    n_issue_4g = sum(1 for r in classified if r["kind"] == KIND_ISSUE_4G)
+    n_issue_4g5g = sum(1 for r in classified if r["kind"] == KIND_ISSUE_4G5G)
+    n_issue = n_issue_4g + n_issue_4g5g
 
     zoom_specs = []
     for index, zoom_issues in enumerate(cluster_issue_sites(issue_rows), start=1):
@@ -1422,18 +1437,22 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
         for row in classified:
             if not (lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max):
                 continue
-            # Keep this cluster's red count exact: neighbouring issue sites
-            # stay on the map as 5G context, not extra red dots.
-            if row["kind"] == "Issue" and row["site"] not in issue_names:
-                zoom_rows.append({**row, "kind": "5G"})
+            # Keep this cluster's issue-legend counts exact: neighbouring
+            # issue sites stay as 4G/5G coverage, not extra issue dots.
+            if row["kind"] in (KIND_ISSUE_4G, KIND_ISSUE_4G5G) and row["site"] not in issue_names:
+                zoom_rows.append({**row, "kind": row["tech"] if row["tech"] in ("4G", "5G") else "4G"})
             else:
                 zoom_rows.append(row)
         label = cluster_label(zoom_issues, index)
+        issue_4g = sum(1 for row in zoom_issues if kind_by_site.get(row["site"]) == KIND_ISSUE_4G)
+        issue_4g5g = sum(1 for row in zoom_issues if kind_by_site.get(row["site"]) == KIND_ISSUE_4G5G)
         zoom_specs.append(
             {
                 "label": label,
                 "slug": f"Cluster_{index:02d}",
                 "issue_count": len(zoom_issues),
+                "issue_4g_count": issue_4g,
+                "issue_4g5g_count": issue_4g5g,
                 "issue_sites": [row["site"] for row in zoom_issues],
                 "rows": zoom_rows,
                 "lat_min": lat_min,
@@ -1454,8 +1473,9 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
     ws.merge_range(
         "A2:N2",
         f"Google satellite    ·    Physical sites: {len(classified)}"
-        f"    ·    4G: {n4}    ·    5G: {n5}    ·    Issue: {n_issue}"
-        f"    ·    Source: {GEO_FILE}",
+        f"    ·    4G: {n4}    ·    5G: {n5}"
+        f"    ·    Issue 4G: {n_issue_4g}    ·    Issue 4G+5G: {n_issue_4g5g}"
+        f"    ·    Source: {GEO_FILE} + {TECH_FILE}",
         styles["subtitle"],
     )
     ws.set_row(2, 20)
@@ -1464,7 +1484,8 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
         "National map is the overview. Issue clusters are built dynamically until every "
         f"issue site is covered ({len(zoom_specs)} maps). Urban clusters come first "
         "(Dhaka Metro, Gazipur, surrounding), then maps with more issue sites. "
-        "Cyan = 4G, Yellow = 5G, Red = issue sites. Open the HTML file for interactive maps.",
+        "Coverage: Cyan = 4G, Yellow = 5G. Issue sites: Red = 4G, Orange = 4G+5G. "
+        "Open the HTML file for interactive maps.",
         styles["note"],
     )
     row = 5
@@ -1490,7 +1511,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v37.xlsx",
+        default="FEGE_Choked_Flat_Sites_v38.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1864,7 +1885,7 @@ def _write_workbook(
     _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
     if geo is not None and len(geo):
-        _write_geoplot(book, styles, work, records, geo, path)
+        _write_geoplot(book, styles, work, records, geo, path, tech_by_site)
     book.close()
 
 
