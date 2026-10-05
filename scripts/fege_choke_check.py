@@ -86,7 +86,7 @@ SEV_SEVERE = "Severe"
 SEV_HIGH = "High"
 SEV_MODERATE = "Moderate"
 SEV_LOW = "Low"
-REPORT_TITLE = "TX Port Choke Check"
+REPORT_TITLE = "Transmission Link Health Review"
 SNAP_SHEET = "2. HourlyChartOfIssueSites"
 GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
@@ -266,8 +266,7 @@ SEVERITY_NOTES = (
     (
         SEV_SEVERE,
         f"Severe: the port sat on the cap at least {SEV_SEVERE_PCT:.0f}% of hours "
-        f"in the {ANALYSIS_DAYS}-day window. This is the DHAPT35 / DHAPT48 case — "
-        "the line is locked for most of the window.",
+        f"in the {ANALYSIS_DAYS}-day window.",
     ),
     (
         SEV_HIGH,
@@ -1474,7 +1473,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v33.xlsx",
+        default="FEGE_Choked_Flat_Sites_v34.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1871,8 +1870,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Busy hours",
-            "The ceiling is clear in 08:00–22:00. Night hours leave the cap "
-            "(same shape as DHAPT35 / DHAPT48).",
+            "The ceiling is clear in 08:00–22:00. Night hours leave the cap.",
         ),
         (
             "Off-peak",
