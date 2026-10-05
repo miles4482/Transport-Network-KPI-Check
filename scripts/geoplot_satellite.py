@@ -8,6 +8,7 @@ import urllib.request
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # Colours chosen to stay visible on Google satellite (dark greens / roofs).
@@ -222,6 +223,100 @@ def tech_counts(rows: list[dict]) -> dict[str, int]:
     }
 
 
+def _centroid(rows: list[dict]) -> tuple[float, float]:
+    return (
+        sum(r["lat"] for r in rows) / len(rows),
+        sum(r["lon"] for r in rows) / len(rows),
+    )
+
+
+def cluster_issue_sites(
+    issue_rows: list[dict],
+    *,
+    target: int = 16,
+    max_sites: int = 20,
+    far: float = 0.04,
+    hard: float = 0.055,
+    min_merge: int = 7,
+    max_merge: int = 22,
+    merge_dist: float = 0.07,
+) -> list[list[dict]]:
+    """Group issue sites into compact neighbourhoods for medium-scale maps."""
+    if not issue_rows:
+        return []
+    pts = np.array([[r["lat"], r["lon"]] for r in issue_rows], dtype=float)
+    unused = set(range(len(issue_rows)))
+    raw: list[list[dict]] = []
+    while unused:
+        start = min(unused, key=lambda i: (pts[i, 0], pts[i, 1]))
+        cluster = [start]
+        unused.remove(start)
+        while unused and len(cluster) < max_sites:
+            center = pts[cluster].mean(axis=0)
+            rest = np.fromiter(unused, dtype=int)
+            dist2 = ((pts[rest] - center) ** 2).sum(axis=1)
+            nearest = int(rest[int(dist2.argmin())])
+            dist = float(dist2.min()) ** 0.5
+            if len(cluster) >= target and dist > far:
+                break
+            if dist > hard and len(cluster) >= 8:
+                break
+            if dist > hard * 1.4:
+                break
+            cluster.append(nearest)
+            unused.remove(nearest)
+        raw.append([issue_rows[i] for i in cluster])
+
+    pending = [list(group) for group in raw]
+    locked: list[list[dict]] = []
+    while pending:
+        pending.sort(key=len)
+        if len(pending[0]) >= min_merge:
+            break
+        small = pending.pop(0)
+        sc = _centroid(small)
+        best_j, best_d = None, 1e9
+        for j, other in enumerate(pending):
+            if len(other) + len(small) > max_merge:
+                continue
+            oc = _centroid(other)
+            dist = ((sc[0] - oc[0]) ** 2 + (sc[1] - oc[1]) ** 2) ** 0.5
+            if dist <= merge_dist and dist < best_d:
+                best_d, best_j = dist, j
+        if best_j is None:
+            locked.append(small)
+            continue
+        pending[best_j].extend(small)
+    clusters = pending + locked
+    clusters.sort(key=lambda group: (-_centroid(group)[0], _centroid(group)[1]))
+    return clusters
+
+
+def cluster_label(rows: list[dict], index: int) -> str:
+    districts = {}
+    regions = {}
+    for row in rows:
+        districts[row.get("district", "")] = districts.get(row.get("district", ""), 0) + 1
+        regions[row.get("region", "")] = regions.get(row.get("region", ""), 0) + 1
+    district = max(districts, key=districts.get) if districts else "Dhaka"
+    region = max(regions, key=regions.get) if regions else ""
+    area = f"{district} / {region}".strip(" /")
+    return f"Cluster {index:02d} — {area}"
+
+
+def cluster_bounds(rows: list[dict]) -> tuple[float, float, float, float]:
+    """Medium viewport: not a city-wide box, not a single-building crop."""
+    lats = [row["lat"] for row in rows]
+    lons = [row["lon"] for row in rows]
+    lat_c = sum(lats) / len(lats)
+    lon_c = sum(lons) / len(lons)
+    lat_span = max(lats) - min(lats)
+    lon_span = max(lons) - min(lons)
+    half_lat = min(0.045, max(0.022, lat_span * 0.55 + 0.012))
+    half_lon = min(0.050, max(0.024, lon_span * 0.55 + 0.014))
+    return lat_c - half_lat, lat_c + half_lat, lon_c - half_lon, lon_c + half_lon
+
+
 def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, stem: str) -> list[tuple[str, Path]]:
     """Write one JPEG per map: national, then each zoom area."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -247,12 +342,16 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
     for spec in zoom_specs:
         panel, z, zx, zy = _stitch(spec["lat_min"], spec["lat_max"], spec["lon_min"], spec["lon_max"], 1100)
         _draw_points(panel, spec["rows"], z, zx, zy, labels=True, emphasize_5g=False)
-        slug = spec["label"].replace(" ", "_")
+        slug = spec.get("slug") or spec["label"].replace(" ", "_").replace("/", "-")
         path = dest_dir / f"{stem}_{slug}.jpg"
-        _frame_map(panel, f"{spec['label']} — {spec['issue_count']} issue sites", counts).save(
-            path, format="JPEG", quality=92
-        )
-        outputs.append((f"{spec['label']} — {spec['issue_count']} issue sites", path))
+        local = {
+            "4G": sum(1 for r in spec["rows"] if r.get("kind") == "4G"),
+            "5G": sum(1 for r in spec["rows"] if r.get("kind") == "5G"),
+            "Issue": spec["issue_count"],
+        }
+        title = f"{spec['label']} — {spec['issue_count']} issue sites"
+        _frame_map(panel, title, local).save(path, format="JPEG", quality=88)
+        outputs.append((title, path))
     return outputs
 
 
@@ -292,11 +391,11 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
     html, body {{ margin: 0; background: #0b0e12; color: #f5f5f5; font-family: Calibri, Arial, sans-serif; }}
     h1 {{ margin: 12px 16px 4px; font-size: 20px; }}
     .sub {{ margin: 0 16px 10px; color: #cfd8dc; font-size: 13px; }}
-    nav {{ margin: 0 16px 12px; }}
-    nav a {{ color: {COLOR_5G}; margin-right: 14px; text-decoration: none; font-size: 14px; }}
+    nav {{ margin: 0 16px 12px; display: flex; flex-wrap: wrap; gap: 6px 12px; max-height: 22vh; overflow: auto; }}
+    nav a {{ color: {COLOR_5G}; margin-right: 14px; text-decoration: none; font-size: 13px; }}
     .map-block {{ margin: 0 12px 28px; }}
     .map-block h2 {{ margin: 0 0 8px; font-size: 16px; }}
-    .map {{ height: 72vh; border: 1px solid #263238; }}
+    .map {{ height: 58vh; border: 1px solid #263238; }}
     .legend {{
       background: rgba(16,20,24,.86); padding: 8px 12px; border-radius: 6px; font-size: 13px;
     }}

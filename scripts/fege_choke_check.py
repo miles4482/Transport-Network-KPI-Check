@@ -1337,7 +1337,14 @@ def cap_when_matrix(records: list[dict], tech_by_site: dict[str, str]) -> dict:
 
 def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path) -> None:
     """Google-satellite GeoPlot: 4G / 5G / issue sites, plus area zooms."""
-    from geoplot_satellite import classify_rows, render_html, render_map_images
+    from geoplot_satellite import (
+        classify_rows,
+        cluster_bounds,
+        cluster_issue_sites,
+        cluster_label,
+        render_html,
+        render_map_images,
+    )
 
     ws = book.add_worksheet(GEO_SHEET)
     _page(ws, "GeoPlot — 4G / 5G / issue sites")
@@ -1407,40 +1414,25 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
     n5 = sum(1 for r in classified if r["tech"] == "5G")
     n_issue = sum(1 for r in classified if r["kind"] == "Issue")
 
-    zoom_groups = [
-        ("Dhaka Metro", "Dhaka", "Dhaka Metro"),
-        ("Dhaka North", "Dhaka", "Dhaka North"),
-        ("Dhaka West", "Dhaka", "Dhaka West"),
-        ("Gazipur", "Gazipur", "Dhaka North"),
-    ]
     zoom_specs = []
-    for label, district, region in zoom_groups:
-        zoom_issues = [
-            row for row in issue_rows
-            if row["district"] == district and row["region"] == region
-        ]
-        if not zoom_issues:
-            continue
-        issue_lats = [row["lat"] for row in zoom_issues]
-        issue_lons = [row["lon"] for row in zoom_issues]
-        lat_pad = max(0.012, (max(issue_lats) - min(issue_lats)) * 0.22)
-        lon_pad = max(0.012, (max(issue_lons) - min(issue_lons)) * 0.22)
-        lat_min, lat_max = min(issue_lats) - lat_pad, max(issue_lats) + lat_pad
-        lon_min, lon_max = min(issue_lons) - lon_pad, max(issue_lons) + lon_pad * 1.35
+    for index, zoom_issues in enumerate(cluster_issue_sites(issue_rows), start=1):
+        lat_min, lat_max, lon_min, lon_max = cluster_bounds(zoom_issues)
         issue_names = {row["site"] for row in zoom_issues}
         zoom_rows = []
         for row in classified:
             if not (lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max):
                 continue
-            # Keep this zoom's issue count exact: neighbouring issue sites
+            # Keep this cluster's red count exact: neighbouring issue sites
             # stay on the map as 5G context, not extra red dots.
             if row["kind"] == "Issue" and row["site"] not in issue_names:
                 zoom_rows.append({**row, "kind": "5G"})
             else:
                 zoom_rows.append(row)
+        label = cluster_label(zoom_issues, index)
         zoom_specs.append(
             {
                 "label": label,
+                "slug": f"Cluster_{index:02d}",
                 "issue_count": len(zoom_issues),
                 "issue_sites": [row["site"] for row in zoom_issues],
                 "rows": zoom_rows,
@@ -1469,15 +1461,16 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:N3",
-        "Each map is separate. Cyan = 4G, Yellow = 5G (357 total, including issue sites), Red = issue sites. "
-        "Zoom maps show site names only. Open the HTML file for the interactive satellite maps.",
+        "National map is the overview. Issue clusters are medium-scale maps "
+        f"({len(zoom_specs)} neighbourhoods, about 8–20 issue sites each) so labels stay readable. "
+        "Cyan = 4G, Yellow = 5G, Red = issue sites. Open the HTML file for interactive maps.",
         styles["note"],
     )
     row = 5
     for title, path in maps:
         ws.merge_range(row, 0, row, 13, title, styles["section"])
-        ws.insert_image(row + 1, 0, str(path), {"x_scale": 0.62, "y_scale": 0.62, "object_position": 2})
-        row += 42
+        ws.insert_image(row + 1, 0, str(path), {"x_scale": 0.50, "y_scale": 0.50, "object_position": 2})
+        row += 34
     ws.set_zoom(100)
 
 
@@ -1496,7 +1489,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v35.xlsx",
+        default="FEGE_Choked_Flat_Sites_v36.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
