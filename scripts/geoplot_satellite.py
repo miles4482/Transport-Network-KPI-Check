@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import urllib.request
 from io import BytesIO
 from pathlib import Path
@@ -40,14 +41,23 @@ def _deg2num(lat: float, lon: float, zoom: int) -> tuple[float, float]:
 def _fetch_tile(z: int, x: int, y: int) -> Image.Image:
     TILE_CACHE.mkdir(parents=True, exist_ok=True)
     path = TILE_CACHE / f"{z}_{x}_{y}.jpg"
-    if path.exists():
+    if path.exists() and path.stat().st_size > 0:
         return Image.open(path).convert("RGB")
     url = f"https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = resp.read()
-    path.write_bytes(data)
-    return Image.open(BytesIO(data)).convert("RGB")
+    last_error = None
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = resp.read()
+            if data:
+                path.write_bytes(data)
+                return Image.open(BytesIO(data)).convert("RGB")
+        except Exception as exc:  # noqa: BLE001 — tile fetch must not abort the report
+            last_error = exc
+            time.sleep(1.5 * (attempt + 1))
+    print(f"Warning: satellite tile z{z}/{x}/{y} failed ({last_error}); using placeholder")
+    return Image.new("RGB", (TILE_SIZE, TILE_SIZE), "#1a2228")
 
 
 def _choose_zoom(lat_min: float, lat_max: float, lon_min: float, lon_max: float, target: int) -> int:
