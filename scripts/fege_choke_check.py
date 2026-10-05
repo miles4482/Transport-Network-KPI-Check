@@ -1312,6 +1312,29 @@ def summarise_tech(records: list[dict], tech_by_site: dict[str, str]) -> dict[st
     }
 
 
+CAP_WHEN_COLS = ("Busy + off-peak", "Busy hours", "Off-peak")
+
+
+def cap_when_matrix(records: list[dict], tech_by_site: dict[str, str]) -> dict:
+    """Severity × cap-window counts for all sites, 4G+5G, and 4G."""
+    sevs = (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW)
+    groups = ("total", TECH_4G5G, TECH_4G)
+    matrix = {
+        group: {sev: {when: 0 for when in CAP_WHEN_COLS} for sev in sevs}
+        for group in groups
+    }
+    for rec in records:
+        sev = rec["severity"]
+        when = rec["cap_when"]
+        if sev not in matrix["total"] or when not in matrix["total"][sev]:
+            continue
+        matrix["total"][sev][when] += 1
+        tech = tech_by_site.get(rec["site"])
+        if tech in (TECH_4G, TECH_4G5G):
+            matrix[tech][sev][when] += 1
+    return matrix
+
+
 def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path) -> None:
     """Google-satellite GeoPlot: 4G / 5G / issue sites, plus area zooms."""
     from geoplot_satellite import classify_rows, render_html, render_map_images
@@ -1473,7 +1496,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v34.xlsx",
+        default="FEGE_Choked_Flat_Sites_v35.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1497,11 +1520,12 @@ def main() -> None:
     tech_path = _find_input(TECH_FILE, source)
     if tech_path is None:
         raise SystemExit(f"Dhaka tech site list not found: {TECH_FILE}")
-    tech_summary = summarise_tech(records, load_site_tech(tech_path))
+    tech_by_site = load_site_tech(tech_path)
+    tech_summary = summarise_tech(records, tech_by_site)
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
-    _write_workbook(output, source.name, work, records, geo, tech_summary)
+    _write_workbook(output, source.name, work, records, geo, tech_summary, tech_by_site)
 
     by_sev = defaultdict(int)
     for rec in records:
@@ -1550,13 +1574,22 @@ def main() -> None:
     print(f"Wrote {output}")
 
 
-def _write_summary(book, styles, source_name, period_txt, n_sites, records, tech_summary=None):
+def _write_summary(
+    book,
+    styles,
+    source_name,
+    period_txt,
+    n_sites,
+    records,
+    tech_summary=None,
+    tech_by_site=None,
+):
     """One sheet that shows the result without opening the other pages."""
     ws = book.add_worksheet("Dashboard")
     _page(ws, REPORT_TITLE)
     ws.set_tab_color("#C65911")
 
-    widths = [6, 14, 14, 14, 14, 14, 32, 18]
+    widths = [16, 16, 16, 16, 16, 20, 22, 16, 16, 16]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
@@ -1610,10 +1643,10 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records, tech
         counts[rec["severity"]] += 1
 
     ws.set_row(0, 28)
-    ws.merge_range("A1:H1", REPORT_TITLE, styles["title"])
+    ws.merge_range("A1:J1", REPORT_TITLE, styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
-        "A2:H2",
+        "A2:J2",
         f"DHK transmission    ·    {period_txt}    ·    hourly    ·    {source_name}",
         styles["subtitle"],
     )
@@ -1641,41 +1674,124 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records, tech
             ws.merge_range(4, col, 4, col + 1, value, value_fmt)
 
     tech_summary = tech_summary or {}
+    tech_by_site = tech_by_site or {}
+    group_title = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 14,
+            "bold": True,
+            "font_color": NAVY,
+            "valign": "vcenter",
+        }
+    )
+    row = 6
     if tech_summary:
-        ws.set_row(5, 20)
+        ws.set_row(row, 22)
+        ws.merge_range(row, 0, row, 9, "Technology-wise Link Health", group_title)
+        row += 1
+        ws.set_row(row, 20)
         ws.merge_range(
-            5,
+            row,
             0,
-            5,
-            7,
+            row,
+            9,
             f"4G / 4G+5G choke summary    ·    source: {TECH_FILE}",
             styles["section"],
         )
+        row += 1
         tech_tiles = [
             (0, "4G sites checked", tech_summary["checked_4g"], False),
             (2, "4G sites choked", tech_summary["choked_4g"], True),
             (4, "4G+5G sites checked", tech_summary["checked_4g5g"], False),
             (6, "4G+5G sites choked", tech_summary["choked_4g5g"], True),
         ]
-        ws.set_row(6, 18)
-        ws.set_row(7, 32)
+        ws.set_row(row, 18)
+        ws.set_row(row + 1, 32)
         for col, label, value, alert in tech_tiles:
             label_fmt = tile_alert if alert else tile
             value_fmt = big_alert if alert else big
-            ws.merge_range(6, col, 6, col + 1, label, label_fmt)
-            ws.merge_range(7, col, 7, col + 1, value, value_fmt)
+            ws.merge_range(row, col, row, col + 1, label, label_fmt)
+            ws.merge_range(row + 1, col, row + 1, col + 1, value, value_fmt)
+        row += 3
+
+    if tech_by_site:
+        matrix = cap_when_matrix(records, tech_by_site)
+        ws.set_row(row, 22)
+        ws.merge_range(row, 0, row, 9, "Cap Window Observation", group_title)
+        row += 1
+        ws.set_row(row, 20)
+        ws.merge_range(row, 0, row + 1, 0, "Category", styles["header"])
+        ws.merge_range(row, 1, row, 3, "Total Summary", styles["header"])
+        ws.merge_range(row, 4, row, 6, "4G+5G Sites Summary", styles["header"])
+        ws.merge_range(row, 7, row, 9, "4G Sites Summary", styles["header"])
+        row += 1
+        ws.set_row(row, 28)
+        subheads = ("Busy + off-peak", "Busy hours", "Off-peak")
+        for base in (1, 4, 7):
+            for offset, text in enumerate(subheads):
+                ws.write(row, base + offset, text, styles["header"])
+        row += 1
+        total_fmt = book.add_format(
+            {
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "align": "center",
+                "valign": "vcenter",
+                "bg_color": PALE,
+                "border": 1,
+                "border_color": LINE,
+            }
+        )
+        total_label = book.add_format(
+            {
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "align": "left",
+                "valign": "vcenter",
+                "bg_color": PALE,
+                "border": 1,
+                "border_color": LINE,
+            }
+        )
+        sevs = (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW)
+        groups = ("total", TECH_4G5G, TECH_4G)
+        for sev in sevs:
+            ws.set_row(row, 18)
+            ws.write(row, 0, sev, styles["center"])
+            col = 1
+            for group in groups:
+                for when in CAP_WHEN_COLS:
+                    value = matrix[group][sev][when]
+                    if value:
+                        ws.write_number(row, col, value, styles["int"])
+                    else:
+                        ws.write_blank(row, col, None, styles["center"])
+                    col += 1
+            row += 1
+        ws.set_row(row, 18)
+        ws.write(row, 0, "Grand Total", total_label)
+        col = 1
+        for group in groups:
+            for when in CAP_WHEN_COLS:
+                value = sum(matrix[group][sev][when] for sev in sevs)
+                if value:
+                    ws.write_number(row, col, value, total_fmt)
+                else:
+                    ws.write_blank(row, col, None, total_fmt)
+                col += 1
+        row += 2
 
     headers = [
         "No.",
         "eNodeB Name",
-        "Tx BW (Mbit/s)",
         "Stuck Rx (Mbit/s)",
         "Hours on cap (%)",
         "Days on cap (≥3h)",
         "Last day cap",
         "Listed because",
     ]
-    row = 9 if tech_summary else 6
     indexed = list(enumerate(records))
     for name, note in SEVERITY_NOTES:
         group = [(i, rec) for i, rec in indexed if rec["severity"] == name]
@@ -1684,13 +1800,13 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records, tech
             row,
             0,
             row,
-            7,
+            9,
             f"{name}    ·    {len(group)} site{'s' if len(group) != 1 else ''}",
             styles["section"],
         )
         row += 1
-        ws.set_row(row, 36)
-        ws.merge_range(row, 0, row, 7, note, styles["body"])
+        ws.set_row(row, 28)
+        ws.merge_range(row, 0, row, 9, note, styles["body"])
         row += 1
         ws.set_row(row, 22)
         for col, text in enumerate(headers):
@@ -1711,12 +1827,11 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records, tech
                 link,
                 string=rec["site"],
             )
-            ws.write_number(row, 2, rec["bw"], nfmt)
-            ws.write_number(row, 3, rec["center"], nfmt)
-            ws.write_number(row, 4, rec["hours_pct"], styles["pct_z"] if zebra else styles["pct"])
-            ws.write_string(row, 5, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
-            ws.write_string(row, 6, last_day_text(rec), cfmt)
-            ws.write_string(row, 7, rec["listed_by"], cfmt)
+            ws.write_number(row, 2, rec["center"], nfmt)
+            ws.write_number(row, 3, rec["hours_pct"], styles["pct_z"] if zebra else styles["pct"])
+            ws.write_string(row, 4, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
+            ws.write_string(row, 5, last_day_text(rec), cfmt)
+            ws.write_string(row, 6, rec["listed_by"], cfmt)
             row += 1
         row += 1
 
@@ -1730,6 +1845,7 @@ def _write_workbook(
     records: list[dict],
     geo: pd.DataFrame | None = None,
     tech_summary: dict[str, int] | None = None,
+    tech_by_site: dict[str, str] | None = None,
 ) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
@@ -1746,7 +1862,9 @@ def _write_workbook(
     # Dashboard is the first sheet so the file opens on the report view.
     chart_end = period_end.normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
-    _write_summary(book, styles, source_name, period_txt, n_sites, records, tech_summary)
+    _write_summary(
+        book, styles, source_name, period_txt, n_sites, records, tech_summary, tech_by_site
+    )
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
     _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
     _write_hourly(book, styles, work, records)

@@ -80,6 +80,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v32 keeps that window and listing. Snapshot Y-axes are adaptive (DHDRS99 at 33.31 Mbit/s uses 0–50, not 0–100). File: `FEGE_Choked_Flat_Sites_v32.xlsx`.
 - v33 adds a Dashboard-only 4G / 4G+5G choke summary from `Site list_Dhaka_Tech_5oct.xlsx`. Other sheets are unchanged. File: `FEGE_Choked_Flat_Sites_v33.xlsx`.
 - v34 retitles the report Transmission Link Health Review (for transmission improvement planning, not blame) and drops DHAPT35/DHAPT48 case wording from Dashboard/Site List notes. File: `FEGE_Choked_Flat_Sites_v34.xlsx`.
+- v35 rearranges Dashboard only: Technology-wise Link Health tiles, Cap Window Observation (Total / 4G+5G / 4G), and removes Tx BW from Dashboard site lists. File: `FEGE_Choked_Flat_Sites_v35.xlsx`.
 
 ## Jupyter (for local Windows use)
 
