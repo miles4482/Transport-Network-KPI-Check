@@ -16,16 +16,18 @@ trace moves up and down during the day but every rise stops at the same
 top value and never goes above it (the clipped ~500 Mbit/s sites such as
 DHSVRS5 / GPSDR01). Jagged traces whose peaks keep changing are not listed.
 
-The rule is applied to every site over the latest seven days in the file
-(16–22 Sep 2026 in the current source). Every hour is scored, including
-night and other off-peak hours. A site is listed when at least three of
-those days have three hours on the cap, or when the last day has two
-hours on the cap. Each snapshot chart shows only the latest three days.
+The rule is applied to every site over 2–4 Oct 2026 only (the window
+requested for this source). Earlier days in the combined Dhaka file
+are ignored. Every hour is scored, including night and other off-peak
+hours. A site is listed when at least three of those days have three
+hours on the cap, or when the last day has two hours on the cap.
+Each snapshot chart shows the same three days.
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 from collections import defaultdict
 from datetime import time
 from pathlib import Path
@@ -41,10 +43,13 @@ BUSY_END = 22  # inclusive
 NIGHT_START = 2
 NIGHT_END = 6  # inclusive, the valley on the sample charts
 
-# Flat-cap test on the latest 7 days (16–22 Sep in this file).
+# Flat-cap test on 2–4 Oct 2026 only (combined FEG_KPI_DHAKA_5Oct source).
 # A day is on-cap when at least 3 hours (busy or off-peak) sit on the ceiling.
-# A site is listed when that happens on at least 3 of the 7 days.
+# A site is listed when that happens on at least 3 of those days.
 # Separately, the last day is flagged when at least 2 hours sit on the ceiling.
+KPI_YEAR = 2026
+ANALYSIS_START = pd.Timestamp(f"{KPI_YEAR}-10-02")
+ANALYSIS_END = pd.Timestamp(f"{KPI_YEAR}-10-04")
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
 # Hard ceiling. A few hours may sit a little above the crowded level.
@@ -67,12 +72,12 @@ MIN_RUN_HOURS = 3
 STUCK_DAY_HOURS = 3
 MIN_DAYS_ON_CAP = 3
 LAST_DAY_HOURS = 2
-ANALYSIS_DAYS = 7
+ANALYSIS_DAYS = int((ANALYSIS_END - ANALYSIS_START).days) + 1
 STD_MBPS = 2.5
 STD_FRAC = 0.01
 MIN_CENTER_MBPS = 20.0
 
-# Severity is hours on the cap as a share of the 7-day window.
+# Severity is hours on the cap as a share of the 2–4 Oct window.
 # RAN-side Tx Total BW is shown as a column only; it is not used to judge.
 SEV_SEVERE_PCT = 50.0
 SEV_HIGH_PCT = 25.0
@@ -115,6 +120,59 @@ PALE = "#D6E3F0"
 
 def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, unit="D", origin="1899-12-30")
+
+
+def parse_kpi_date(series: pd.Series) -> pd.Series:
+    """Parse Excel serials or text dates such as 2-Oct / 02-Oct-26."""
+    if pd.api.types.is_numeric_dtype(series):
+        return excel_serial_to_datetime(series)
+    text = series.astype(str).str.strip()
+    numeric = pd.to_numeric(text, errors="coerce")
+    if numeric.notna().all():
+        return excel_serial_to_datetime(numeric)
+    parsed = pd.to_datetime(text + f"-{KPI_YEAR}", format="%d-%b-%Y", errors="coerce")
+    if parsed.isna().any():
+        parsed = parsed.fillna(pd.to_datetime(text, errors="coerce", dayfirst=True))
+    if parsed.isna().any():
+        raise SystemExit("Could not parse the Date column")
+    if (parsed.dt.year != KPI_YEAR).any():
+        parsed = parsed.map(lambda ts: ts.replace(year=KPI_YEAR))
+    return parsed
+
+
+def parse_hour(series: pd.Series) -> pd.Series:
+    """Parse 0:00 / 00:00 / 8:00 into an integer hour."""
+    text = series.astype(str).str.strip()
+    hour = text.str.split(":", n=1).str[0]
+    values = pd.to_numeric(hour, errors="coerce")
+    if values.isna().any():
+        raise SystemExit("Could not parse the Time column")
+    return values.astype(int)
+
+
+def resolve_source(path: Path) -> Path:
+    """Use a CSV, workbook, or the first volume of a split RAR as the KPI source."""
+    name = path.name.lower()
+    if name.endswith(".part2.rar"):
+        path = path.with_name(path.name.replace(".part2.rar", ".part1.rar"))
+    if path.suffix.lower() == ".rar":
+        dest = Path("/tmp/dhaka_kpi")
+        dest.mkdir(parents=True, exist_ok=True)
+        subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+        csvs = sorted(dest.glob("*.csv"))
+        if not csvs:
+            raise SystemExit(f"No CSV extracted from {path.name}")
+        return csvs[0]
+    return path
+
+
+def load_kpi(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix == ".xlsb":
+        return pd.read_excel(path, engine="pyxlsb")
+    return pd.read_excel(path)
 
 
 def find_plateau(rx: np.ndarray) -> tuple[float, float, np.ndarray]:
@@ -205,13 +263,13 @@ SEVERITY_NOTES = (
     (
         SEV_SEVERE,
         f"Severe: the port sat on the cap at least {SEV_SEVERE_PCT:.0f}% of hours "
-        "in the latest 7 days. This is the DHAPT35 / DHAPT48 case — the line is "
-        "locked for most of the week.",
+        f"in the {ANALYSIS_DAYS}-day window. This is the DHAPT35 / DHAPT48 case — "
+        "the line is locked for most of the window.",
     ),
     (
         SEV_HIGH,
         f"High: {SEV_HIGH_PCT:.0f}% to {SEV_SEVERE_PCT:.0f}% of hours on the cap. "
-        "The choke is clear on several days, but the port is not locked all week.",
+        "The choke is clear on several days, but the port is not locked all window.",
     ),
     (
         SEV_MODERATE,
@@ -260,18 +318,24 @@ def listed_by_text(week_flag: bool, last_flag: bool) -> str:
 def analyse(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     """Return the hourly frame (with KPI columns) and the choked-site records."""
     work = df.copy()
-    work["Date"] = excel_serial_to_datetime(work["Date"])
+    work["Date"] = parse_kpi_date(work["Date"])
     work["Rx"] = work[RX_COL] / 1000.0 / 1000.0
     work["TxBW"] = work[TXBW_COL] / 1000.0
-    work["Hour"] = work["Time"].str.slice(0, 2).astype(int)
+    work["Hour"] = parse_hour(work["Time"])
     work["ts"] = work["Date"] + pd.to_timedelta(work["Hour"], unit="h")
     work = work.sort_values(["eNodeB Name", "ts"])
     work = work.drop_duplicates(["eNodeB Name", "ts"], keep="last")
 
-    period_end = work["Date"].max().normalize()
-    window_start = period_end - pd.Timedelta(days=ANALYSIS_DAYS - 1)
-    work = work[(work["Date"] >= window_start) & (work["Date"] <= period_end)].copy()
+    work = work[
+        (work["Date"] >= ANALYSIS_START) & (work["Date"] <= ANALYSIS_END)
+    ].copy()
+    if work.empty:
+        raise SystemExit(
+            f"No rows in the requested window "
+            f"{ANALYSIS_START.date()} – {ANALYSIS_END.date()}"
+        )
     work = work.reset_index(drop=True)
+    period_end = ANALYSIS_END.normalize()
     last_day = period_end.date()
     last_day_label = period_end.strftime("%-d-%b-%y")
 
@@ -412,8 +476,9 @@ def _require_references(records: list[dict]) -> None:
     found = {r["site"] for r in records}
     missing = [site for site in REFERENCE_SITES if site not in found]
     if missing:
-        raise SystemExit(
-            "Sample snap sites were not classified as choked: " + ", ".join(missing)
+        print(
+            "Note: sample snap sites were not classified as choked: "
+            + ", ".join(missing)
         )
 
 
@@ -992,9 +1057,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Analysis window",
-            f"Only the latest {ANALYSIS_DAYS} days in the source file are scored. "
-            "Earlier days are ignored so a site that recovered, or one that only "
-            "became flat recently, is judged on the current week.",
+            f"Only {ANALYSIS_START.strftime('%-d %b %Y')} – "
+            f"{ANALYSIS_END.strftime('%-d %b %Y')} ({ANALYSIS_DAYS} days) is scored. "
+            "Earlier days in the combined Dhaka source (28 Sep–1 Oct) are ignored.",
         ),
         (
             "Hours on the cap (all 24h)",
@@ -1066,9 +1131,10 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         0,
         foot + 1,
         1,
-        "DHAPT35 and DHAPT48 both pass this rule and are marked Sample snap = Yes "
-        "on the site list. Scoring uses 16-Sep-26 to 22-Sep-26 and every hour. "
-        "Each snapshot is a clean chart of the latest 3 days: "
+        "DHAPT35 and DHAPT48 are the sample-snap pattern. Scoring uses "
+        f"{ANALYSIS_START.strftime('%-d-%b-%y')} to "
+        f"{ANALYSIS_END.strftime('%-d-%b-%y')} and every hour. "
+        "Each snapshot is a clean chart of those three days: "
         "hourly timestamps 00:00 to 23:00, "
         "and the date is shown once under that day. The chart title is the site name.",
         styles["method_val"],
@@ -1104,8 +1170,10 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Site List scoring note",
-            f"Scored on {period_txt} (16-Sep-26 to 22-Sep-26). "
-            f"Listed when ≥{MIN_DAYS_ON_CAP} of 7 days have ≥{STUCK_DAY_HOURS} hours on the cap "
+            f"Scored on {period_txt} "
+            f"({ANALYSIS_START.strftime('%-d-%b-%y')} to "
+            f"{ANALYSIS_END.strftime('%-d-%b-%y')}). "
+            f"Listed when ≥{MIN_DAYS_ON_CAP} of {ANALYSIS_DAYS} days have ≥{STUCK_DAY_HOURS} hours on the cap "
             f"(busy 08:00–22:00 and off-peak / night). "
             f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day "
             "sit on the cap. "
@@ -1312,20 +1380,20 @@ def main() -> None:
     parser.add_argument(
         "source",
         nargs="?",
-        default="FEG_KPI_5G Site_DHK.xlsb",
-        help="FEGE KPI workbook (.xlsb or .xlsx)",
+        default="FEG_KPI_DHAKA_5Oct.part1.rar",
+        help="FEGE KPI source (.csv, .xlsb, .xlsx, or split .part1.rar)",
     )
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v30.xlsx",
+        default="FEGE_Choked_Flat_Sites_v31.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
-    source = Path(args.source)
+    source = resolve_source(Path(args.source))
     output = Path(args.output)
 
-    raw = pd.read_excel(source, engine="pyxlsb" if source.suffix.lower() == ".xlsb" else None)
+    raw = load_kpi(source)
     required = {"Date", "Time", "eNodeB Name", RX_COL, TXBW_COL}
     missing = required - set(raw.columns)
     if missing:
@@ -1334,10 +1402,19 @@ def main() -> None:
     work, records = analyse(raw)
     _require_references(records)
 
-    geo_path = source.parent / GEO_FILE
-    if not geo_path.exists():
-        geo_path = Path(GEO_FILE)
-    if not geo_path.exists():
+    geo_path = next(
+        (
+            candidate
+            for candidate in (
+                source.parent / GEO_FILE,
+                Path(GEO_FILE),
+                Path("/workspace") / GEO_FILE,
+            )
+            if candidate.exists()
+        ),
+        None,
+    )
+    if geo_path is None:
         raise SystemExit(f"Physical site database not found: {GEO_FILE}")
     geo = load_site_geo(geo_path)
 
@@ -1450,7 +1527,7 @@ def _write_summary(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(1, 18)
     ws.merge_range(
         "A2:H2",
-        f"DHK 5G transmission    ·    {period_txt}    ·    hourly    ·    {source_name}",
+        f"DHK transmission    ·    {period_txt}    ·    hourly    ·    {source_name}",
         styles["subtitle"],
     )
 
@@ -1578,11 +1655,15 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
     last_col_letter = "O"
     ws.set_row(0, 28)
-    ws.merge_range(f"A1:{last_col_letter}1", f"{REPORT_TITLE} — issue sites (latest 7 days)", styles["title"])
+    ws.merge_range(
+        f"A1:{last_col_letter}1",
+        f"{REPORT_TITLE} — issue sites ({ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b %Y')})",
+        styles["title"],
+    )
     ws.set_row(1, 18)
     ws.merge_range(
         f"A2:{last_col_letter}2",
-        f"DHK 5G transmission    ·    {period_txt}    ·    hourly    ·    "
+        f"DHK transmission    ·    {period_txt}    ·    hourly    ·    "
         f"{n_sites} sites checked    ·    {len(records)} issue sites",
         styles["subtitle"],
     )
@@ -1791,7 +1872,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         count_row + 4,
         last_col,
         f"Window is {period_txt}. "
-        f"7-day rule: ≥{MIN_DAYS_ON_CAP} days with ≥{STUCK_DAY_HOURS} hours on the cap. "
+        f"{ANALYSIS_DAYS}-day rule: ≥{MIN_DAYS_ON_CAP} days with ≥{STUCK_DAY_HOURS} hours on the cap. "
         f"Last-day rule: {last_day_hdr} with ≥{LAST_DAY_HOURS} hours on the cap "
         "(busy and/or off-peak).",
         styles["note"],
