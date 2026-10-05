@@ -1461,8 +1461,9 @@ def _write_geoplot(book, styles, work, records, geo: pd.DataFrame, output: Path)
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:N3",
-        "National map is the overview. Issue clusters are medium-scale maps "
-        f"({len(zoom_specs)} neighbourhoods, about 8–20 issue sites each) so labels stay readable. "
+        "National map is the overview. Issue clusters are built dynamically until every "
+        f"issue site is covered ({len(zoom_specs)} maps). Urban clusters come first "
+        "(Dhaka Metro, Gazipur, surrounding), then maps with more issue sites. "
         "Cyan = 4G, Yellow = 5G, Red = issue sites. Open the HTML file for interactive maps.",
         styles["note"],
     )
@@ -1489,7 +1490,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v36.xlsx",
+        default="FEGE_Choked_Flat_Sites_v37.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

@@ -6,6 +6,7 @@ import json
 import math
 import time
 import urllib.request
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 
@@ -43,9 +44,11 @@ def _fetch_tile(z: int, x: int, y: int) -> Image.Image:
     path = TILE_CACHE / f"{z}_{x}_{y}.jpg"
     if path.exists() and path.stat().st_size > 0:
         return Image.open(path).convert("RGB")
-    url = f"https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
     last_error = None
-    for attempt in range(5):
+    hosts = ("mt1", "mt0", "mt2", "mt3")
+    for attempt in range(6):
+        host = hosts[attempt % len(hosts)]
+        url = f"https://{host}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=25) as resp:
@@ -55,7 +58,7 @@ def _fetch_tile(z: int, x: int, y: int) -> Image.Image:
                 return Image.open(BytesIO(data)).convert("RGB")
         except Exception as exc:  # noqa: BLE001 — tile fetch must not abort the report
             last_error = exc
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(1.2 * (attempt + 1))
     print(f"Warning: satellite tile z{z}/{x}/{y} failed ({last_error}); using placeholder")
     return Image.new("RGB", (TILE_SIZE, TILE_SIZE), "#1a2228")
 
@@ -240,6 +243,34 @@ def _centroid(rows: list[dict]) -> tuple[float, float]:
     )
 
 
+def urban_rank(row: dict) -> int:
+    """Lower is more urban: Dhaka Metro, then Gazipur and surrounding cities."""
+    region = str(row.get("region") or "").strip().lower()
+    district = str(row.get("district") or "").strip().lower()
+    if region == "dhaka metro":
+        return 0
+    if district == "gazipur":
+        return 1
+    if region in ("dhaka north", "dhaka west", "dhaka south"):
+        return 2
+    if district == "narayanganj":
+        return 3
+    if district in ("narsingdi", "manikganj", "munshiganj"):
+        return 4
+    if district == "tangail":
+        return 5
+    return 6
+
+
+def cluster_urban_rank(rows: list[dict]) -> int:
+    ranks = [urban_rank(row) for row in rows]
+    if not ranks:
+        return 9
+    counts = Counter(ranks)
+    top = max(counts.values())
+    return min(rank for rank, count in counts.items() if count == top)
+
+
 def cluster_issue_sites(
     issue_rows: list[dict],
     *,
@@ -255,19 +286,33 @@ def cluster_issue_sites(
     if not issue_rows:
         return []
     pts = np.array([[r["lat"], r["lon"]] for r in issue_rows], dtype=float)
+    ranks = np.array([urban_rank(row) for row in issue_rows], dtype=int)
     unused = set(range(len(issue_rows)))
     raw: list[list[dict]] = []
     while unused:
-        start = min(unused, key=lambda i: (pts[i, 0], pts[i, 1]))
+        best_rank = min(ranks[i] for i in unused)
+        candidates = [i for i in unused if ranks[i] == best_rank]
+        start = candidates[0]
+        best_near = -1
+        for i in candidates:
+            near = int(
+                np.sum(
+                    ((pts[list(unused)] - pts[i]) ** 2).sum(axis=1) <= far * far
+                )
+            )
+            if near > best_near:
+                start, best_near = i, near
+        cluster_max = 22 if ranks[start] <= 2 else max_sites
         cluster = [start]
         unused.remove(start)
-        while unused and len(cluster) < max_sites:
+        while unused and len(cluster) < cluster_max:
             center = pts[cluster].mean(axis=0)
             rest = np.fromiter(unused, dtype=int)
             dist2 = ((pts[rest] - center) ** 2).sum(axis=1)
             nearest = int(rest[int(dist2.argmin())])
             dist = float(dist2.min()) ** 0.5
-            if len(cluster) >= target and dist > far:
+            local_target = 18 if ranks[start] <= 2 else target
+            if len(cluster) >= local_target and dist > far:
                 break
             if dist > hard and len(cluster) >= 8:
                 break
@@ -298,7 +343,11 @@ def cluster_issue_sites(
             continue
         pending[best_j].extend(small)
     clusters = pending + locked
-    clusters.sort(key=lambda group: (-_centroid(group)[0], _centroid(group)[1]))
+    covered = {row["site"] for group in clusters for row in group}
+    leftover = [row for row in issue_rows if row["site"] not in covered]
+    if leftover:
+        clusters.append(leftover)
+    clusters.sort(key=lambda group: (cluster_urban_rank(group), -len(group), _centroid(group)[0]))
     return clusters
 
 
