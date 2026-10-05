@@ -84,6 +84,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v36 keeps the national GeoPlot and replaces the four large area zooms with many medium issue-cluster maps (about 8–20 sites each). File: `FEGE_Choked_Flat_Sites_v36.xlsx`.
 - v37 keeps GeoPlot clustering dynamic (maps until every issue site is covered) and orders clusters urban-first (Dhaka Metro, Gazipur, surrounding) then by site count. File: `FEGE_Choked_Flat_Sites_v37.xlsx`.
 - v38 splits GeoPlot issue markers into two legends: red Issue 4G and orange Issue 4G+5G, from `Site list_Dhaka_Tech_5oct.xlsx`. Coverage 4G/5G colours stay. File: `FEGE_Choked_Flat_Sites_v38.xlsx`.
+- v39 keeps the national map and urban-first issue clusters, and adds four thana maps after the national overview for the high-5G belt: Gulshan, Banani, Dhanmondi, Tejgaon. File: `FEGE_Choked_Flat_Sites_v39.xlsx`.
 
 ## Jupyter (for local Windows use)
 

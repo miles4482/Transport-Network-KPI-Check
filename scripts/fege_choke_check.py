@@ -1354,6 +1354,7 @@ def _write_geoplot(
         cluster_label,
         render_html,
         render_map_images,
+        thana_focus_specs,
     )
 
     ws = book.add_worksheet(GEO_SHEET)
@@ -1429,7 +1430,7 @@ def _write_geoplot(
     n_issue_4g5g = sum(1 for r in classified if r["kind"] == KIND_ISSUE_4G5G)
     n_issue = n_issue_4g + n_issue_4g5g
 
-    zoom_specs = []
+    zoom_specs = thana_focus_specs(classified)
     for index, zoom_issues in enumerate(cluster_issue_sites(issue_rows), start=1):
         lat_min, lat_max, lon_min, lon_max = cluster_bounds(zoom_issues)
         issue_names = {row["site"] for row in zoom_issues}
@@ -1481,11 +1482,12 @@ def _write_geoplot(
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:N3",
-        "National map is the overview. Issue clusters are built dynamically until every "
-        f"issue site is covered ({len(zoom_specs)} maps). Urban clusters come first "
-        "(Dhaka Metro, Gazipur, surrounding), then maps with more issue sites. "
-        "Coverage: Cyan = 4G, Yellow = 5G. Issue sites: Red = 4G, Orange = 4G+5G. "
-        "Open the HTML file for interactive maps.",
+        "National map is the overview, then Gulshan, Banani, Dhanmondi, and Tejgaon "
+        "thana maps (high 5G footprint). Issue clusters after that are built dynamically "
+        f"until every issue site is covered ({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
+        "Urban clusters come first (Dhaka Metro, Gazipur, surrounding), then maps with "
+        "more issue sites. Coverage: Cyan = 4G, Yellow = 5G. Issue sites: Red = 4G, "
+        "Orange = 4G+5G. Open the HTML file for interactive maps.",
         styles["note"],
     )
     row = 5
@@ -1511,7 +1513,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v38.xlsx",
+        default="FEGE_Choked_Flat_Sites_v39.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

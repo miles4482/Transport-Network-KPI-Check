@@ -400,6 +400,86 @@ def cluster_label(rows: list[dict], index: int) -> str:
     return f"Cluster {index:02d} — {area}"
 
 
+THANAS = (
+    ("Gulshan Thana", "Thana_Gulshan", "gulshan"),
+    ("Banani Thana", "Thana_Banani", "banani"),
+    ("Dhanmondi Thana", "Thana_Dhanmondi", "dhanmondi"),
+    ("Tejgaon Thana", "Thana_Tejgaon", "tejgaon"),
+)
+
+
+def site_thana_key(row: dict) -> str | None:
+    """Assign a high-5G Dhaka thana from site code and coordinates."""
+    site = str(row.get("site") or "").strip().upper()
+    lat = float(row["lat"])
+    lon = float(row["lon"])
+    if site.startswith("DHDHN"):
+        return "dhanmondi"
+    if site.startswith("DHTEJ") or site.startswith("DHTIA"):
+        return "tejgaon"
+    if site.startswith("DHGUL"):
+        # Banani lake split: west = Banani, east = Gulshan.
+        return "banani" if lon < 90.408 else "gulshan"
+    if (
+        site.startswith("DHCNT")
+        and 23.784 <= lat <= 23.808
+        and 90.392 <= lon <= 90.412
+    ):
+        return "banani"
+    return None
+
+
+def area_bounds(rows: list[dict], pad: float = 0.008) -> tuple[float, float, float, float]:
+    """Roomy thana viewport so the 5G footprint reads as an area."""
+    lats = [row["lat"] for row in rows]
+    lons = [row["lon"] for row in rows]
+    return min(lats) - pad, max(lats) + pad, min(lons) - pad, max(lons) + pad
+
+
+def thana_focus_specs(classified: list[dict]) -> list[dict]:
+    """Fixed thana maps for the high-5G Gulshan / Banani / Dhanmondi / Tejgaon belt."""
+    specs = []
+    for name, slug, key in THANAS:
+        members = [row for row in classified if site_thana_key(row) == key]
+        if not members:
+            continue
+        lat_min, lat_max, lon_min, lon_max = area_bounds(members)
+        member_sites = {row["site"] for row in members}
+        member_issues = [row for row in members if row.get("kind") in ISSUE_KINDS]
+        rows = []
+        for row in classified:
+            if not (lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max):
+                continue
+            if row.get("kind") in ISSUE_KINDS and row["site"] not in member_sites:
+                rows.append({**row, "kind": row["tech"] if row["tech"] in ("4G", "5G") else "4G"})
+            else:
+                rows.append(row)
+        issue_4g = sum(1 for row in member_issues if row["kind"] == KIND_ISSUE_4G)
+        issue_4g5g = sum(1 for row in member_issues if row["kind"] == KIND_ISSUE_4G5G)
+        n5 = sum(1 for row in members if row.get("tech") == "5G")
+        specs.append(
+            {
+                "label": f"{name} — high 5G footprint",
+                "title": (
+                    f"{name} — high 5G footprint ({n5} 5G · "
+                    f"{len(member_issues)} issue sites)"
+                ),
+                "slug": slug,
+                "focus": "thana",
+                "issue_count": len(member_issues),
+                "issue_4g_count": issue_4g,
+                "issue_4g5g_count": issue_4g5g,
+                "issue_sites": [row["site"] for row in member_issues],
+                "rows": rows,
+                "lat_min": lat_min,
+                "lat_max": lat_max,
+                "lon_min": lon_min,
+                "lon_max": lon_max,
+            }
+        )
+    return specs
+
+
 def cluster_bounds(rows: list[dict]) -> tuple[float, float, float, float]:
     """Medium viewport: not a city-wide box, not a single-building crop."""
     lats = [row["lat"] for row in rows]
@@ -440,13 +520,17 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
         _draw_points(panel, spec["rows"], z, zx, zy, labels=True, emphasize_5g=False)
         slug = spec.get("slug") or spec["label"].replace(" ", "_").replace("/", "-")
         path = dest_dir / f"{stem}_{slug}.jpg"
-        local = {
-            "4G": sum(1 for r in spec["rows"] if r.get("kind") == "4G"),
-            "5G": sum(1 for r in spec["rows"] if r.get("kind") == "5G"),
-            KIND_ISSUE_4G: spec.get("issue_4g_count", 0),
-            KIND_ISSUE_4G5G: spec.get("issue_4g5g_count", 0),
-        }
-        title = f"{spec['label']} — {spec['issue_count']} issue sites"
+        if spec.get("focus") == "thana":
+            local = tech_counts(spec["rows"])
+            title = spec.get("title") or spec["label"]
+        else:
+            local = {
+                "4G": sum(1 for r in spec["rows"] if r.get("kind") == "4G"),
+                "5G": sum(1 for r in spec["rows"] if r.get("kind") == "5G"),
+                KIND_ISSUE_4G: spec.get("issue_4g_count", 0),
+                KIND_ISSUE_4G5G: spec.get("issue_4g5g_count", 0),
+            }
+            title = f"{spec['label']} — {spec['issue_count']} issue sites"
         _frame_map(panel, title, local).save(path, format="JPEG", quality=88)
         outputs.append((title, path))
     return outputs
@@ -467,6 +551,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         "zooms": [
             {
                 "label": spec["label"],
+                "title": spec.get("title") or f"{spec['label']} — {spec['issue_count']} issue sites",
                 "issueCount": spec["issue_count"],
                 "issueSites": spec.get("issue_sites", []),
                 "bounds": [spec["lat_min"], spec["lon_min"], spec["lat_max"], spec["lon_max"]],
@@ -511,7 +596,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G</p>
+  <p class="sub">Google satellite · National, then Gulshan / Banani / Dhanmondi / Tejgaon thana maps (high 5G footprint), then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>
@@ -585,7 +670,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         const [s, w, n, e] = z.bounds;
         return {{
           id: "zoom" + i,
-          title: z.label + " — " + z.issueCount + " issue sites",
+          title: z.title || (z.label + " — " + z.issueCount + " issue sites"),
           points: DATA.points.filter(p => p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e).map(p => {{
             if ((p.kind === "Issue 4G" || p.kind === "Issue 4G+5G") && z.issueSites.length && !z.issueSites.includes(p.site)) {{
               return Object.assign({{}}, p, {{kind: p.tech === "5G" ? "5G" : "4G"}});
