@@ -755,18 +755,23 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         # Hourly line, compact 2-level category axis matching the target snap.
         # Outer level: Date shown only once per day (blank for hours 1..23).
         # Inner level: All 24 hourly timestamps (00:00 to 23:00) rotated vertically.
-        c0 = i * 4
+        c0 = i * 5
         data.write(0, c0, "Date")
         data.write(0, c0 + 1, "Time")
         data.write(0, c0 + 2, "Rx")
-        data.write(0, c0 + 3, "Stuck")
+        data.write(0, c0 + 3, "Peak")
+        data.write(0, c0 + 4, "Peak95")
         rx_by_key = {
             (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
             for _, row in s.iterrows()
         }
+        chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
+        peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
+        # 5% below the 72-hour peak (all hourly RxMaxSpeed values in the chart).
+        peak_95 = peak_72 * 0.95 if np.isfinite(peak_72) else float("nan")
         dates: list[str] = []
         times: list[str] = []
-        plotted: list[float] = [float(rec["center"])]
+        plotted: list[float] = [v for v in (peak_72, peak_95) if np.isfinite(v)]
         r = 0
         for day in pd.date_range(chart_start, chart_end, freq="D"):
             date_label = f"{int(day.day)}/{MONTHS[int(day.month) - 1]}"
@@ -790,8 +795,9 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                 else:
                     data.write_number(r, c0 + 2, value)
                     plotted.append(value)
-                # Straight red line at Stuck RxMaxSpeed for every hour.
-                data.write_number(r, c0 + 3, float(rec["center"]))
+                if np.isfinite(peak_72):
+                    data.write_number(r, c0 + 3, peak_72)
+                    data.write_number(r, c0 + 4, peak_95)
         n = r
 
         ws.set_row(top, 26)
@@ -847,16 +853,27 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                 "marker": {"type": "none"},
             }
         )
-        chart.add_series(
-            {
-                "name": f"Stuck RxMaxSpeed ({rec['center']:.2f} Mbit/s)",
-                "categories": ["_ChartData", 1, c0, n, c0 + 1],
-                "categories_data": [dates, times],
-                "values": ["_ChartData", 1, c0 + 3, n, c0 + 3],
-                "line": {"color": "#C00000", "width": 1.5, "dash_type": "dash"},
-                "marker": {"type": "none"},
-            }
-        )
+        if np.isfinite(peak_72):
+            chart.add_series(
+                {
+                    "name": f"Peak ({peak_72:.2f} Mbit/s)",
+                    "categories": ["_ChartData", 1, c0, n, c0 + 1],
+                    "categories_data": [dates, times],
+                    "values": ["_ChartData", 1, c0 + 3, n, c0 + 3],
+                    "line": {"color": "#C00000", "width": 1.5, "dash_type": "dash"},
+                    "marker": {"type": "none"},
+                }
+            )
+            chart.add_series(
+                {
+                    "name": f"5% below peak ({peak_95:.2f} Mbit/s)",
+                    "categories": ["_ChartData", 1, c0, n, c0 + 1],
+                    "categories_data": [dates, times],
+                    "values": ["_ChartData", 1, c0 + 4, n, c0 + 4],
+                    "line": {"color": "#ED7D31", "width": 1.5, "dash_type": "dash"},
+                    "marker": {"type": "none"},
+                }
+            )
         chart.set_x_axis(
             {
                 "num_font": {
@@ -1513,7 +1530,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v39.xlsx",
+        default="FEGE_Choked_Flat_Sites_v40.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
