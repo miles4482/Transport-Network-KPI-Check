@@ -97,6 +97,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v49 adds Site List **Double check** = Yes when Peak is ≥50% above Avg peak (DHGULAP type). Detection listing is unchanged. File: `FEGE_Choked_Flat_Sites_v49.xlsx`.
 - v50 lowers Double check to Yes when Peak is ≥30% above Avg peak. Detection listing is unchanged. File: `FEGE_Choked_Flat_Sites_v50.xlsx`.
 - v51 puts an issue-severity map beside every top-thana and cluster GeoPlot, matching the national pair. File: `FEGE_Choked_Flat_Sites_v51.xlsx`.
+- v52 adds **Action plan** for urgent Tx BW increase: Severe/High (both cap shapes) with high Hours on cap and busy hours ≥50% on cap. Double check = Yes is left off. File: `FEGE_Choked_Flat_Sites_v52.xlsx`.
 
 ## Jupyter (for local Windows use)
 
