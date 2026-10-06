@@ -1814,7 +1814,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v58.xlsx",
+        default="FEGE_Choked_Flat_Sites_v59.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2000,8 +2000,7 @@ def _write_summary(
     ws.merge_range(
         "A6:J6",
         f"UrgentTxBWInc: {n_action} sites for urgent Tx BW increase "
-        f"(Severe/High, Hours on cap high, busy hours ≥{ACTION_BUSY_PCT:.0f}% on cap). "
-        "Open the UrgentTxBWInc sheet — not every issue site can take a BW upgrade.",
+        f"(Severe/High, Hours on cap high, busy hours ≥{ACTION_BUSY_PCT:.0f}% on cap).",
         styles["note"],
     )
 
@@ -2633,8 +2632,7 @@ def _write_action_plan(
         0,
         1,
         title_last_col,
-        f"DHK transmission    ·    {period_txt}    ·    {len(selected)} of {len(records)} issue sites"
-        f"    ·    not every issue site can take a BW upgrade",
+        f"DHK transmission    ·    {period_txt}    ·    {len(selected)} of {len(records)} issue sites",
         styles["subtitle"],
     )
 
