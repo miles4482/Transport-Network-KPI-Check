@@ -93,6 +93,7 @@ GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
 GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
 TECH_FILE = "Site list_Dhaka_Tech_5oct.xlsx"
+TOP_THANA_FILE = "Top Thana.xlsx"
 TECH_4G = "4G"
 TECH_4G5G = "4G+5G"
 DARK_RED = "#8B0000"
@@ -1278,6 +1279,12 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"Cap shape: '{CAP_CROWDED}' or '{CAP_CEILING}'. "
             "The hourly chart is the latest 3 days only. Open a site name to jump to it.",
         ),
+        (
+            "GeoPlot top thanas",
+            f"Thana maps use only names listed in {TOP_THANA_FILE}, matched to the "
+            f"Thana column in {GEO_FILE}. Cluster maps after that cover remaining "
+            "issue sites.",
+        ),
     ]
     for i, (key, val) in enumerate(kept):
         r = kept_head + 1 + i
@@ -1306,6 +1313,7 @@ def load_site_geo(path: Path) -> pd.DataFrame:
     district_col = cols.get("district")
     region_col = cols.get("region")
     tech_col = cols.get("tech")
+    thana_col = cols.get("thana")
     geo = pd.DataFrame(
         {
             "site": raw[site_col].astype(str).str.strip(),
@@ -1314,11 +1322,26 @@ def load_site_geo(path: Path) -> pd.DataFrame:
             "district": raw[district_col].astype(str) if district_col else "",
             "region": raw[region_col].astype(str) if region_col else "",
             "tech": raw[tech_col].astype(str).str.strip() if tech_col else "",
+            "thana": raw[thana_col].astype(str).str.strip() if thana_col else "",
         }
     )
     geo = geo.dropna(subset=["lat", "lon"])
     geo = geo[geo["site"] != ""]
+    geo.loc[geo["thana"].str.lower().isin(("", "nan", "none")), "thana"] = ""
     return geo.drop_duplicates("site", keep="last")
+
+
+def load_top_thanas(path: Path) -> list[str]:
+    """Thana names to plot first on GeoPlot, in file order."""
+    raw = pd.read_excel(path, header=None)
+    names: list[str] = []
+    skip = {"", "nan", "top than", "top thana", "thana", "name", "thana name"}
+    for val in raw.iloc[:, 0].tolist():
+        text = str(val or "").strip()
+        if not text or text.lower() in skip:
+            continue
+        names.append(text)
+    return names
 
 
 def _find_input(name: str, source: Path | None = None) -> Path | None:
@@ -1448,6 +1471,7 @@ def _write_geoplot(
             "district": str(row["district"]),
             "region": str(row["region"]),
             "tech": str(row.get("tech", "")),
+            "thana": str(row["thana"]) if "thana" in row.index and pd.notna(row["thana"]) else "",
             "severity": sev_by_site.get(site, "—"),
         }
 
@@ -1465,11 +1489,12 @@ def _write_geoplot(
                 "district": str(row.district),
                 "region": str(row.region),
                 "tech": str(getattr(row, "tech", "")),
+                "thana": str(getattr(row, "thana", "") or ""),
                 "severity": "—",
             }
         )
 
-    headers = ["Site", "Latitude", "Longitude", "Status", "Tech", "Issue Tech", "District", "Region", "Severity"]
+    headers = ["Site", "Latitude", "Longitude", "Status", "Tech", "Issue Tech", "District", "Region", "Thana", "Severity"]
     for col, text in enumerate(headers):
         data_ws.write_string(0, col, text)
     excel_row = 1
@@ -1484,7 +1509,8 @@ def _write_geoplot(
         data_ws.write_string(excel_row, 5, listed if status == "Issue" else "")
         data_ws.write_string(excel_row, 6, row["district"])
         data_ws.write_string(excel_row, 7, row["region"])
-        data_ws.write_string(excel_row, 8, row["severity"])
+        data_ws.write_string(excel_row, 8, str(row.get("thana") or ""))
+        data_ws.write_string(excel_row, 9, row["severity"])
         excel_row += 1
 
     classified = classify_rows(other_rows + issue_rows, issue_set, tech_by_site)
@@ -1495,7 +1521,11 @@ def _write_geoplot(
     n_issue_4g5g = sum(1 for r in classified if r["kind"] == KIND_ISSUE_4G5G)
     n_issue = n_issue_4g + n_issue_4g5g
 
-    zoom_specs = thana_focus_specs(classified)
+    thana_path = _find_input(TOP_THANA_FILE, output)
+    if thana_path is None:
+        raise SystemExit(f"Top thana list not found: {TOP_THANA_FILE}")
+    top_thanas = load_top_thanas(thana_path)
+    zoom_specs = thana_focus_specs(classified, top_thanas, tech_by_site)
     for index, zoom_issues in enumerate(cluster_issue_sites(issue_rows), start=1):
         lat_min, lat_max, lon_min, lon_max = cluster_bounds(zoom_issues)
         issue_names = {row["site"] for row in zoom_issues}
@@ -1541,20 +1571,16 @@ def _write_geoplot(
         f"Google satellite    ·    Physical sites: {len(classified)}"
         f"    ·    4G: {n4}    ·    5G: {n5}"
         f"    ·    Issue 4G: {n_issue_4g}    ·    Issue 4G+5G: {n_issue_4g5g}"
-        f"    ·    Source: {GEO_FILE} + {TECH_FILE}",
+        f"    ·    Source: {GEO_FILE} + {TECH_FILE} + {TOP_THANA_FILE}",
         styles["subtitle"],
     )
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:R3",
-        "National map (left) is the 4G / 5G / issue-tech overview. The map beside it "
-        "colours the same issue sites by severity (Severe / High / Moderate / Low). "
-        "Then Gulshan, Banani, Dhanmondi, and Tejgaon thana maps (high 5G footprint). "
-        "Issue clusters after that are built dynamically until every issue site is "
-        f"covered ({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
-        "Urban clusters come first (Dhaka Metro, Gazipur, surrounding), then maps with "
-        "more issue sites. Coverage: Cyan = 4G, Yellow = 5G. Issue sites: Red = 4G, "
-        "Orange = 4G+5G. Open the HTML file for interactive maps.",
+        "National map (left) and issue-severity map (right). "
+        f"Top thanas from {TOP_THANA_FILE}, then issue clusters "
+        f"({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
+        "Coverage: Cyan = 4G, Yellow = 5G. Issue: Red = 4G, Orange = 4G+5G.",
         styles["note"],
     )
     row = 5
@@ -1627,7 +1653,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v47.xlsx",
+        default="FEGE_Choked_Flat_Sites_v48.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2010,12 +2036,12 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws = book.add_worksheet("1. Site List")
     _page(ws, REPORT_TITLE)
 
-    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 12]
+    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
-    last_col_letter = "O"
+    last_col_letter = "M"
     ws.set_row(0, 28)
     ws.merge_range(
         f"A1:{last_col_letter}1",
@@ -2044,8 +2070,6 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         f"Last day cap ({last_day_hdr})",
         "Listed because",
         "Longest flat run (h)",
-        "Night Rx 02–06 (Mbit/s)",
-        "Sample snap",
     ]
     header_row = 3
     ws.set_row(header_row, 36)
@@ -2085,20 +2109,12 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         ws.write_string(row, 10, last_txt, styles["yes"] if rec["last_flag"] else c)
         ws.write_string(row, 11, rec["listed_by"], c)
         ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
-        if np.isfinite(rec["night_rx"]):
-            ws.write_number(row, 13, rec["night_rx"], n)
-        else:
-            ws.write_string(row, 13, "—", c)
-        if rec["reference"]:
-            ws.write_string(row, 14, "Yes", styles["yes"])
-        else:
-            ws.write_string(row, 14, "—", c)
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.repeat_rows(header_row, header_row)
 
-    last_col = 14
+    last_col = 12
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
@@ -2177,7 +2193,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         7,
         count_row,
         last_col,
-        f"Sample snaps in the list: {', '.join(REFERENCE_SITES)}",
+        f"Cap shapes: {shapes[CAP_CROWDED]} crowded · {shapes[CAP_CEILING]} ceiling",
         styles["meta"],
     )
     ws.set_row(count_row + 1, 18)

@@ -509,47 +509,58 @@ def cluster_label(rows: list[dict], index: int) -> str:
     return f"Cluster {index:02d} — {area}"
 
 
-THANAS = (
-    ("Gulshan Thana", "Thana_Gulshan", "gulshan"),
-    ("Banani Thana", "Thana_Banani", "banani"),
-    ("Dhanmondi Thana", "Thana_Dhanmondi", "dhanmondi"),
-    ("Tejgaon Thana", "Thana_Tejgaon", "tejgaon"),
-)
+def _norm_thana(name: object) -> str:
+    text = str(name or "").strip().casefold()
+    for suffix in (" thana", " than", " upazila"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+    return text
 
 
-def site_thana_key(row: dict) -> str | None:
-    """Assign a high-5G Dhaka thana from site code and coordinates."""
-    site = str(row.get("site") or "").strip().upper()
-    lat = float(row["lat"])
-    lon = float(row["lon"])
-    if site.startswith("DHDHN"):
-        return "dhanmondi"
-    if site.startswith("DHTEJ") or site.startswith("DHTIA"):
-        return "tejgaon"
-    if site.startswith("DHGUL"):
-        # Banani lake split: west = Banani, east = Gulshan.
-        return "banani" if lon < 90.408 else "gulshan"
-    if (
-        site.startswith("DHCNT")
-        and 23.784 <= lat <= 23.808
-        and 90.392 <= lon <= 90.412
-    ):
-        return "banani"
-    return None
+def _thana_display(name: str) -> str:
+    label = str(name or "").strip()
+    if not label:
+        return label
+    if label.casefold().endswith("thana"):
+        return label
+    return f"{label} Thana"
+
+
+def _thana_tech_counts(members: list[dict], tech_by_site: dict[str, str] | None) -> tuple[int, int]:
+    n4 = 0
+    n45 = 0
+    listed = tech_by_site or {}
+    for row in members:
+        tech = listed.get(row["site"], "")
+        if tech == "4G+5G":
+            n45 += 1
+        elif tech == "4G":
+            n4 += 1
+        elif "5G" in str(row.get("tech") or "").upper():
+            n45 += 1
+        else:
+            n4 += 1
+    return n4, n45
 
 
 def area_bounds(rows: list[dict], pad: float = 0.008) -> tuple[float, float, float, float]:
-    """Roomy thana viewport so the 5G footprint reads as an area."""
     lats = [row["lat"] for row in rows]
     lons = [row["lon"] for row in rows]
     return min(lats) - pad, max(lats) + pad, min(lons) - pad, max(lons) + pad
 
 
-def thana_focus_specs(classified: list[dict]) -> list[dict]:
-    """Fixed thana maps for the high-5G Gulshan / Banani / Dhanmondi / Tejgaon belt."""
+def thana_focus_specs(
+    classified: list[dict],
+    top_thanas: list[str] | None = None,
+    tech_by_site: dict[str, str] | None = None,
+) -> list[dict]:
+    """Thana maps listed in Top Thana.xlsx, matched to the physical Thana column."""
     specs = []
-    for name, slug, key in THANAS:
-        members = [row for row in classified if site_thana_key(row) == key]
+    for name in top_thanas or []:
+        key = _norm_thana(name)
+        if not key:
+            continue
+        members = [row for row in classified if _norm_thana(row.get("thana")) == key]
         if not members:
             continue
         lat_min, lat_max, lon_min, lon_max = area_bounds(members)
@@ -565,14 +576,13 @@ def thana_focus_specs(classified: list[dict]) -> list[dict]:
                 rows.append(row)
         issue_4g = sum(1 for row in member_issues if row["kind"] == KIND_ISSUE_4G)
         issue_4g5g = sum(1 for row in member_issues if row["kind"] == KIND_ISSUE_4G5G)
-        n5 = sum(1 for row in members if row.get("tech") == "5G")
+        n4, n45 = _thana_tech_counts(members, tech_by_site)
+        title = f"{_thana_display(name)} (4G: {n4} 4G+5G: {n45})"
+        slug = "Thana_" + "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
         specs.append(
             {
-                "label": f"{name} — high 5G footprint",
-                "title": (
-                    f"{name} — high 5G footprint ({n5} 5G · "
-                    f"{len(member_issues)} issue sites)"
-                ),
+                "label": title,
+                "title": title,
                 "slug": slug,
                 "focus": "thana",
                 "issue_count": len(member_issues),
@@ -721,7 +731,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · National + severity maps, then Gulshan / Banani / Dhanmondi / Tejgaon thana maps, then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: bright red Severe / deep red High / muted amber Moderate / calm green Low</p>
+  <p class="sub">Google satellite · National + severity maps, then top thanas from Top Thana.xlsx, then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: bright red Severe / deep red High / muted amber Moderate / calm green Low</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>

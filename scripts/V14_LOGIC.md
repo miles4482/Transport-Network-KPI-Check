@@ -93,6 +93,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v45 pulls the national and severity maps together, leaving only a thin separator instead of a wide empty gutter. File: `FEGE_Choked_Flat_Sites_v45.xlsx`.
 - v46 retunes GeoPlot severity colours: bright red Severe, less-bright deep red High, muted amber Moderate, calm green Low. File: `FEGE_Choked_Flat_Sites_v46.xlsx`.
 - v47 keeps the 72-hour Peak line and redraws Avg peak as the mean of every 3-day hour that hits the wall, that day's high, or sits at/above the wall. File: `FEGE_Choked_Flat_Sites_v47.xlsx`.
+- v48 plots GeoPlot top thanas from `Top Thana.xlsx` matched to the physical `Thana` column, shortens GeoPlot titles to `Thana (4G: n 4G+5G: m)`, and drops Night Rx / Sample snap from Site List. File: `FEGE_Choked_Flat_Sites_v48.xlsx`.
 
 ## Jupyter (for local Windows use)
 
