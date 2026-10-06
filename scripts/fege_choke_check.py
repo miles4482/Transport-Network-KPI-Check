@@ -286,6 +286,8 @@ SEVERITY_NOTES = (
     ),
 )
 SNAP_DAYS = 3
+# Tx review flag: (Peak − Avg peak) / Peak ≥ 50% (DHGULAP-type traces).
+DOUBLE_CHECK_PEAK_GAP = 0.50
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
@@ -767,6 +769,40 @@ def _avg_wall_peak(
     return float(sum(collected) / len(collected))
 
 
+def _site_chart_peaks(work: pd.DataFrame, rec: dict, chart_start, chart_end) -> tuple[float, float]:
+    s = work.loc[work["eNodeB Name"] == rec["site"]]
+    s = s[(s["Date"] >= chart_start) & (s["Date"] <= chart_end)]
+    rx_by_key = {
+        (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
+        for _, row in s.iterrows()
+    }
+    on_cap_by_key = {
+        (row["Date"].normalize(), int(row["Hour"])): bool(row.get("OnCap", False))
+        for _, row in s.iterrows()
+    }
+    chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
+    peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
+    avg_peak = _avg_wall_peak(
+        rx_by_key, on_cap_by_key, float(rec["center"]), chart_start, chart_end
+    )
+    return peak_72, avg_peak, rx_by_key, on_cap_by_key, s
+
+
+def _needs_double_check(peak_72: float, avg_peak: float) -> bool:
+    """True when Peak sits ~50% or more above Avg peak (radio demand, not a hard Tx wall)."""
+    if not (np.isfinite(peak_72) and np.isfinite(avg_peak) and peak_72 > 0):
+        return False
+    return (peak_72 - avg_peak) / peak_72 >= DOUBLE_CHECK_PEAK_GAP
+
+
+def _attach_chart_peaks(work: pd.DataFrame, records: list[dict], chart_start, chart_end) -> None:
+    for rec in records:
+        peak_72, avg_peak, *_rest = _site_chart_peaks(work, rec, chart_start, chart_end)
+        rec["peak_72"] = peak_72
+        rec["avg_peak"] = avg_peak
+        rec["double_check"] = _needs_double_check(peak_72, avg_peak)
+
+
 def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
     ws = book.add_worksheet(SNAP_SHEET)
     _page(ws, "Hourly chart of issue sites", fit_width=False)
@@ -807,15 +843,18 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
             for _, row in s.iterrows()
         }
-        on_cap_by_key = {
-            (row["Date"].normalize(), int(row["Hour"])): bool(row.get("OnCap", False))
-            for _, row in s.iterrows()
-        }
-        chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
-        peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
-        avg_peak = _avg_wall_peak(
-            rx_by_key, on_cap_by_key, float(rec["center"]), chart_start, chart_end
-        )
+        peak_72 = rec.get("peak_72")
+        avg_peak = rec.get("avg_peak")
+        if peak_72 is None or avg_peak is None:
+            on_cap_by_key = {
+                (row["Date"].normalize(), int(row["Hour"])): bool(row.get("OnCap", False))
+                for _, row in s.iterrows()
+            }
+            chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
+            peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
+            avg_peak = _avg_wall_peak(
+                rx_by_key, on_cap_by_key, float(rec["center"]), chart_start, chart_end
+            )
         dates: list[str] = []
         times: list[str] = []
         plotted: list[float] = [v for v in (peak_72, avg_peak) if np.isfinite(v)]
@@ -1285,6 +1324,12 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"Thana column in {GEO_FILE}. Cluster maps after that cover remaining "
             "issue sites.",
         ),
+        (
+            "Double check",
+            f"Site List Double check = Yes when Peak is ≥{DOUBLE_CHECK_PEAK_GAP:.0%} above "
+            "Avg peak (Peak − Avg peak) / Peak. Example: DHGULAP. Tx may read this as "
+            "low radio demand rather than a hard wall. Detection listing is unchanged.",
+        ),
     ]
     for i, (key, val) in enumerate(kept):
         r = kept_head + 1 + i
@@ -1653,7 +1698,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v48.xlsx",
+        default="FEGE_Choked_Flat_Sites_v49.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2019,6 +2064,7 @@ def _write_workbook(
     # Dashboard is the first sheet so the file opens on the report view.
     chart_end = period_end.normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
+    _attach_chart_peaks(work, records, chart_start, chart_end)
     _write_summary(
         book, styles, source_name, period_txt, n_sites, records, tech_summary, tech_by_site
     )
@@ -2036,12 +2082,12 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws = book.add_worksheet("1. Site List")
     _page(ws, REPORT_TITLE)
 
-    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12]
+    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
-    last_col_letter = "M"
+    last_col_letter = "N"
     ws.set_row(0, 28)
     ws.merge_range(
         f"A1:{last_col_letter}1",
@@ -2070,6 +2116,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         f"Last day cap ({last_day_hdr})",
         "Listed because",
         "Longest flat run (h)",
+        "Double check",
     ]
     header_row = 3
     ws.set_row(header_row, 36)
@@ -2109,12 +2156,14 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         ws.write_string(row, 10, last_txt, styles["yes"] if rec["last_flag"] else c)
         ws.write_string(row, 11, rec["listed_by"], c)
         ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        if rec.get("double_check"):
+            ws.write_string(row, 13, "Yes", styles["yes"])
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.repeat_rows(header_row, header_row)
 
-    last_col = 12
+    last_col = 13
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
@@ -2166,6 +2215,22 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         styles["body"],
     )
 
+    dc_row = last_help + 3
+    ws.set_row(dc_row, 20)
+    ws.merge_range(dc_row, 0, dc_row, last_col, "How to read Double check", styles["section"])
+    ws.set_row(dc_row + 1, 40)
+    ws.merge_range(
+        dc_row + 1,
+        0,
+        dc_row + 1,
+        last_col,
+        f"Yes means Peak is at least {DOUBLE_CHECK_PEAK_GAP:.0%} above Avg peak on the "
+        "hourly chart (example: DHGULAP Peak 71.97 vs Avg peak 34.92). "
+        "Tx may treat this as low radio demand rather than a hard transmission wall. "
+        "The site stays in the issue list for review.",
+        styles["body"],
+    )
+
     counts = defaultdict(int)
     listed = defaultdict(int)
     when = defaultdict(int)
@@ -2177,7 +2242,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         when[rec["cap_when"]] += 1
         shapes[rec["cap_type"]] += 1
         last_n += int(rec["last_flag"])
-    count_row = last_help + 3
+    count_row = dc_row + 3
     ws.write(count_row, 0, "Severity", styles["label"])
     ws.merge_range(count_row, 1, count_row, 2, f"Severe: {counts[SEV_SEVERE]}", styles["meta"])
     ws.merge_range(
