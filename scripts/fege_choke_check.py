@@ -88,7 +88,7 @@ SEV_MODERATE = "Moderate"
 SEV_LOW = "Low"
 REPORT_TITLE = "Transmission Link Health Review"
 SNAP_SHEET = "2. HourlyChartOfIssueSites"
-ACTION_SHEET = "Action plan"
+ACTION_SHEET = "UrgentTxBWInc"
 GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
@@ -1360,18 +1360,44 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Avg peak (Peak − Avg peak) / Peak. Example: DHGULAP. Tx may read this as "
             "low radio demand rather than a hard wall. Detection listing is unchanged.",
         ),
-        (
-            "Action plan",
-            "Action plan is the budgeted urgent Tx BW increase list. "
-            "Severe and High only (Crowded level and Hard ceiling both eligible). "
-            f"Hours on cap (all 24h) is at least High ({SEV_HIGH_PCT:.0f}%). "
-            f"Busy hours (08:00–22:00) sit on the cap at least {ACTION_BUSY_PCT:.0f}% "
-            "of those hours. Double check = Yes is left off. "
-            "Sorted Severe first, then Hours on cap %, then busy-hour cap %.",
-        ),
     ]
     for i, (key, val) in enumerate(kept):
         r = kept_head + 1 + i
+        ws.set_row(r, 56)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
+    action_head = kept_head + 1 + len(kept) + 1
+    ws.set_row(action_head, 20)
+    ws.merge_range(action_head, 0, action_head, 1, "UrgentTxBWInc", styles["section"])
+    action_notes = (
+        (
+            "Why this sheet",
+            "Tx cannot raise bandwidth on every issue site (cost and budget). "
+            "UrgentTxBWInc is the urgent upgrade list only.",
+        ),
+        (
+            "Who is listed",
+            f"Severe and High from both '{CAP_CROWDED}' and '{CAP_CEILING}'. "
+            f"Hours on cap (all 24h) is at least {SEV_HIGH_PCT:.0f}% "
+            f"(Severe ≥{SEV_SEVERE_PCT:.0f}%). "
+            f"Busy hours 08:00–22:00 sit on the cap at least {ACTION_BUSY_PCT:.0f}% "
+            "of those hours — the busy period is heavily capped, so radio still has demand.",
+        ),
+        (
+            "Who is left off",
+            "Moderate, Low, Off-peak-only, and sites whose busy-hour cap is below "
+            f"{ACTION_BUSY_PCT:.0f}%. Double check = Yes (Peak well above Avg peak) "
+            "is left off — Tx reads those as low radio demand, not a hard wall.",
+        ),
+        (
+            "Order",
+            "Severe first, then highest Hours on cap (all 24h) %, then highest "
+            "busy-hour cap %. Open a site name to jump to its hourly chart.",
+        ),
+    )
+    for i, (key, val) in enumerate(action_notes):
+        r = action_head + 1 + i
         ws.set_row(r, 56)
         ws.write(r, 0, key, styles["method_key"])
         ws.write(r, 1, val, styles["method_val"])
@@ -1744,7 +1770,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v52.xlsx",
+        default="FEGE_Choked_Flat_Sites_v53.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1925,9 +1951,9 @@ def _write_summary(
     ws.set_row(5, 20)
     ws.merge_range(
         "A6:J6",
-        f"Action plan: {n_action} sites for urgent Tx BW increase "
+        f"UrgentTxBWInc: {n_action} sites for urgent Tx BW increase "
         f"(Severe/High, Hours on cap high, busy hours ≥{ACTION_BUSY_PCT:.0f}% on cap). "
-        "Open the Action plan sheet — not every issue site can take a BW upgrade.",
+        "Open the UrgentTxBWInc sheet — not every issue site can take a BW upgrade.",
         styles["note"],
     )
 
@@ -2381,7 +2407,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
 def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
     """Budgeted urgent Tx BW increase list: Severe/High with a heavy busy-hour cap."""
     ws = book.add_worksheet(ACTION_SHEET)
-    _page(ws, "Action plan — urgent Tx BW increase")
+    _page(ws, "UrgentTxBWInc — urgent Tx BW increase")
     ws.set_tab_color(ORANGE_FONT)
 
     widths = [5, 14, 12, 14, 16, 16, 20, 26, 16, 12, 18]
@@ -2396,7 +2422,7 @@ def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
     ws.set_row(0, 28)
     ws.merge_range(
         f"A1:{last_col_letter}1",
-        "Action plan — urgent Tx BW increase",
+        "UrgentTxBWInc — urgent Tx BW increase",
         styles["title"],
     )
     ws.set_row(1, 18)
@@ -2470,42 +2496,7 @@ def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
         by_sev[rec["severity"]] += 1
         by_shape[rec["cap_type"]] += 1
 
-    note_row = last + 2
-    ws.set_row(note_row, 20)
-    ws.merge_range(note_row, 0, note_row, last_col, "How to read Action plan", styles["section"])
-    rules = (
-        (
-            "Why this sheet",
-            "Tx cannot raise bandwidth on every issue site (cost and budget). "
-            "This is the urgent upgrade list only.",
-        ),
-        (
-            "Who is listed",
-            f"Severe and High from both '{CAP_CROWDED}' and '{CAP_CEILING}'. "
-            f"Hours on cap (all 24h) is at least {SEV_HIGH_PCT:.0f}% "
-            f"(Severe ≥{SEV_SEVERE_PCT:.0f}%). "
-            f"Busy hours 08:00–22:00 sit on the cap at least {ACTION_BUSY_PCT:.0f}% "
-            "of those hours — the busy period is heavily capped, so radio still has demand.",
-        ),
-        (
-            "Who is left off",
-            "Moderate, Low, Off-peak-only, and sites whose busy-hour cap is below "
-            f"{ACTION_BUSY_PCT:.0f}%. Double check = Yes (Peak well above Avg peak) "
-            "is left off — Tx reads those as low radio demand, not a hard wall.",
-        ),
-        (
-            "Order",
-            "Severe first, then highest Hours on cap (all 24h) %, then highest "
-            "busy-hour cap %. Open a site name to jump to its hourly chart.",
-        ),
-    )
-    for offset, (name, text) in enumerate(rules):
-        r = note_row + 1 + offset
-        ws.set_row(r, 40)
-        ws.merge_range(r, 0, r, 1, name, styles["center"])
-        ws.merge_range(r, 2, r, last_col, text, styles["body"])
-
-    count_row = note_row + 6
+    count_row = last + 2
     ws.set_row(count_row, 18)
     ws.write(count_row, 0, "This plan", styles["label"])
     ws.merge_range(count_row, 1, count_row, 2, f"Sites: {len(selected)}", styles["meta"])
