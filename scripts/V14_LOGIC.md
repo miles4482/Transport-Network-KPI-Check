@@ -105,6 +105,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v57 fills that Thana summary down each column by count (highest first in column 1, then 2, …) and adds a **Tech** column on Dashboard, Site List, and UrgentTxBWInc. File: `FEGE_Choked_Flat_Sites_v57.xlsx`.
 - v58 sizes the UrgentTxBWInc Thana summary from the thana count: more thanas add pairs to the right, fewer thanas shrink the grid. File: `FEGE_Choked_Flat_Sites_v58.xlsx`.
 - v59 drops the “not every issue site can take a BW upgrade” line from Dashboard and UrgentTxBWInc. File: `FEGE_Choked_Flat_Sites_v59.xlsx`.
+- v60 removes the Dashboard UrgentTxBWInc banner, the Tech-source note, and the UrgentTxBWInc Crowded/Hard ceiling footer. File: `FEGE_Choked_Flat_Sites_v60.xlsx`.
 
 ## Jupyter (for local Windows use)
 

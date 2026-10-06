@@ -1814,7 +1814,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v59.xlsx",
+        default="FEGE_Choked_Flat_Sites_v60.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1995,15 +1995,6 @@ def _write_summary(
         else:
             ws.merge_range(4, col, 4, col + 1, value, value_fmt)
 
-    n_action = sum(1 for rec in records if _on_action_plan(rec))
-    ws.set_row(5, 20)
-    ws.merge_range(
-        "A6:J6",
-        f"UrgentTxBWInc: {n_action} sites for urgent Tx BW increase "
-        f"(Severe/High, Hours on cap high, busy hours ≥{ACTION_BUSY_PCT:.0f}% on cap).",
-        styles["note"],
-    )
-
     tech_summary = tech_summary or {}
     tech_by_site = tech_by_site or {}
     group_title = book.add_format(
@@ -2015,7 +2006,7 @@ def _write_summary(
             "valign": "vcenter",
         }
     )
-    row = 6
+    row = 5
     if tech_summary:
         ws.set_row(row, 22)
         ws.merge_range(row, 0, row, 9, "Technology-wise Link Health", group_title)
@@ -2026,7 +2017,7 @@ def _write_summary(
             0,
             row,
             9,
-            f"4G / 4G+5G choke summary    ·    source: {GEO_FILE} Tech column",
+            "4G / 4G+5G choke summary",
             styles["section"],
         )
         row += 1
@@ -2725,26 +2716,15 @@ def _write_action_plan(
     ws.repeat_rows(header_row, header_row)
 
     by_sev = defaultdict(int)
-    by_shape = defaultdict(int)
     for rec in selected:
         by_sev[rec["severity"]] += 1
-        by_shape[rec["cap_type"]] += 1
 
     count_row = last + 2
     ws.set_row(count_row, 18)
     ws.write(count_row, 0, "This plan", styles["label"])
     ws.merge_range(count_row, 1, count_row, 2, f"Sites: {len(selected)}", styles["meta"])
     ws.merge_range(count_row, 3, count_row, 4, f"Severe: {by_sev[SEV_SEVERE]}", styles["meta"])
-    ws.merge_range(count_row, 5, count_row, 6, f"High: {by_sev[SEV_HIGH]}", styles["meta"])
-    ws.merge_range(
-        count_row,
-        7,
-        count_row,
-        last_col,
-        f"{CAP_CROWDED}: {by_shape[CAP_CROWDED]}    ·    "
-        f"{CAP_CEILING}: {by_shape[CAP_CEILING]}",
-        styles["meta"],
-    )
+    ws.merge_range(count_row, 5, count_row, last_col, f"High: {by_sev[SEV_HIGH]}", styles["meta"])
     ws.set_zoom(110)
 
 
