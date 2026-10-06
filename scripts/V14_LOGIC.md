@@ -92,6 +92,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v44 returns the national pair to the compact side-by-side size, reserves enough rows so thana/cluster maps do not overlap, and enlarges every map legend. File: `FEGE_Choked_Flat_Sites_v44.xlsx`.
 - v45 pulls the national and severity maps together, leaving only a thin separator instead of a wide empty gutter. File: `FEGE_Choked_Flat_Sites_v45.xlsx`.
 - v46 retunes GeoPlot severity colours: bright red Severe, less-bright deep red High, muted amber Moderate, calm green Low. File: `FEGE_Choked_Flat_Sites_v46.xlsx`.
+- v47 keeps the 72-hour Peak line and redraws Avg peak as the mean of every 3-day hour that hits the wall, that day's high, or sits at/above the wall. File: `FEGE_Choked_Flat_Sites_v47.xlsx`.
 
 ## Jupyter (for local Windows use)
 

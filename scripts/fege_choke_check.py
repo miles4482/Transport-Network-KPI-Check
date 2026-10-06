@@ -725,6 +725,47 @@ def _chart_y_scale(values: list[float]) -> tuple[int, int]:
     return max(y_max, 200), 200
 
 
+def _avg_wall_peak(
+    rx_by_key: dict[tuple, float],
+    on_cap_by_key: dict[tuple, bool],
+    center: float,
+    chart_start,
+    chart_end,
+) -> float:
+    """Average of every chart-window hour that hits the wall.
+
+    For each day, collect Rx values that sit on the cap, reach that day's
+    highest value, or sit at/above the stuck wall (including after a cross).
+    The Avg peak line is the mean of those collected values across all days.
+    """
+    collected: list[float] = []
+    for day in pd.date_range(chart_start, chart_end, freq="D"):
+        day_n = day.normalize()
+        day_vals = [
+            rx_by_key[(day_n, hour)]
+            for hour in range(24)
+            if (day_n, hour) in rx_by_key and np.isfinite(rx_by_key[(day_n, hour)])
+        ]
+        if not day_vals:
+            continue
+        day_max = max(day_vals)
+        for hour in range(24):
+            key = (day_n, hour)
+            if key not in rx_by_key:
+                continue
+            rx = rx_by_key[key]
+            if not np.isfinite(rx):
+                continue
+            hit_wall = bool(on_cap_by_key.get(key, False))
+            hit_highest = rx >= day_max
+            hit_or_cross = np.isfinite(center) and rx >= center
+            if hit_wall or hit_highest or hit_or_cross:
+                collected.append(rx)
+    if not collected:
+        return float("nan")
+    return float(sum(collected) / len(collected))
+
+
 def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
     ws = book.add_worksheet(SNAP_SHEET)
     _page(ws, "Hourly chart of issue sites", fit_width=False)
@@ -765,20 +806,15 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
             for _, row in s.iterrows()
         }
+        on_cap_by_key = {
+            (row["Date"].normalize(), int(row["Hour"])): bool(row.get("OnCap", False))
+            for _, row in s.iterrows()
+        }
         chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
         peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
-        # Typical high: mean of each day's peak (not 5% below the single max).
-        daily_peaks = []
-        for day in pd.date_range(chart_start, chart_end, freq="D"):
-            day_vals = [
-                rx_by_key[(day.normalize(), hour)]
-                for hour in range(24)
-                if (day.normalize(), hour) in rx_by_key
-                and np.isfinite(rx_by_key[(day.normalize(), hour)])
-            ]
-            if day_vals:
-                daily_peaks.append(max(day_vals))
-        avg_peak = float(sum(daily_peaks) / len(daily_peaks)) if daily_peaks else float("nan")
+        avg_peak = _avg_wall_peak(
+            rx_by_key, on_cap_by_key, float(rec["center"]), chart_start, chart_end
+        )
         dates: list[str] = []
         times: list[str] = []
         plotted: list[float] = [v for v in (peak_72, avg_peak) if np.isfinite(v)]
@@ -1591,7 +1627,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v46.xlsx",
+        default="FEGE_Choked_Flat_Sites_v47.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
