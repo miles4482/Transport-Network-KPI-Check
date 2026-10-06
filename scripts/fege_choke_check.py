@@ -1770,7 +1770,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v53.xlsx",
+        default="FEGE_Choked_Flat_Sites_v54.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2151,7 +2151,7 @@ def _write_workbook(
         book, styles, source_name, period_txt, n_sites, records, tech_summary, tech_by_site
     )
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
-    _write_action_plan(book, styles, source_name, period_txt, n_sites, records)
+    _write_action_plan(book, styles, source_name, period_txt, n_sites, records, geo)
     _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
     _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
@@ -2404,13 +2404,41 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     )
 
 
-def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
+def _urgent_thana_counts(
+    selected: list[dict], geo: pd.DataFrame | None
+) -> list[tuple[str, int]]:
+    """Site counts by physical Thana for the UrgentTxBWInc list."""
+    by_site: dict[str, str] = {}
+    if geo is not None and len(geo):
+        for row in geo.itertuples(index=False):
+            name = str(getattr(row, "thana", "") or "").strip()
+            if name.lower() in ("", "nan", "none"):
+                name = ""
+            by_site[str(row.site)] = name
+    counts: dict[str, int] = defaultdict(int)
+    for rec in selected:
+        name = by_site.get(rec["site"], "")
+        if not name:
+            name = "(No thana)"
+        counts[name] += 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+
+
+def _write_action_plan(
+    book,
+    styles,
+    source_name,
+    period_txt,
+    n_sites,
+    records,
+    geo: pd.DataFrame | None = None,
+):
     """Budgeted urgent Tx BW increase list: Severe/High with a heavy busy-hour cap."""
     ws = book.add_worksheet(ACTION_SHEET)
     _page(ws, "UrgentTxBWInc — urgent Tx BW increase")
     ws.set_tab_color(ORANGE_FONT)
 
-    widths = [5, 14, 12, 14, 16, 16, 20, 26, 16, 12, 18]
+    widths = [5, 18, 12, 18, 16, 18, 20, 26, 16, 12, 18]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
@@ -2418,6 +2446,49 @@ def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
     chart_row = {rec["site"]: i * BLOCK_ROWS + 1 for i, rec in enumerate(records)}
     last_col = 10
     last_col_letter = "K"
+
+    sum_title = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 12,
+            "bold": True,
+            "font_color": NAVY,
+            "valign": "vcenter",
+        }
+    )
+    sum_head = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#F8CBAD",
+            "border": 1,
+            "border_color": "#C65911",
+        }
+    )
+    sum_name = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "align": "left",
+            "valign": "vcenter",
+            "border": 1,
+            "border_color": LINE,
+        }
+    )
+    sum_count = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "border_color": LINE,
+            "num_format": "0",
+        }
+    )
 
     ws.set_row(0, 28)
     ws.merge_range(
@@ -2433,6 +2504,40 @@ def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
         styles["subtitle"],
     )
 
+    thana_counts = _urgent_thana_counts(selected, geo)
+    pair_n = 3
+    pair_start = 1  # column B, matching the attached layout
+    n_sum_rows = (len(thana_counts) + pair_n - 1) // pair_n if thana_counts else 1
+
+    ws.set_row(3, 20)
+    ws.merge_range(
+        3,
+        0,
+        3,
+        last_col,
+        "Thana Level Summary of urgent Tx BW increase",
+        sum_title,
+    )
+    head_row = 5
+    ws.set_row(head_row, 20)
+    for pair in range(pair_n):
+        col = pair_start + pair * 2
+        ws.write(head_row, col, "Thana Name", sum_head)
+        ws.write(head_row, col + 1, "Site Count", sum_head)
+    for r in range(n_sum_rows):
+        excel_r = head_row + 1 + r
+        ws.set_row(excel_r, 18)
+        for pair in range(pair_n):
+            idx = r * pair_n + pair
+            col = pair_start + pair * 2
+            if idx < len(thana_counts):
+                name, count = thana_counts[idx]
+                ws.write_string(excel_r, col, name, sum_name)
+                ws.write_number(excel_r, col + 1, count, sum_count)
+            else:
+                ws.write_blank(excel_r, col, None, sum_name)
+                ws.write_blank(excel_r, col + 1, None, sum_count)
+
     headers = [
         "No.",
         "eNodeB Name",
@@ -2446,7 +2551,7 @@ def _write_action_plan(book, styles, source_name, period_txt, n_sites, records):
         "Days on cap (≥3h)",
         "Action",
     ]
-    header_row = 3
+    header_row = head_row + 1 + n_sum_rows + 2
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
         ws.write(header_row, col, text, styles["header"])
