@@ -1496,12 +1496,12 @@ def _write_geoplot(
     maps = render_map_images(classified, zoom_specs, output.parent, output.stem + "_GeoPlot")
     render_html(classified, zoom_specs, html_path, GEO_TITLE)
 
-    ws.set_column(0, 16, 14)
+    ws.set_column(0, 18, 12)
     ws.set_row(0, 28)
-    ws.merge_range("A1:N1", GEO_TITLE, styles["title"])
+    ws.merge_range("A1:R1", GEO_TITLE, styles["title"])
     ws.set_row(1, 18)
     ws.merge_range(
-        "A2:N2",
+        "A2:R2",
         f"Google satellite    ·    Physical sites: {len(classified)}"
         f"    ·    4G: {n4}    ·    5G: {n5}"
         f"    ·    Issue 4G: {n_issue_4g}    ·    Issue 4G+5G: {n_issue_4g5g}"
@@ -1510,18 +1510,31 @@ def _write_geoplot(
     )
     ws.set_row(2, 20)
     ws.merge_range(
-        "A3:N3",
-        "National map is the overview, then Gulshan, Banani, Dhanmondi, and Tejgaon "
-        "thana maps (high 5G footprint). Issue clusters after that are built dynamically "
-        f"until every issue site is covered ({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
+        "A3:R3",
+        "National map (left) is the 4G / 5G / issue-tech overview. The map beside it "
+        "colours the same issue sites by severity (Severe / High / Moderate / Low). "
+        "Then Gulshan, Banani, Dhanmondi, and Tejgaon thana maps (high 5G footprint). "
+        "Issue clusters after that are built dynamically until every issue site is "
+        f"covered ({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
         "Urban clusters come first (Dhaka Metro, Gazipur, surrounding), then maps with "
         "more issue sites. Coverage: Cyan = 4G, Yellow = 5G. Issue sites: Red = 4G, "
         "Orange = 4G+5G. Open the HTML file for interactive maps.",
         styles["note"],
     )
     row = 5
-    for title, path in maps:
-        ws.merge_range(row, 0, row, 13, title, styles["section"])
+    paired = {slot: (title, path) for title, path, slot in maps if slot in ("national", "severity")}
+    stacked = [(title, path) for title, path, slot in maps if slot == "stack"]
+    if "national" in paired and "severity" in paired:
+        nat_title, nat_path = paired["national"]
+        sev_title, sev_path = paired["severity"]
+        ws.merge_range(row, 0, row, 8, nat_title, styles["section"])
+        ws.merge_range(row, 9, row, 17, sev_title, styles["section"])
+        pair_opts = {"x_scale": 0.42, "y_scale": 0.42, "object_position": 2}
+        ws.insert_image(row + 1, 0, str(nat_path), pair_opts)
+        ws.insert_image(row + 1, 9, str(sev_path), pair_opts)
+        row += 34
+    for title, path in stacked:
+        ws.merge_range(row, 0, row, 17, title, styles["section"])
         ws.insert_image(row + 1, 0, str(path), {"x_scale": 0.50, "y_scale": 0.50, "object_position": 2})
         row += 34
     ws.set_zoom(100)
@@ -1542,7 +1555,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v41.xlsx",
+        default="FEGE_Choked_Flat_Sites_v42.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

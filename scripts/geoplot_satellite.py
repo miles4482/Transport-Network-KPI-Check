@@ -21,6 +21,13 @@ COLOR_ISSUE_4G5G = "#FF6D00"
 KIND_ISSUE_4G = "Issue 4G"
 KIND_ISSUE_4G5G = "Issue 4G+5G"
 ISSUE_KINDS = (KIND_ISSUE_4G, KIND_ISSUE_4G5G)
+SEV_ORDER = ("Severe", "High", "Moderate", "Low")
+COLOR_SEV = {
+    "Severe": "#C62828",
+    "High": "#EF6C00",
+    "Moderate": "#F9A825",
+    "Low": "#43A047",
+}
 TILE_SIZE = 256
 TILE_CACHE = Path("/tmp/google_sat_tiles")
 UA = "Mozilla/5.0 (compatible; TXPortChokeGeoPlot/1.0)"
@@ -242,6 +249,81 @@ def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Ima
     return Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
 
 
+def _legend_strip_severity(width: int, counts: dict[str, int] | None = None) -> Image.Image:
+    """Severity-only legend for the national companion map."""
+    strip = Image.new("RGB", (width, 56), "#101418")
+    draw = ImageDraw.Draw(strip)
+    font = _font(15)
+    group_font = _font(13)
+    draw.text((14, 18), "Severity", fill="#90A4AE", font=group_font)
+    overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
+    x = 110
+    for name in SEV_ORDER:
+        count = (counts or {}).get(name)
+        label = f"{name} ({count:,})" if count is not None else name
+        stamp = _circle_stamp(7, COLOR_SEV[name], "#FFFFFF", 1)
+        _paste_circle(overlay, x, 28, stamp)
+        draw.text((x + 16, 18), label, fill="#F5F5F5", font=font)
+        x += 200
+    return Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
+
+
+def _draw_severity_points(
+    img: Image.Image,
+    rows: list[dict],
+    zoom: int,
+    x_origin: float,
+    y_origin: float,
+) -> None:
+    """National companion: faint coverage, issue sites coloured by severity."""
+    coverage = [r for r in rows if r.get("kind") in ("4G", "5G")]
+    issues = [r for r in rows if _is_issue_kind(r.get("kind"))]
+    cov_stamp = {
+        "4G": _circle_stamp(2, COLOR_4G, "#0B0E12", 1),
+        "5G": _circle_stamp(2, COLOR_5G, "#0B0E12", 1),
+    }
+    sev_stamps = {name: _circle_stamp(3, COLOR_SEV[name], "#0B0E12", 1) for name in SEV_ORDER}
+    if img.mode != "RGBA":
+        base = img.convert("RGBA")
+    else:
+        base = img
+    for row in coverage:
+        x, y = _to_px(row["lat"], row["lon"], zoom, x_origin, y_origin)
+        if 0 <= x < base.width and 0 <= y < base.height:
+            _paste_circle(base, x, y, cov_stamp.get(row["kind"], cov_stamp["4G"]))
+    by_sev = {name: [] for name in SEV_ORDER}
+    other = []
+    for row in issues:
+        sev = str(row.get("severity") or "")
+        if sev in by_sev:
+            by_sev[sev].append(row)
+        else:
+            other.append(row)
+    # Low first, Severe last so the worst sites sit on top.
+    for name in reversed(SEV_ORDER):
+        stamp = sev_stamps[name]
+        for row in by_sev[name]:
+            x, y = _to_px(row["lat"], row["lon"], zoom, x_origin, y_origin)
+            if 0 <= x < base.width and 0 <= y < base.height:
+                _paste_circle(base, x, y, stamp)
+    for row in other:
+        x, y = _to_px(row["lat"], row["lon"], zoom, x_origin, y_origin)
+        if 0 <= x < base.width and 0 <= y < base.height:
+            _paste_circle(base, x, y, sev_stamps["Low"])
+    img.paste(base.convert("RGB"))
+
+
+def severity_counts(rows: list[dict]) -> dict[str, int]:
+    counts = {name: 0 for name in SEV_ORDER}
+    for row in rows:
+        if not _is_issue_kind(row.get("kind")):
+            continue
+        sev = str(row.get("severity") or "")
+        if sev in counts:
+            counts[sev] += 1
+    return counts
+
+
 def classify_rows(
     geo_rows: list[dict],
     issue_set: set[str],
@@ -255,12 +337,19 @@ def classify_rows(
     return classified
 
 
-def _frame_map(panel: Image.Image, title: str, counts: dict[str, int] | None = None) -> Image.Image:
-    legend = _legend_strip(max(panel.width, 780), counts)
-    canvas = Image.new("RGB", (max(panel.width, legend.width), panel.height + legend.height + 36), "#0B0E12")
-    canvas.paste(legend, (0, 0))
-    ImageDraw.Draw(canvas).text((12, legend.height + 6), title, fill="#F5F5F5", font=_font(18))
-    canvas.paste(panel, (0, legend.height + 32))
+def _frame_map(
+    panel: Image.Image,
+    title: str,
+    counts: dict[str, int] | None = None,
+    *,
+    legend: str = "tech",
+) -> Image.Image:
+    width = max(panel.width, 780)
+    strip = _legend_strip_severity(width, counts) if legend == "severity" else _legend_strip(width, counts)
+    canvas = Image.new("RGB", (max(panel.width, strip.width), panel.height + strip.height + 36), "#0B0E12")
+    canvas.paste(strip, (0, 0))
+    ImageDraw.Draw(canvas).text((12, strip.height + 6), title, fill="#F5F5F5", font=_font(18))
+    canvas.paste(panel, (0, strip.height + 32))
     return canvas
 
 
@@ -496,7 +585,7 @@ def cluster_bounds(rows: list[dict]) -> tuple[float, float, float, float]:
 def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, stem: str) -> list[tuple[str, Path]]:
     """Write one JPEG per map: national, then each zoom area."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    outputs: list[tuple[str, Path]] = []
+    outputs: list[tuple[str, Path, str]] = []
     counts = tech_counts(rows)
 
     lats = [r["lat"] for r in rows]
@@ -510,10 +599,22 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
         max(lons) + lon_pad,
         1200,
     )
+    blank = national.copy()
     _draw_points(national, rows, zoom, x0, y0, labels=False, emphasize_5g=True)
     national_path = dest_dir / f"{stem}_National.jpg"
     _frame_map(national, "National map", counts).save(national_path, format="JPEG", quality=92)
-    outputs.append(("National map", national_path))
+    outputs.append(("National map", national_path, "national"))
+
+    severity_panel = blank.copy()
+    _draw_severity_points(severity_panel, rows, zoom, x0, y0)
+    severity_path = dest_dir / f"{stem}_Severity.jpg"
+    _frame_map(
+        severity_panel,
+        "Issue severity map",
+        severity_counts(rows),
+        legend="severity",
+    ).save(severity_path, format="JPEG", quality=92)
+    outputs.append(("Issue severity map", severity_path, "severity"))
 
     for spec in zoom_specs:
         panel, z, zx, zy = _stitch(spec["lat_min"], spec["lat_max"], spec["lon_min"], spec["lon_max"], 1100)
@@ -532,7 +633,7 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
             }
             title = f"{spec['label']} — {spec['issue_count']} issue sites"
         _frame_map(panel, title, local).save(path, format="JPEG", quality=88)
-        outputs.append((title, path))
+        outputs.append((title, path, "stack"))
     return outputs
 
 
@@ -545,6 +646,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
                 "lon": r["lon"],
                 "tech": r["tech"],
                 "kind": r["kind"],
+                "severity": r.get("severity") or "",
             }
             for r in rows
         ],
@@ -565,6 +667,8 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
             KIND_ISSUE_4G5G: COLOR_ISSUE_4G5G,
         },
         "counts": tech_counts(rows),
+        "severityCounts": severity_counts(rows),
+        "severityColors": COLOR_SEV,
         "title": title,
     }
     html = f"""<!DOCTYPE html>
@@ -596,12 +700,12 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · National, then Gulshan / Banani / Dhanmondi / Tejgaon thana maps (high 5G footprint), then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G</p>
+  <p class="sub">Google satellite · National + severity maps, then Gulshan / Banani / Dhanmondi / Tejgaon thana maps, then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: red Severe / orange High / gold Moderate / green Low</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>
     const DATA = {json.dumps(payload, separators=(",", ":"))};
-    function addPoints(map, points, withLabels, national) {{
+    function addPoints(map, points, withLabels, national, severity) {{
       const layer = L.layerGroup();
       const ordered = [
         ...points.filter(p => p.kind === "4G"),
@@ -610,10 +714,12 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         ...points.filter(p => p.kind === "Issue 4G+5G"),
       ];
       for (const p of ordered) {{
-        const color = DATA.colors[p.kind] || "#ffffff";
         const isIssue = p.kind === "Issue 4G" || p.kind === "Issue 4G+5G";
+        const color = severity && isIssue
+          ? (DATA.severityColors[p.severity] || "#43A047")
+          : (DATA.colors[p.kind] || "#ffffff");
         const radius = national
-          ? 3
+          ? (severity && isIssue ? 4 : 3)
           : (isIssue ? 7 : (p.kind === "5G" ? 6 : 5));
         const marker = L.circleMarker([p.lat, p.lon], {{
           radius, color: "#111", weight: 1,
@@ -634,23 +740,33 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         "Issue 4G+5G": points.filter(p => p.kind === "Issue 4G+5G").length,
       }};
     }}
-    function makeMap(id, points, bounds, withLabels, national) {{
+    function makeMap(id, points, bounds, withLabels, national, severity) {{
       const map = L.map(id, {{ preferCanvas: true }});
       L.tileLayer("https://mt1.google.com/vt/lyrs=s&x={{x}}&y={{y}}&z={{z}}", {{
         maxZoom: 20, attribution: "Google Satellite"
       }}).addTo(map);
-      addPoints(map, points, withLabels, national);
+      addPoints(map, points, withLabels, national, severity);
       map.fitBounds(bounds, {{padding: [20, 20]}});
       const legend = L.control({{position: "topright"}});
       legend.onAdd = function () {{
         const div = L.DomUtil.create("div", "legend");
-        const c = kindCounts(points);
-        div.innerHTML = "<div style='color:#90A4AE;margin-bottom:4px'>Coverage</div>"
-          + "<div><span class='swatch swatch-4g' style='background:{COLOR_4G}'></span>4G sites (" + c["4G"].toLocaleString() + ")</div>"
-          + "<div><span class='swatch swatch-5g' style='background:{COLOR_5G}'></span>5G sites (" + c["5G"].toLocaleString() + ")</div>"
-          + "<div style='color:#90A4AE;margin:8px 0 4px'>Issue sites</div>"
-          + "<div><span class='swatch swatch-issue-4g' style='background:{COLOR_ISSUE_4G}'></span>Issue 4G (" + (c["Issue 4G"] || 0).toLocaleString() + ")</div>"
-          + "<div><span class='swatch swatch-issue-4g5g' style='background:{COLOR_ISSUE_4G5G}'></span>Issue 4G+5G (" + (c["Issue 4G+5G"] || 0).toLocaleString() + ")</div>";
+        if (severity) {{
+          const c = DATA.severityCounts;
+          const col = DATA.severityColors;
+          div.innerHTML = "<div style='color:#90A4AE;margin-bottom:4px'>Severity</div>"
+            + "<div><span class='swatch' style='background:" + col.Severe + ";width:13px;height:13px'></span>Severe (" + (c.Severe || 0).toLocaleString() + ")</div>"
+            + "<div><span class='swatch' style='background:" + col.High + ";width:13px;height:13px'></span>High (" + (c.High || 0).toLocaleString() + ")</div>"
+            + "<div><span class='swatch' style='background:" + col.Moderate + ";width:13px;height:13px'></span>Moderate (" + (c.Moderate || 0).toLocaleString() + ")</div>"
+            + "<div><span class='swatch' style='background:" + col.Low + ";width:13px;height:13px'></span>Low (" + (c.Low || 0).toLocaleString() + ")</div>";
+        }} else {{
+          const c = kindCounts(points);
+          div.innerHTML = "<div style='color:#90A4AE;margin-bottom:4px'>Coverage</div>"
+            + "<div><span class='swatch swatch-4g' style='background:{COLOR_4G}'></span>4G sites (" + c["4G"].toLocaleString() + ")</div>"
+            + "<div><span class='swatch swatch-5g' style='background:{COLOR_5G}'></span>5G sites (" + c["5G"].toLocaleString() + ")</div>"
+            + "<div style='color:#90A4AE;margin:8px 0 4px'>Issue sites</div>"
+            + "<div><span class='swatch swatch-issue-4g' style='background:{COLOR_ISSUE_4G}'></span>Issue 4G (" + (c["Issue 4G"] || 0).toLocaleString() + ")</div>"
+            + "<div><span class='swatch swatch-issue-4g5g' style='background:{COLOR_ISSUE_4G5G}'></span>Issue 4G+5G (" + (c["Issue 4G+5G"] || 0).toLocaleString() + ")</div>";
+        }}
         return div;
       }};
       legend.addTo(map);
@@ -664,7 +780,17 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         points: DATA.points,
         bounds: DATA.points.map(p => [p.lat, p.lon]),
         labels: false,
-        national: true
+        national: true,
+        severity: false
+      }},
+      {{
+        id: "severity",
+        title: "Issue severity map",
+        points: DATA.points,
+        bounds: DATA.points.map(p => [p.lat, p.lon]),
+        labels: false,
+        national: true,
+        severity: true
       }},
       ...DATA.zooms.map((z, i) => {{
         const [s, w, n, e] = z.bounds;
@@ -679,7 +805,8 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
           }}),
           bounds: [[s, w], [n, e]],
           labels: true,
-          national: false
+          national: false,
+          severity: false
         }};
       }})
     ];
@@ -690,7 +817,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       wrap.id = block.id + "-block";
       wrap.innerHTML = "<h2>" + block.title + "</h2><div class='map' id='" + block.id + "'></div>";
       maps.appendChild(wrap);
-      makeMap(block.id, block.points, block.bounds, block.labels, block.national);
+      makeMap(block.id, block.points, block.bounds, block.labels, block.national, block.severity);
     }});
   </script>
 </body>

@@ -87,6 +87,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v39 keeps the national map and urban-first issue clusters, and adds four thana maps after the national overview for the high-5G belt: Gulshan, Banani, Dhanmondi, Tejgaon. File: `FEGE_Choked_Flat_Sites_v39.xlsx`.
 - v40 changes HourlyChartOfIssueSites only: keep the RxMaxSpeed series, replace the stuck line with a 72-hour peak line and a line 5% below that peak. File: `FEGE_Choked_Flat_Sites_v40.xlsx`.
 - v41 keeps the 72-hour peak line and replaces the 5%-below line with the average of the three daily peaks. File: `FEGE_Choked_Flat_Sites_v41.xlsx`.
+- v42 adds a national issue-severity map beside the national GeoPlot (Severe / High / Moderate / Low). Cluster maps are unchanged. File: `FEGE_Choked_Flat_Sites_v42.xlsx`.
 
 ## Jupyter (for local Windows use)
 
