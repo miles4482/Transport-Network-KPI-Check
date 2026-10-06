@@ -760,18 +760,28 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
         data.write(0, c0 + 1, "Time")
         data.write(0, c0 + 2, "Rx")
         data.write(0, c0 + 3, "Peak")
-        data.write(0, c0 + 4, "Peak95")
+        data.write(0, c0 + 4, "AvgPeak")
         rx_by_key = {
             (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
             for _, row in s.iterrows()
         }
         chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
         peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
-        # 5% below the 72-hour peak (all hourly RxMaxSpeed values in the chart).
-        peak_95 = peak_72 * 0.95 if np.isfinite(peak_72) else float("nan")
+        # Typical high: mean of each day's peak (not 5% below the single max).
+        daily_peaks = []
+        for day in pd.date_range(chart_start, chart_end, freq="D"):
+            day_vals = [
+                rx_by_key[(day.normalize(), hour)]
+                for hour in range(24)
+                if (day.normalize(), hour) in rx_by_key
+                and np.isfinite(rx_by_key[(day.normalize(), hour)])
+            ]
+            if day_vals:
+                daily_peaks.append(max(day_vals))
+        avg_peak = float(sum(daily_peaks) / len(daily_peaks)) if daily_peaks else float("nan")
         dates: list[str] = []
         times: list[str] = []
-        plotted: list[float] = [v for v in (peak_72, peak_95) if np.isfinite(v)]
+        plotted: list[float] = [v for v in (peak_72, avg_peak) if np.isfinite(v)]
         r = 0
         for day in pd.date_range(chart_start, chart_end, freq="D"):
             date_label = f"{int(day.day)}/{MONTHS[int(day.month) - 1]}"
@@ -797,7 +807,8 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                     plotted.append(value)
                 if np.isfinite(peak_72):
                     data.write_number(r, c0 + 3, peak_72)
-                    data.write_number(r, c0 + 4, peak_95)
+                if np.isfinite(avg_peak):
+                    data.write_number(r, c0 + 4, avg_peak)
         n = r
 
         ws.set_row(top, 26)
@@ -864,9 +875,10 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
                     "marker": {"type": "none"},
                 }
             )
+        if np.isfinite(avg_peak):
             chart.add_series(
                 {
-                    "name": f"5% below peak ({peak_95:.2f} Mbit/s)",
+                    "name": f"Avg peak ({avg_peak:.2f} Mbit/s)",
                     "categories": ["_ChartData", 1, c0, n, c0 + 1],
                     "categories_data": [dates, times],
                     "values": ["_ChartData", 1, c0 + 4, n, c0 + 4],
@@ -1530,7 +1542,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v40.xlsx",
+        default="FEGE_Choked_Flat_Sites_v41.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
