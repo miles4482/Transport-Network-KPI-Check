@@ -1322,7 +1322,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "GeoPlot top thanas",
             f"Thana maps use only names listed in {TOP_THANA_FILE}, matched to the "
             f"Thana column in {GEO_FILE}. Cluster maps after that cover remaining "
-            "issue sites.",
+            "issue sites. Each thana and cluster map has an issue-severity map "
+            "beside it.",
         ),
         (
             "Double check",
@@ -1622,7 +1623,8 @@ def _write_geoplot(
     ws.set_row(2, 20)
     ws.merge_range(
         "A3:R3",
-        "National map (left) and issue-severity map (right). "
+        "National, top-thana, and cluster maps each have an issue-severity map "
+        "on the right (Severe / High / Moderate / Low). "
         f"Top thanas from {TOP_THANA_FILE}, then issue clusters "
         f"({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
         "Coverage: Cyan = 4G, Yellow = 5G. Issue: Red = 4G, Orange = 4G+5G.",
@@ -1630,7 +1632,8 @@ def _write_geoplot(
     )
     row = 5
     paired = {slot: (title, path) for title, path, slot in maps if slot in ("national", "severity")}
-    stacked = [(title, path) for title, path, slot in maps if slot == "stack"]
+    zoom_maps = [(title, path) for title, path, slot in maps if slot == "zoom"]
+    zoom_sevs = [(title, path) for title, path, slot in maps if slot == "zoom_sev"]
 
     def _rows_for_image(path: Path, scale: float) -> int:
         from PIL import Image as PILImage
@@ -1641,45 +1644,46 @@ def _write_geoplot(
         # lands on top of the previous map.
         return max(28, int(height * scale / 15) + 5)
 
-    if "national" in paired and "severity" in paired:
+    def _insert_pair(left_title: str, left_path: Path, right_title: str, right_path: Path) -> int:
         from PIL import Image as PILImage
 
-        nat_title, nat_path = paired["national"]
-        sev_title, sev_path = paired["severity"]
         pair_scale = 0.42
-        # Small separator only — do not park the second map at column J.
         pair_gap_px = 24
         col_px = 89  # set_column width 12
-        with PILImage.open(nat_path) as nat_im, PILImage.open(sev_path) as sev_im:
-            nat_w, _nat_h = nat_im.size
-            sev_w, _sev_h = sev_im.size
-        nat_disp_w = nat_w * pair_scale
-        sev_disp_w = sev_w * pair_scale
-        nat_cols = max(3, int(round(nat_disp_w / col_px)))
-        sev_cols = max(3, int(round(sev_disp_w / col_px)))
-        sev_title_col = nat_cols
-        ws.merge_range(row, 0, row, nat_cols - 1, nat_title, styles["section"])
+        with PILImage.open(left_path) as left_im, PILImage.open(right_path) as right_im:
+            left_w, _lh = left_im.size
+            right_w, _rh = right_im.size
+        left_disp_w = left_w * pair_scale
+        left_cols = max(3, int(round(left_disp_w / col_px)))
+        right_cols = max(3, int(round(right_w * pair_scale / col_px)))
+        ws.merge_range(row, 0, row, left_cols - 1, left_title, styles["section"])
         ws.merge_range(
             row,
-            sev_title_col,
+            left_cols,
             row,
-            sev_title_col + sev_cols - 1,
-            sev_title,
+            left_cols + right_cols - 1,
+            right_title,
             styles["section"],
         )
         pair_opts = {"x_scale": pair_scale, "y_scale": pair_scale, "object_position": 1}
-        ws.insert_image(row + 1, 0, str(nat_path), pair_opts)
+        ws.insert_image(row + 1, 0, str(left_path), pair_opts)
         ws.insert_image(
             row + 1,
             0,
-            str(sev_path),
-            {**pair_opts, "x_offset": int(nat_disp_w + pair_gap_px)},
+            str(right_path),
+            {**pair_opts, "x_offset": int(left_disp_w + pair_gap_px)},
         )
-        row += max(_rows_for_image(nat_path, pair_scale), _rows_for_image(sev_path, pair_scale))
-    for title, path in stacked:
-        ws.merge_range(row, 0, row, 17, title, styles["section"])
-        ws.insert_image(row + 1, 0, str(path), {"x_scale": 0.50, "y_scale": 0.50, "object_position": 1})
-        row += _rows_for_image(path, 0.50)
+        return max(
+            _rows_for_image(left_path, pair_scale),
+            _rows_for_image(right_path, pair_scale),
+        )
+
+    if "national" in paired and "severity" in paired:
+        nat_title, nat_path = paired["national"]
+        sev_title, sev_path = paired["severity"]
+        row += _insert_pair(nat_title, nat_path, sev_title, sev_path)
+    for (title, path), (sev_title, sev_path) in zip(zoom_maps, zoom_sevs):
+        row += _insert_pair(title, path, sev_title, sev_path)
     ws.set_zoom(100)
 
 
@@ -1698,7 +1702,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v50.xlsx",
+        default="FEGE_Choked_Flat_Sites_v51.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

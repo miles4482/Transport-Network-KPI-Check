@@ -119,6 +119,14 @@ def _scale_to_min_width(img: Image.Image, min_width: int) -> Image.Image:
     return img.resize((min_width, height), Image.Resampling.LANCZOS)
 
 
+def _scale_to_max_width(img: Image.Image, max_width: int) -> Image.Image:
+    """Cap framed zoom maps so paired JPEGs stay compact in the workbook."""
+    if img.width <= max_width:
+        return img
+    height = max(1, int(round(img.height * (max_width / img.width))))
+    return img.resize((max_width, height), Image.Resampling.LANCZOS)
+
+
 def _to_px(lat: float, lon: float, zoom: int, x_origin: float, y_origin: float) -> tuple[int, int]:
     x, y = _deg2num(lat, lon, zoom)
     return int((x - x_origin) * TILE_SIZE), int((y - y_origin) * TILE_SIZE)
@@ -292,15 +300,23 @@ def _draw_severity_points(
     zoom: int,
     x_origin: float,
     y_origin: float,
+    *,
+    labels: bool = False,
+    compact: bool = True,
 ) -> None:
-    """National companion: faint coverage, issue sites coloured by severity."""
+    """Companion map: faint coverage, issue sites coloured by severity."""
     coverage = [r for r in rows if r.get("kind") in ("4G", "5G")]
     issues = [r for r in rows if _is_issue_kind(r.get("kind"))]
+    if compact:
+        cov_r, sev_r, outline = 3, 5, "#0B0E12"
+    else:
+        cov_r, sev_r, outline = 4, 7, "#111111"
     cov_stamp = {
-        "4G": _circle_stamp(3, COLOR_4G, "#0B0E12", 1),
-        "5G": _circle_stamp(3, COLOR_5G, "#0B0E12", 1),
+        "4G": _circle_stamp(cov_r, COLOR_4G, outline, 1),
+        "5G": _circle_stamp(cov_r, COLOR_5G, outline, 1),
     }
-    sev_stamps = {name: _circle_stamp(5, COLOR_SEV[name], "#0B0E12", 1) for name in SEV_ORDER}
+    sev_stamps = {name: _circle_stamp(sev_r, COLOR_SEV[name], outline, 1) for name in SEV_ORDER}
+    font = _font(9)
     if img.mode != "RGBA":
         base = img.convert("RGBA")
     else:
@@ -324,10 +340,18 @@ def _draw_severity_points(
             x, y = _to_px(row["lat"], row["lon"], zoom, x_origin, y_origin)
             if 0 <= x < base.width and 0 <= y < base.height:
                 _paste_circle(base, x, y, stamp)
+                if labels:
+                    ImageDraw.Draw(base).text(
+                        (x + sev_r + 2, y - 5), row["site"], fill="#FFFFFF", font=font
+                    )
     for row in other:
         x, y = _to_px(row["lat"], row["lon"], zoom, x_origin, y_origin)
         if 0 <= x < base.width and 0 <= y < base.height:
             _paste_circle(base, x, y, sev_stamps["Low"])
+            if labels:
+                ImageDraw.Draw(base).text(
+                    (x + sev_r + 2, y - 5), row["site"], fill="#FFFFFF", font=font
+                )
     img.paste(base.convert("RGB"))
 
 
@@ -648,7 +672,8 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
     outputs.append(("Issue severity map", severity_path, "severity"))
 
     for spec in zoom_specs:
-        panel, z, zx, zy = _stitch(spec["lat_min"], spec["lat_max"], spec["lon_min"], spec["lon_max"], 1100)
+        panel, z, zx, zy = _stitch(spec["lat_min"], spec["lat_max"], spec["lon_min"], spec["lon_max"], 900)
+        blank = panel.copy()
         _draw_points(panel, spec["rows"], z, zx, zy, labels=True, emphasize_5g=False)
         slug = spec.get("slug") or spec["label"].replace(" ", "_").replace("/", "-")
         path = dest_dir / f"{stem}_{slug}.jpg"
@@ -663,8 +688,20 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
                 KIND_ISSUE_4G5G: spec.get("issue_4g5g_count", 0),
             }
             title = f"{spec['label']} — {spec['issue_count']} issue sites"
-        _frame_map(panel, title, local).save(path, format="JPEG", quality=88)
-        outputs.append((title, path, "stack"))
+        framed = _scale_to_max_width(_frame_map(panel, title, local), 900)
+        framed.save(path, format="JPEG", quality=80)
+        outputs.append((title, path, "zoom"))
+
+        sev_panel = blank.copy()
+        _draw_severity_points(sev_panel, spec["rows"], z, zx, zy, labels=True, compact=False)
+        sev_title = "Issue severity map"
+        sev_path = dest_dir / f"{stem}_{slug}_Severity.jpg"
+        sev_framed = _scale_to_max_width(
+            _frame_map(sev_panel, sev_title, severity_counts(spec["rows"]), legend="severity"),
+            900,
+        )
+        sev_framed.save(sev_path, format="JPEG", quality=80)
+        outputs.append((sev_title, sev_path, "zoom_sev"))
     return outputs
 
 
@@ -717,7 +754,11 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
     nav a {{ color: {COLOR_5G}; margin-right: 14px; text-decoration: none; font-size: 13px; }}
     .map-block {{ margin: 0 12px 28px; }}
     .map-block h2 {{ margin: 0 0 8px; font-size: 16px; }}
+    .map-block h3 {{ margin: 0 0 6px; font-size: 14px; font-weight: 600; }}
     .map {{ height: 58vh; border: 1px solid #263238; }}
+    .pair {{ display: flex; gap: 12px; align-items: stretch; }}
+    .pair .pane {{ flex: 1; min-width: 0; }}
+    .pair .map {{ height: 52vh; }}
     .legend {{
       background: rgba(16,20,24,.86); padding: 8px 12px; border-radius: 6px; font-size: 13px;
     }}
@@ -731,7 +772,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · National + severity maps, then top thanas from Top Thana.xlsx, then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: bright red Severe / deep red High / muted amber Moderate / calm green Low</p>
+      <p class="sub">Google satellite · National + severity maps, then top thanas and issue clusters each with a severity map beside them · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: bright red Severe / deep red High / muted amber Moderate / calm green Low</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>
@@ -771,7 +812,16 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
         "Issue 4G+5G": points.filter(p => p.kind === "Issue 4G+5G").length,
       }};
     }}
-    function makeMap(id, points, bounds, withLabels, national, severity) {{
+    function sevCounts(points) {{
+      const c = {{Severe: 0, High: 0, Moderate: 0, Low: 0}};
+      for (const p of points) {{
+        if ((p.kind === "Issue 4G" || p.kind === "Issue 4G+5G") && Object.prototype.hasOwnProperty.call(c, p.severity)) {{
+          c[p.severity]++;
+        }}
+      }}
+      return c;
+    }}
+    function makeMap(id, points, bounds, withLabels, national, severity, localSev) {{
       const map = L.map(id, {{ preferCanvas: true }});
       L.tileLayer("https://mt1.google.com/vt/lyrs=s&x={{x}}&y={{y}}&z={{z}}", {{
         maxZoom: 20, attribution: "Google Satellite"
@@ -782,7 +832,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       legend.onAdd = function () {{
         const div = L.DomUtil.create("div", "legend");
         if (severity) {{
-          const c = DATA.severityCounts;
+          const c = localSev || DATA.severityCounts;
           const col = DATA.severityColors;
           div.innerHTML = "<div style='color:#90A4AE;margin-bottom:4px'>Severity</div>"
             + "<div><span class='swatch' style='background:" + col.Severe + ";width:13px;height:13px'></span>Severe (" + (c.Severe || 0).toLocaleString() + ")</div>"
@@ -804,44 +854,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
     }}
     const maps = document.getElementById("maps");
     const nav = document.getElementById("nav");
-    const blocks = [
-      {{
-        id: "national",
-        title: "National map",
-        points: DATA.points,
-        bounds: DATA.points.map(p => [p.lat, p.lon]),
-        labels: false,
-        national: true,
-        severity: false
-      }},
-      {{
-        id: "severity",
-        title: "Issue severity map",
-        points: DATA.points,
-        bounds: DATA.points.map(p => [p.lat, p.lon]),
-        labels: false,
-        national: true,
-        severity: true
-      }},
-      ...DATA.zooms.map((z, i) => {{
-        const [s, w, n, e] = z.bounds;
-        return {{
-          id: "zoom" + i,
-          title: z.title || (z.label + " — " + z.issueCount + " issue sites"),
-          points: DATA.points.filter(p => p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e).map(p => {{
-            if ((p.kind === "Issue 4G" || p.kind === "Issue 4G+5G") && z.issueSites.length && !z.issueSites.includes(p.site)) {{
-              return Object.assign({{}}, p, {{kind: p.tech === "5G" ? "5G" : "4G"}});
-            }}
-            return p;
-          }}),
-          bounds: [[s, w], [n, e]],
-          labels: true,
-          national: false,
-          severity: false
-        }};
-      }})
-    ];
-    blocks.forEach(block => {{
+    function addSingle(block) {{
       nav.innerHTML += "<a href='#" + block.id + "-block'>" + block.title + "</a>";
       const wrap = document.createElement("section");
       wrap.className = "map-block";
@@ -849,6 +862,45 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
       wrap.innerHTML = "<h2>" + block.title + "</h2><div class='map' id='" + block.id + "'></div>";
       maps.appendChild(wrap);
       makeMap(block.id, block.points, block.bounds, block.labels, block.national, block.severity);
+    }}
+    addSingle({{
+      id: "national",
+      title: "National map",
+      points: DATA.points,
+      bounds: DATA.points.map(p => [p.lat, p.lon]),
+      labels: false,
+      national: true,
+      severity: false
+    }});
+    addSingle({{
+      id: "severity",
+      title: "Issue severity map",
+      points: DATA.points,
+      bounds: DATA.points.map(p => [p.lat, p.lon]),
+      labels: false,
+      national: true,
+      severity: true
+    }});
+    DATA.zooms.forEach((z, i) => {{
+      const [s, w, n, e] = z.bounds;
+      const title = z.title || (z.label + " — " + z.issueCount + " issue sites");
+      const points = DATA.points.filter(p => p.lat >= s && p.lat <= n && p.lon >= w && p.lon <= e).map(p => {{
+        if ((p.kind === "Issue 4G" || p.kind === "Issue 4G+5G") && z.issueSites.length && !z.issueSites.includes(p.site)) {{
+          return Object.assign({{}}, p, {{kind: p.tech === "5G" ? "5G" : "4G"}});
+        }}
+        return p;
+      }});
+      const bounds = [[s, w], [n, e]];
+      nav.innerHTML += "<a href='#zoom" + i + "-block'>" + title + "</a>";
+      const wrap = document.createElement("section");
+      wrap.className = "map-block";
+      wrap.id = "zoom" + i + "-block";
+      wrap.innerHTML = "<h2>" + title + "</h2><div class='pair'><div class='pane'><h3>" + title
+        + "</h3><div class='map' id='zoom" + i + "'></div></div><div class='pane'><h3>Issue severity map</h3>"
+        + "<div class='map' id='zoom" + i + "sev'></div></div></div>";
+      maps.appendChild(wrap);
+      makeMap("zoom" + i, points, bounds, true, false, false);
+      makeMap("zoom" + i + "sev", points, bounds, true, false, true, sevCounts(points));
     }});
   </script>
 </body>

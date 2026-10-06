@@ -96,6 +96,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v48 plots GeoPlot top thanas from `Top Thana.xlsx` matched to the physical `Thana` column, shortens GeoPlot titles to `Thana (4G: n 4G+5G: m)`, and drops Night Rx / Sample snap from Site List. File: `FEGE_Choked_Flat_Sites_v48.xlsx`.
 - v49 adds Site List **Double check** = Yes when Peak is ≥50% above Avg peak (DHGULAP type). Detection listing is unchanged. File: `FEGE_Choked_Flat_Sites_v49.xlsx`.
 - v50 lowers Double check to Yes when Peak is ≥30% above Avg peak. Detection listing is unchanged. File: `FEGE_Choked_Flat_Sites_v50.xlsx`.
+- v51 puts an issue-severity map beside every top-thana and cluster GeoPlot, matching the national pair. File: `FEGE_Choked_Flat_Sites_v51.xlsx`.
 
 ## Jupyter (for local Windows use)
 
