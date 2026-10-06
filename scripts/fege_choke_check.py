@@ -286,8 +286,8 @@ SEVERITY_NOTES = (
     ),
 )
 SNAP_DAYS = 3
-# Tx review flag: (Peak − Avg peak) / Peak ≥ 50% (DHGULAP-type traces).
-DOUBLE_CHECK_PEAK_GAP = 0.50
+# Tx review flag: (Peak − Avg peak) / Peak ≥ 30% (DHGULAP-type traces).
+DOUBLE_CHECK_PEAK_GAP = 0.30
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
@@ -789,7 +789,7 @@ def _site_chart_peaks(work: pd.DataFrame, rec: dict, chart_start, chart_end) -> 
 
 
 def _needs_double_check(peak_72: float, avg_peak: float) -> bool:
-    """True when Peak sits ~50% or more above Avg peak (radio demand, not a hard Tx wall)."""
+    """True when Peak sits ~30% or more above Avg peak (radio demand, not a hard Tx wall)."""
     if not (np.isfinite(peak_72) and np.isfinite(avg_peak) and peak_72 > 0):
         return False
     return (peak_72 - avg_peak) / peak_72 >= DOUBLE_CHECK_PEAK_GAP
@@ -1698,7 +1698,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v49.xlsx",
+        default="FEGE_Choked_Flat_Sites_v50.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
