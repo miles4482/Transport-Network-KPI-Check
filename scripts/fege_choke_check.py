@@ -1798,7 +1798,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v55.xlsx",
+        default="FEGE_Choked_Flat_Sites_v56.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2497,8 +2497,7 @@ def _write_action_plan(
 
     selected = _action_plan_records(records)
     chart_row = {rec["site"]: i * BLOCK_ROWS + 1 for i, rec in enumerate(records)}
-    last_col = 10
-    last_col_letter = "K"
+    last_col = 10  # site list stays A–K; Thana summary continues further right
 
     sum_title = book.add_format(
         {
@@ -2543,31 +2542,46 @@ def _write_action_plan(
         }
     )
 
+    thana_counts = _urgent_thana_counts(selected, geo)
+    # 12 Name/Count pairs from B through Y: ~75 thanas sit in 7 rows, not 25.
+    pair_n = 12
+    pair_start = 1  # column B; A stays the site-list No. column (width 5)
+    sum_last_col = pair_start + pair_n * 2 - 1
+    n_sum_rows = (len(thana_counts) + pair_n - 1) // pair_n if thana_counts else 1
+    for pair in range(pair_n):
+        name_col = pair_start + pair * 2
+        count_col = name_col + 1
+        if name_col > last_col:
+            ws.set_column(name_col, name_col, 18)
+        if count_col > last_col:
+            ws.set_column(count_col, count_col, 8)
+
     ws.set_row(0, 28)
     ws.merge_range(
-        f"A1:{last_col_letter}1",
+        0,
+        0,
+        0,
+        sum_last_col,
         "UrgentTxBWInc — urgent Tx BW increase",
         styles["title"],
     )
     ws.set_row(1, 18)
     ws.merge_range(
-        f"A2:{last_col_letter}2",
+        1,
+        0,
+        1,
+        sum_last_col,
         f"DHK transmission    ·    {period_txt}    ·    {len(selected)} of {len(records)} issue sites"
         f"    ·    not every issue site can take a BW upgrade",
         styles["subtitle"],
     )
-
-    thana_counts = _urgent_thana_counts(selected, geo)
-    pair_n = 3
-    pair_start = 1  # column B, matching the attached layout
-    n_sum_rows = (len(thana_counts) + pair_n - 1) // pair_n if thana_counts else 1
 
     ws.set_row(3, 20)
     ws.merge_range(
         3,
         0,
         3,
-        last_col,
+        sum_last_col,
         "Thana Level Summary of urgent Tx BW increase",
         sum_title,
     )
