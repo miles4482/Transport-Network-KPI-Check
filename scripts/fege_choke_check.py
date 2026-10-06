@@ -1535,14 +1535,40 @@ def _write_geoplot(
         return max(28, int(height * scale / 15) + 5)
 
     if "national" in paired and "severity" in paired:
+        from PIL import Image as PILImage
+
         nat_title, nat_path = paired["national"]
         sev_title, sev_path = paired["severity"]
-        ws.merge_range(row, 0, row, 8, nat_title, styles["section"])
-        ws.merge_range(row, 9, row, 17, sev_title, styles["section"])
-        pair_opts = {"x_scale": 0.42, "y_scale": 0.42, "object_position": 1}
+        pair_scale = 0.42
+        # Small separator only — do not park the second map at column J.
+        pair_gap_px = 24
+        col_px = 89  # set_column width 12
+        with PILImage.open(nat_path) as nat_im, PILImage.open(sev_path) as sev_im:
+            nat_w, _nat_h = nat_im.size
+            sev_w, _sev_h = sev_im.size
+        nat_disp_w = nat_w * pair_scale
+        sev_disp_w = sev_w * pair_scale
+        nat_cols = max(3, int(round(nat_disp_w / col_px)))
+        sev_cols = max(3, int(round(sev_disp_w / col_px)))
+        sev_title_col = nat_cols
+        ws.merge_range(row, 0, row, nat_cols - 1, nat_title, styles["section"])
+        ws.merge_range(
+            row,
+            sev_title_col,
+            row,
+            sev_title_col + sev_cols - 1,
+            sev_title,
+            styles["section"],
+        )
+        pair_opts = {"x_scale": pair_scale, "y_scale": pair_scale, "object_position": 1}
         ws.insert_image(row + 1, 0, str(nat_path), pair_opts)
-        ws.insert_image(row + 1, 9, str(sev_path), pair_opts)
-        row += max(_rows_for_image(nat_path, 0.42), _rows_for_image(sev_path, 0.42))
+        ws.insert_image(
+            row + 1,
+            0,
+            str(sev_path),
+            {**pair_opts, "x_offset": int(nat_disp_w + pair_gap_px)},
+        )
+        row += max(_rows_for_image(nat_path, pair_scale), _rows_for_image(sev_path, pair_scale))
     for title, path in stacked:
         ws.merge_range(row, 0, row, 17, title, styles["section"])
         ws.insert_image(row + 1, 0, str(path), {"x_scale": 0.50, "y_scale": 0.50, "object_position": 1})
@@ -1565,7 +1591,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v44.xlsx",
+        default="FEGE_Choked_Flat_Sites_v45.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()

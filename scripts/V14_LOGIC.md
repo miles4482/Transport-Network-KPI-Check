@@ -90,6 +90,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v42 adds a national issue-severity map beside the national GeoPlot (Severe / High / Moderate / Low). Cluster maps are unchanged. File: `FEGE_Choked_Flat_Sites_v42.xlsx`.
 - v43 fills the empty black gutter on the national pair: tighter crop, zoom-9 satellite, brighter/sharper tiles, and Excel scale that best-fits each half of the sheet. File: `FEGE_Choked_Flat_Sites_v43.xlsx`.
 - v44 returns the national pair to the compact side-by-side size, reserves enough rows so thana/cluster maps do not overlap, and enlarges every map legend. File: `FEGE_Choked_Flat_Sites_v44.xlsx`.
+- v45 pulls the national and severity maps together, leaving only a thin separator instead of a wide empty gutter. File: `FEGE_Choked_Flat_Sites_v45.xlsx`.
 
 ## Jupyter (for local Windows use)
 
