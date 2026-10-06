@@ -229,58 +229,58 @@ def _draw_points(
 
 def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Image:
     """Two legends: coverage (4G / 5G) and issue tech (4G / 4G+5G)."""
-    strip = Image.new("RGB", (width, 78), "#101418")
+    strip = Image.new("RGB", (width, 132), "#101418")
     draw = ImageDraw.Draw(strip)
-    font = _font(15)
-    group_font = _font(13)
+    font = _font(26)
+    group_font = _font(20)
     groups = [
         (
             "Coverage",
-            12,
+            18,
             [
-                ("4G sites", COLOR_4G, 8, "4G"),
-                ("5G sites", COLOR_5G, 6, "5G"),
+                ("4G sites", COLOR_4G, 12, "4G"),
+                ("5G sites", COLOR_5G, 11, "5G"),
             ],
         ),
         (
             "Issue sites",
-            46,
+            78,
             [
-                ("Issue 4G", COLOR_ISSUE_4G, 7, KIND_ISSUE_4G),
-                ("Issue 4G+5G", COLOR_ISSUE_4G5G, 7, KIND_ISSUE_4G5G),
+                ("Issue 4G", COLOR_ISSUE_4G, 12, KIND_ISSUE_4G),
+                ("Issue 4G+5G", COLOR_ISSUE_4G5G, 12, KIND_ISSUE_4G5G),
             ],
         ),
     ]
     overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
     for group_name, y, items in groups:
-        draw.text((14, y - 4), group_name, fill="#90A4AE", font=group_font)
-        x = 118
+        draw.text((16, y - 2), group_name, fill="#90A4AE", font=group_font)
+        x = 168
         for name, color, radius, key in items:
             count = (counts or {}).get(key)
             label = f"{name} ({count:,})" if count is not None else name
-            stamp = _circle_stamp(radius, color, "#FFFFFF", 1)
-            _paste_circle(overlay, x, y + 8, stamp)
-            draw.text((x + radius + 10, y), label, fill="#F5F5F5", font=font)
-            x += 250
+            stamp = _circle_stamp(radius, color, "#FFFFFF", 2)
+            _paste_circle(overlay, x, y + 12, stamp)
+            draw.text((x + radius + 12, y), label, fill="#F5F5F5", font=font)
+            x += 310
     return Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
 
 
 def _legend_strip_severity(width: int, counts: dict[str, int] | None = None) -> Image.Image:
     """Severity-only legend for the national companion map."""
-    strip = Image.new("RGB", (width, 56), "#101418")
+    strip = Image.new("RGB", (width, 96), "#101418")
     draw = ImageDraw.Draw(strip)
-    font = _font(15)
-    group_font = _font(13)
-    draw.text((14, 18), "Severity", fill="#90A4AE", font=group_font)
+    font = _font(26)
+    group_font = _font(20)
+    draw.text((16, 30), "Severity", fill="#90A4AE", font=group_font)
     overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
-    x = 110
+    x = 160
     for name in SEV_ORDER:
         count = (counts or {}).get(name)
         label = f"{name} ({count:,})" if count is not None else name
-        stamp = _circle_stamp(7, COLOR_SEV[name], "#FFFFFF", 1)
-        _paste_circle(overlay, x, 28, stamp)
-        draw.text((x + 16, 18), label, fill="#F5F5F5", font=font)
-        x += 200
+        stamp = _circle_stamp(12, COLOR_SEV[name], "#FFFFFF", 2)
+        _paste_circle(overlay, x, 48, stamp)
+        draw.text((x + 20, 30), label, fill="#F5F5F5", font=font)
+        x += 230
     return Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -360,12 +360,14 @@ def _frame_map(
     *,
     legend: str = "tech",
 ) -> Image.Image:
+    panel = _scale_to_min_width(panel, 900)
     width = panel.width
     strip = _legend_strip_severity(width, counts) if legend == "severity" else _legend_strip(width, counts)
-    canvas = Image.new("RGB", (width, panel.height + strip.height + 36), "#0B0E12")
+    title_h = 44
+    canvas = Image.new("RGB", (width, panel.height + strip.height + title_h), "#0B0E12")
     canvas.paste(strip, (0, 0))
-    ImageDraw.Draw(canvas).text((12, strip.height + 6), title, fill="#F5F5F5", font=_font(18))
-    canvas.paste(panel, (0, strip.height + 32))
+    ImageDraw.Draw(canvas).text((14, strip.height + 8), title, fill="#F5F5F5", font=_font(26))
+    canvas.paste(panel, (0, strip.height + title_h))
     return canvas
 
 
@@ -606,26 +608,24 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
 
     lats = [r["lat"] for r in rows]
     lons = [r["lon"] for r in rows]
-    lat_pad = max(0.02, (max(lats) - min(lats)) * 0.03)
-    lon_pad = max(0.02, (max(lons) - min(lons)) * 0.03)
+    lat_pad = max(0.03, (max(lats) - min(lats)) * 0.05)
+    lon_pad = max(0.03, (max(lons) - min(lons)) * 0.05)
     national, zoom, x0, y0 = _stitch(
         min(lats) - lat_pad,
         max(lats) + lat_pad,
         min(lons) - lon_pad,
         max(lons) + lon_pad,
-        2000,
+        1200,
     )
     national = _enhance_satellite(national)
     blank = national.copy()
     _draw_points(national, rows, zoom, x0, y0, labels=False, emphasize_5g=True)
-    national = _scale_to_min_width(national, 1680)
     national_path = dest_dir / f"{stem}_National.jpg"
-    _frame_map(national, "National map", counts).save(national_path, format="JPEG", quality=95)
+    _frame_map(national, "National map", counts).save(national_path, format="JPEG", quality=92)
     outputs.append(("National map", national_path, "national"))
 
     severity_panel = blank.copy()
     _draw_severity_points(severity_panel, rows, zoom, x0, y0)
-    severity_panel = _scale_to_min_width(severity_panel, 1680)
     severity_path = dest_dir / f"{stem}_Severity.jpg"
     _frame_map(
         severity_panel,
