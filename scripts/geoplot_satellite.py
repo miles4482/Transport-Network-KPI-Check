@@ -100,7 +100,7 @@ def _stitch(lat_min: float, lat_max: float, lon_min: float, lon_max: float, targ
     right = (max(x0, x1) - ix0) * TILE_SIZE
     bottom = (max(y0, y1) - iy0) * TILE_SIZE
     crop = mosaic.crop((int(left), int(top), max(int(right), int(left) + 8), max(int(bottom), int(top) + 8)))
-    return _enhance_satellite(crop), zoom, min(x0, x1), min(y0, y1)
+    return crop, zoom, min(x0, x1), min(y0, y1)
 
 
 def _enhance_satellite(img: Image.Image) -> Image.Image:
@@ -615,6 +615,7 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
         max(lons) + lon_pad,
         2000,
     )
+    national = _enhance_satellite(national)
     blank = national.copy()
     _draw_points(national, rows, zoom, x0, y0, labels=False, emphasize_5g=True)
     national = _scale_to_min_width(national, 1680)
