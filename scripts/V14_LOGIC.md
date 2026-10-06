@@ -100,6 +100,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v52 adds **Action plan** for urgent Tx BW increase: Severe/High (both cap shapes) with high Hours on cap and busy hours ≥50% on cap. Double check = Yes is left off. File: `FEGE_Choked_Flat_Sites_v52.xlsx`.
 - v53 renames that sheet to **UrgentTxBWInc** and moves the How-to-read notes to **4. Method**. File: `FEGE_Choked_Flat_Sites_v53.xlsx`.
 - v54 adds a 3-column Thana Level Summary above the UrgentTxBWInc site table. File: `FEGE_Choked_Flat_Sites_v54.xlsx`.
+- v55 takes Tech (4G / 4G+5G) from `Physical_Site_Database_24Sep26.xlsx` (unmapped = 4G) and adds Site List **Site Type** from that file (unmapped = Not found). File: `FEGE_Choked_Flat_Sites_v55.xlsx`.
 
 ## Jupyter (for local Windows use)
 

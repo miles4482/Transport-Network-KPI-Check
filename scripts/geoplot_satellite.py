@@ -174,13 +174,16 @@ def _is_issue_kind(kind: object) -> bool:
 
 
 def _issue_kind(site: str, physical_tech: str, tech_by_site: dict[str, str] | None) -> str:
-    """Map an issue site to 4G or 4G+5G using the Dhaka tech list."""
+    """Map an issue site to 4G or 4G+5G using the physical Tech column."""
     listed = str((tech_by_site or {}).get(site) or "").strip()
     if listed == "4G+5G":
         return KIND_ISSUE_4G5G
     if listed == "4G":
         return KIND_ISSUE_4G
-    return KIND_ISSUE_4G5G if physical_tech == "5G" else KIND_ISSUE_4G
+    key = str(physical_tech or "").strip().upper().replace(" ", "")
+    if key in ("4G+5G", "4G5G") or "5G" in key:
+        return KIND_ISSUE_4G5G
+    return KIND_ISSUE_4G
 
 
 def _draw_points(

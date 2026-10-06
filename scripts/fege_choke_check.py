@@ -93,7 +93,6 @@ GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
 GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
-TECH_FILE = "Site list_Dhaka_Tech_5oct.xlsx"
 TOP_THANA_FILE = "Top Thana.xlsx"
 TECH_4G = "4G"
 TECH_4G5G = "4G+5G"
@@ -1360,6 +1359,16 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Avg peak (Peak − Avg peak) / Peak. Example: DHGULAP. Tx may read this as "
             "low radio demand rather than a hard wall. Detection listing is unchanged.",
         ),
+        (
+            "Tech (4G / 4G+5G)",
+            f"Taken from the Tech column in {GEO_FILE}. "
+            "Unmapped sites are treated as 4G (every site has 4G).",
+        ),
+        (
+            "Site Type",
+            f"Site List Site Type is copied from the Site Type column in {GEO_FILE}. "
+            "If the site is not in that file, the cell is Not found.",
+        ),
     ]
     for i, (key, val) in enumerate(kept):
         r = kept_head + 1 + i
@@ -1424,6 +1433,7 @@ def load_site_geo(path: Path) -> pd.DataFrame:
     region_col = cols.get("region")
     tech_col = cols.get("tech")
     thana_col = cols.get("thana")
+    type_col = cols.get("site type") or cols.get("sitetype") or cols.get("type")
     geo = pd.DataFrame(
         {
             "site": raw[site_col].astype(str).str.strip(),
@@ -1433,11 +1443,13 @@ def load_site_geo(path: Path) -> pd.DataFrame:
             "region": raw[region_col].astype(str) if region_col else "",
             "tech": raw[tech_col].astype(str).str.strip() if tech_col else "",
             "thana": raw[thana_col].astype(str).str.strip() if thana_col else "",
+            "site_type": raw[type_col].astype(str).str.strip() if type_col else "",
         }
     )
     geo = geo.dropna(subset=["lat", "lon"])
     geo = geo[geo["site"] != ""]
     geo.loc[geo["thana"].str.lower().isin(("", "nan", "none")), "thana"] = ""
+    geo.loc[geo["site_type"].str.lower().isin(("", "nan", "none")), "site_type"] = ""
     return geo.drop_duplicates("site", keep="last")
 
 
@@ -1463,50 +1475,66 @@ def _find_input(name: str, source: Path | None = None) -> Path | None:
 
 
 def _norm_list_tech(value: object) -> str:
+    """4G or 4G+5G. Unknown / missing is 4G — every site has 4G."""
     key = str(value or "").strip().upper().replace(" ", "")
-    if key in ("4G+5G", "4G5G"):
+    if key in ("4G+5G", "4G5G") or "5G" in key:
         return TECH_4G5G
-    if key == "4G":
-        return TECH_4G
-    return str(value or "").strip()
+    return TECH_4G
 
 
-def load_site_tech(path: Path) -> dict[str, str]:
-    """Site Name / Tech list (4G vs 4G+5G) used only for the Dashboard summary."""
-    raw = pd.read_excel(path)
-    cols = {str(c).strip().lower(): c for c in raw.columns}
-    site_col = cols.get("site name") or cols.get("sitename") or cols.get("site")
-    tech_col = cols.get("tech")
-    if site_col is None or tech_col is None:
-        raise SystemExit(f"{path.name} needs Site Name and Tech columns")
+def tech_by_site_from_geo(geo: pd.DataFrame) -> dict[str, str]:
+    """Tech (4G / 4G+5G) from the physical site database."""
     out: dict[str, str] = {}
-    for site, tech in zip(raw[site_col], raw[tech_col]):
-        name = str(site).strip()
-        if name and name.lower() != "nan":
-            out[name] = _norm_list_tech(tech)
+    if geo is None or geo.empty:
+        return out
+    for row in geo.itertuples(index=False):
+        out[str(row.site)] = _norm_list_tech(getattr(row, "tech", ""))
     return out
 
 
-def summarise_tech(records: list[dict], tech_by_site: dict[str, str]) -> dict[str, int]:
-    checked_4g = sum(1 for tech in tech_by_site.values() if tech == TECH_4G)
-    checked_4g5g = sum(1 for tech in tech_by_site.values() if tech == TECH_4G5G)
+def site_type_by_site_from_geo(geo: pd.DataFrame) -> dict[str, str]:
+    """Site Type from the physical site database. Missing stays empty for Not found."""
+    out: dict[str, str] = {}
+    if geo is None or geo.empty:
+        return out
+    for row in geo.itertuples(index=False):
+        name = str(getattr(row, "site_type", "") or "").strip()
+        if name.lower() in ("", "nan", "none"):
+            continue
+        out[str(row.site)] = name
+    return out
+
+
+def _attach_site_type(records: list[dict], geo: pd.DataFrame) -> None:
+    types = site_type_by_site_from_geo(geo)
+    for rec in records:
+        rec["site_type"] = types.get(rec["site"]) or "Not found"
+
+
+def summarise_tech(
+    records: list[dict],
+    tech_by_site: dict[str, str],
+    checked_sites: list[str] | None = None,
+) -> dict[str, int]:
+    def listed(site: str) -> str:
+        return tech_by_site.get(site, TECH_4G)
+
+    names = checked_sites if checked_sites is not None else list(tech_by_site)
+    checked_4g = sum(1 for site in names if listed(site) == TECH_4G)
+    checked_4g5g = sum(1 for site in names if listed(site) == TECH_4G5G)
     choked_4g = 0
     choked_4g5g = 0
-    unmapped = 0
     for rec in records:
-        tech = tech_by_site.get(rec["site"])
-        if tech == TECH_4G:
-            choked_4g += 1
-        elif tech == TECH_4G5G:
+        if listed(rec["site"]) == TECH_4G5G:
             choked_4g5g += 1
         else:
-            unmapped += 1
+            choked_4g += 1
     return {
         "checked_4g": checked_4g,
         "checked_4g5g": checked_4g5g,
         "choked_4g": choked_4g,
         "choked_4g5g": choked_4g5g,
-        "unmapped": unmapped,
+        "unmapped": 0,
     }
 
 
@@ -1527,7 +1555,7 @@ def cap_when_matrix(records: list[dict], tech_by_site: dict[str, str]) -> dict:
         if sev not in matrix["total"] or when not in matrix["total"][sev]:
             continue
         matrix["total"][sev][when] += 1
-        tech = tech_by_site.get(rec["site"])
+        tech = tech_by_site.get(rec["site"], TECH_4G)
         if tech in (TECH_4G, TECH_4G5G):
             matrix[tech][sev][when] += 1
     return matrix
@@ -1681,7 +1709,7 @@ def _write_geoplot(
         f"Google satellite    ·    Physical sites: {len(classified)}"
         f"    ·    4G: {n4}    ·    5G: {n5}"
         f"    ·    Issue 4G: {n_issue_4g}    ·    Issue 4G+5G: {n_issue_4g5g}"
-        f"    ·    Source: {GEO_FILE} + {TECH_FILE} + {TOP_THANA_FILE}",
+        f"    ·    Source: {GEO_FILE} + {TOP_THANA_FILE}",
         styles["subtitle"],
     )
     ws.set_row(2, 20)
@@ -1770,7 +1798,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v54.xlsx",
+        default="FEGE_Choked_Flat_Sites_v55.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1791,11 +1819,14 @@ def main() -> None:
         raise SystemExit(f"Physical site database not found: {GEO_FILE}")
     geo = load_site_geo(geo_path)
 
-    tech_path = _find_input(TECH_FILE, source)
-    if tech_path is None:
-        raise SystemExit(f"Dhaka tech site list not found: {TECH_FILE}")
-    tech_by_site = load_site_tech(tech_path)
-    tech_summary = summarise_tech(records, tech_by_site)
+    tech_by_site = tech_by_site_from_geo(geo)
+    checked_sites = (
+        work["eNodeB Name"].astype(str).str.strip().drop_duplicates().tolist()
+    )
+    for site in checked_sites:
+        tech_by_site.setdefault(site, TECH_4G)
+    _attach_site_type(records, geo)
+    tech_summary = summarise_tech(records, tech_by_site, checked_sites)
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
@@ -1979,7 +2010,7 @@ def _write_summary(
             0,
             row,
             9,
-            f"4G / 4G+5G choke summary    ·    source: {TECH_FILE}",
+            f"4G / 4G+5G choke summary    ·    source: {GEO_FILE} Tech column",
             styles["section"],
         )
         row += 1
@@ -2165,12 +2196,12 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws = book.add_worksheet("1. Site List")
     _page(ws, REPORT_TITLE)
 
-    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14]
+    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 14]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
-    last_col_letter = "N"
+    last_col_letter = "O"
     ws.set_row(0, 28)
     ws.merge_range(
         f"A1:{last_col_letter}1",
@@ -2200,6 +2231,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         "Listed because",
         "Longest flat run (h)",
         "Double check",
+        "Site Type",
     ]
     header_row = 3
     ws.set_row(header_row, 36)
@@ -2241,12 +2273,19 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
         if rec.get("double_check"):
             ws.write_string(row, 13, "Yes", styles["yes"])
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row,
+            14,
+            site_type,
+            styles["below"] if site_type == "Not found" else c,
+        )
 
     last = header_row + len(records)
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.repeat_rows(header_row, header_row)
 
-    last_col = 13
+    last_col = 14
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
@@ -2314,6 +2353,20 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         styles["body"],
     )
 
+    st_row = dc_row + 3
+    ws.set_row(st_row, 20)
+    ws.merge_range(st_row, 0, st_row, last_col, "How to read Site Type", styles["section"])
+    ws.set_row(st_row + 1, 36)
+    ws.merge_range(
+        st_row + 1,
+        0,
+        st_row + 1,
+        last_col,
+        f"Copied from the Site Type column in {GEO_FILE} (GF, RTT, RTP, IBS, and so on). "
+        "Not found means the site is not in that physical database.",
+        styles["body"],
+    )
+
     counts = defaultdict(int)
     listed = defaultdict(int)
     when = defaultdict(int)
@@ -2325,7 +2378,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         when[rec["cap_when"]] += 1
         shapes[rec["cap_type"]] += 1
         last_n += int(rec["last_flag"])
-    count_row = dc_row + 3
+    count_row = st_row + 3
     ws.write(count_row, 0, "Severity", styles["label"])
     ws.merge_range(count_row, 1, count_row, 2, f"Severe: {counts[SEV_SEVERE]}", styles["meta"])
     ws.merge_range(
