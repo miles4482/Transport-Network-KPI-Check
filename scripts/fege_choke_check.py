@@ -1361,8 +1361,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Tech (4G / 4G+5G)",
-            f"Taken from the Tech column in {GEO_FILE}. "
-            "Unmapped sites are treated as 4G (every site has 4G).",
+            f"Dashboard, Site List, and UrgentTxBWInc Tech is taken from the "
+            f"Tech column in {GEO_FILE}. Unmapped sites are treated as 4G "
+            "(every site has 4G).",
         ),
         (
             "Site Type",
@@ -1509,6 +1510,15 @@ def _attach_site_type(records: list[dict], geo: pd.DataFrame) -> None:
     types = site_type_by_site_from_geo(geo)
     for rec in records:
         rec["site_type"] = types.get(rec["site"]) or "Not found"
+
+
+def _attach_tech(records: list[dict], tech_by_site: dict[str, str]) -> None:
+    for rec in records:
+        rec["tech"] = tech_by_site.get(rec["site"], TECH_4G)
+
+
+def _rec_tech(rec: dict) -> str:
+    return rec.get("tech") or TECH_4G
 
 
 def summarise_tech(
@@ -1798,7 +1808,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v56.xlsx",
+        default="FEGE_Choked_Flat_Sites_v57.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1826,6 +1836,7 @@ def main() -> None:
     for site in checked_sites:
         tech_by_site.setdefault(site, TECH_4G)
     _attach_site_type(records, geo)
+    _attach_tech(records, tech_by_site)
     tech_summary = summarise_tech(records, tech_by_site, checked_sites)
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
@@ -2101,6 +2112,7 @@ def _write_summary(
     headers = [
         "No.",
         "eNodeB Name",
+        "Tech",
         "Stuck Rx (Mbit/s)",
         "Hours on cap (%)",
         "Days on cap (≥3h)",
@@ -2142,11 +2154,12 @@ def _write_summary(
                 link,
                 string=rec["site"],
             )
-            ws.write_number(row, 2, rec["center"], nfmt)
-            ws.write_number(row, 3, rec["hours_pct"], styles["pct_z"] if zebra else styles["pct"])
-            ws.write_string(row, 4, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
-            ws.write_string(row, 5, last_day_text(rec), cfmt)
-            ws.write_string(row, 6, rec["listed_by"], cfmt)
+            ws.write_string(row, 2, _rec_tech(rec), cfmt)
+            ws.write_number(row, 3, rec["center"], nfmt)
+            ws.write_number(row, 4, rec["hours_pct"], styles["pct_z"] if zebra else styles["pct"])
+            ws.write_string(row, 5, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
+            ws.write_string(row, 6, last_day_text(rec), cfmt)
+            ws.write_string(row, 7, rec["listed_by"], cfmt)
             row += 1
         row += 1
 
@@ -2196,12 +2209,12 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws = book.add_worksheet("1. Site List")
     _page(ws, REPORT_TITLE)
 
-    widths = [5, 14, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 14]
+    widths = [5, 14, 12, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 14]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
-    last_col_letter = "O"
+    last_col_letter = "P"
     ws.set_row(0, 28)
     ws.merge_range(
         f"A1:{last_col_letter}1",
@@ -2219,6 +2232,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     headers = [
         "No.",
         "eNodeB Name",
+        "Tech",
         "Severity",
         "Cap shape",
         "Tx Total BW (Mbit/s)",
@@ -2254,29 +2268,30 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
             link,
             string=rec["site"],
         )
-        ws.write_string(row, 2, rec["severity"], _severity_format(styles, rec["severity"], zebra))
-        ws.write_string(row, 3, rec["cap_type"], c)
-        ws.write_number(row, 4, rec["bw"], n)
-        ws.write_number(row, 5, rec["center"], n)
-        ws.write_number(row, 6, rec["max_rx"], n)
+        ws.write_string(row, 2, _rec_tech(rec), c)
+        ws.write_string(row, 3, rec["severity"], _severity_format(styles, rec["severity"], zebra))
+        ws.write_string(row, 4, rec["cap_type"], c)
+        ws.write_number(row, 5, rec["bw"], n)
+        ws.write_number(row, 6, rec["center"], n)
+        ws.write_number(row, 7, rec["max_rx"], n)
         ws.write_string(
             row,
-            7,
+            8,
             f"{rec['hours_on']}/{rec['hours_n']} ({rec['hours_pct']:.1f}%)",
             c,
         )
-        ws.write_string(row, 8, rec["cap_when"], c)
-        ws.write_string(row, 9, f"{rec['days_on_cap']}/{rec['days_total']}", c)
+        ws.write_string(row, 9, rec["cap_when"], c)
+        ws.write_string(row, 10, f"{rec['days_on_cap']}/{rec['days_total']}", c)
         last_txt = last_day_text(rec)
-        ws.write_string(row, 10, last_txt, styles["yes"] if rec["last_flag"] else c)
-        ws.write_string(row, 11, rec["listed_by"], c)
-        ws.write_number(row, 12, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        ws.write_string(row, 11, last_txt, styles["yes"] if rec["last_flag"] else c)
+        ws.write_string(row, 12, rec["listed_by"], c)
+        ws.write_number(row, 13, rec["longest"], styles["int_z"] if zebra else styles["int"])
         if rec.get("double_check"):
-            ws.write_string(row, 13, "Yes", styles["yes"])
+            ws.write_string(row, 14, "Yes", styles["yes"])
         site_type = str(rec.get("site_type") or "Not found")
         ws.write_string(
             row,
-            14,
+            15,
             site_type,
             styles["below"] if site_type == "Not found" else c,
         )
@@ -2285,7 +2300,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
     ws.autofilter(header_row, 0, last, len(headers) - 1)
     ws.repeat_rows(header_row, header_row)
 
-    last_col = 14
+    last_col = 15
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
@@ -2367,6 +2382,20 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         styles["body"],
     )
 
+    tech_row = st_row + 3
+    ws.set_row(tech_row, 20)
+    ws.merge_range(tech_row, 0, tech_row, last_col, "How to read Tech", styles["section"])
+    ws.set_row(tech_row + 1, 32)
+    ws.merge_range(
+        tech_row + 1,
+        0,
+        tech_row + 1,
+        last_col,
+        f"Copied from the Tech column in {GEO_FILE} (4G or 4G+5G). "
+        "Unmapped sites are 4G — every site has 4G.",
+        styles["body"],
+    )
+
     counts = defaultdict(int)
     listed = defaultdict(int)
     when = defaultdict(int)
@@ -2378,7 +2407,7 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         when[rec["cap_when"]] += 1
         shapes[rec["cap_type"]] += 1
         last_n += int(rec["last_flag"])
-    count_row = st_row + 3
+    count_row = tech_row + 3
     ws.write(count_row, 0, "Severity", styles["label"])
     ws.merge_range(count_row, 1, count_row, 2, f"Severe: {counts[SEV_SEVERE]}", styles["meta"])
     ws.merge_range(
@@ -2491,13 +2520,13 @@ def _write_action_plan(
     _page(ws, "UrgentTxBWInc — urgent Tx BW increase")
     ws.set_tab_color(ORANGE_FONT)
 
-    widths = [5, 18, 12, 18, 16, 18, 20, 26, 16, 12, 18]
+    widths = [5, 18, 12, 12, 18, 16, 18, 20, 26, 16, 12, 18]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
     selected = _action_plan_records(records)
     chart_row = {rec["site"]: i * BLOCK_ROWS + 1 for i, rec in enumerate(records)}
-    last_col = 10  # site list stays A–K; Thana summary continues further right
+    last_col = 11  # UrgentTxBWInc site table A–L; Thana summary continues further right
 
     sum_title = book.add_format(
         {
@@ -2543,7 +2572,8 @@ def _write_action_plan(
     )
 
     thana_counts = _urgent_thana_counts(selected, geo)
-    # 12 Name/Count pairs from B through Y: ~75 thanas sit in 7 rows, not 25.
+    # 12 Name/Count pairs from B through Y. Fill down each column by count
+    # so the highest thanas sit in column 1, then column 2, and so on.
     pair_n = 12
     pair_start = 1  # column B; A stays the site-list No. column (width 5)
     sum_last_col = pair_start + pair_n * 2 - 1
@@ -2595,7 +2625,7 @@ def _write_action_plan(
         excel_r = head_row + 1 + r
         ws.set_row(excel_r, 18)
         for pair in range(pair_n):
-            idx = r * pair_n + pair
+            idx = pair * n_sum_rows + r
             col = pair_start + pair * 2
             if idx < len(thana_counts):
                 name, count = thana_counts[idx]
@@ -2608,6 +2638,7 @@ def _write_action_plan(
     headers = [
         "No.",
         "eNodeB Name",
+        "Tech",
         "Severity",
         "Cap shape",
         "Tx Total BW (Mbit/s)",
@@ -2638,25 +2669,26 @@ def _write_action_plan(
             link,
             string=rec["site"],
         )
-        ws.write_string(row, 2, rec["severity"], _severity_format(styles, rec["severity"], zebra))
-        ws.write_string(row, 3, rec["cap_type"], c)
-        ws.write_number(row, 4, rec["bw"], n)
-        ws.write_number(row, 5, rec["center"], n)
+        ws.write_string(row, 2, _rec_tech(rec), c)
+        ws.write_string(row, 3, rec["severity"], _severity_format(styles, rec["severity"], zebra))
+        ws.write_string(row, 4, rec["cap_type"], c)
+        ws.write_number(row, 5, rec["bw"], n)
+        ws.write_number(row, 6, rec["center"], n)
         ws.write_string(
             row,
-            6,
+            7,
             f"{rec['hours_on']}/{rec['hours_n']} ({rec['hours_pct']:.1f}%)",
             c,
         )
         ws.write_string(
             row,
-            7,
+            8,
             f"{rec['busy_on']}/{rec['busy_n']} ({rec['busy_pct']:.1f}%)",
             c,
         )
-        ws.write_string(row, 8, rec["cap_when"], c)
-        ws.write_string(row, 9, f"{rec['days_on_cap']}/{rec['days_total']}", c)
-        ws.write_string(row, 10, "Increase Tx BW", styles["yes"])
+        ws.write_string(row, 9, rec["cap_when"], c)
+        ws.write_string(row, 10, f"{rec['days_on_cap']}/{rec['days_total']}", c)
+        ws.write_string(row, 11, "Increase Tx BW", styles["yes"])
 
     last = header_row + max(len(selected), 1)
     ws.autofilter(header_row, 0, last, last_col)
