@@ -88,6 +88,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v40 changes HourlyChartOfIssueSites only: keep the RxMaxSpeed series, replace the stuck line with a 72-hour peak line and a line 5% below that peak. File: `FEGE_Choked_Flat_Sites_v40.xlsx`.
 - v41 keeps the 72-hour peak line and replaces the 5%-below line with the average of the three daily peaks. File: `FEGE_Choked_Flat_Sites_v41.xlsx`.
 - v42 adds a national issue-severity map beside the national GeoPlot (Severe / High / Moderate / Low). Cluster maps are unchanged. File: `FEGE_Choked_Flat_Sites_v42.xlsx`.
+- v43 fills the empty black gutter on the national pair: tighter crop, zoom-9 satellite, brighter/sharper tiles, and Excel scale that best-fits each half of the sheet. File: `FEGE_Choked_Flat_Sites_v43.xlsx`.
 
 ## Jupyter (for local Windows use)
 

@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 # Colours chosen to stay visible on Google satellite (dark greens / roofs).
 COLOR_4G = "#00E5FF"
@@ -100,7 +100,23 @@ def _stitch(lat_min: float, lat_max: float, lon_min: float, lon_max: float, targ
     right = (max(x0, x1) - ix0) * TILE_SIZE
     bottom = (max(y0, y1) - iy0) * TILE_SIZE
     crop = mosaic.crop((int(left), int(top), max(int(right), int(left) + 8), max(int(bottom), int(top) + 8)))
-    return crop, zoom, min(x0, x1), min(y0, y1)
+    return _enhance_satellite(crop), zoom, min(x0, x1), min(y0, y1)
+
+
+def _enhance_satellite(img: Image.Image) -> Image.Image:
+    """Lift the dark Google satellite base so sites stay readable."""
+    bright = ImageEnhance.Brightness(img).enhance(1.42)
+    contrast = ImageEnhance.Contrast(bright).enhance(1.22)
+    color = ImageEnhance.Color(contrast).enhance(1.12)
+    return color.filter(ImageFilter.UnsharpMask(radius=1.4, percent=115, threshold=2))
+
+
+def _scale_to_min_width(img: Image.Image, min_width: int) -> Image.Image:
+    """Grow a map to fill its slot instead of leaving empty black bars."""
+    if img.width >= min_width:
+        return img
+    height = max(1, int(round(img.height * (min_width / img.width))))
+    return img.resize((min_width, height), Image.Resampling.LANCZOS)
 
 
 def _to_px(lat: float, lon: float, zoom: int, x_origin: float, y_origin: float) -> tuple[int, int]:
@@ -176,10 +192,10 @@ def _draw_points(
     # Colour distinguishes 4G, 5G, and the two issue-tech legends.
     if emphasize_5g:
         styles = {
-            "4G": (COLOR_4G, 2, "#0B0E12", 1),
-            "5G": (COLOR_5G, 2, "#0B0E12", 1),
-            KIND_ISSUE_4G: (COLOR_ISSUE_4G, 2, "#0B0E12", 1),
-            KIND_ISSUE_4G5G: (COLOR_ISSUE_4G5G, 2, "#0B0E12", 1),
+            "4G": (COLOR_4G, 3, "#0B0E12", 1),
+            "5G": (COLOR_5G, 3, "#0B0E12", 1),
+            KIND_ISSUE_4G: (COLOR_ISSUE_4G, 4, "#0B0E12", 1),
+            KIND_ISSUE_4G5G: (COLOR_ISSUE_4G5G, 4, "#0B0E12", 1),
         }
     else:
         styles = {
@@ -279,10 +295,10 @@ def _draw_severity_points(
     coverage = [r for r in rows if r.get("kind") in ("4G", "5G")]
     issues = [r for r in rows if _is_issue_kind(r.get("kind"))]
     cov_stamp = {
-        "4G": _circle_stamp(2, COLOR_4G, "#0B0E12", 1),
-        "5G": _circle_stamp(2, COLOR_5G, "#0B0E12", 1),
+        "4G": _circle_stamp(3, COLOR_4G, "#0B0E12", 1),
+        "5G": _circle_stamp(3, COLOR_5G, "#0B0E12", 1),
     }
-    sev_stamps = {name: _circle_stamp(3, COLOR_SEV[name], "#0B0E12", 1) for name in SEV_ORDER}
+    sev_stamps = {name: _circle_stamp(5, COLOR_SEV[name], "#0B0E12", 1) for name in SEV_ORDER}
     if img.mode != "RGBA":
         base = img.convert("RGBA")
     else:
@@ -344,9 +360,9 @@ def _frame_map(
     *,
     legend: str = "tech",
 ) -> Image.Image:
-    width = max(panel.width, 780)
+    width = panel.width
     strip = _legend_strip_severity(width, counts) if legend == "severity" else _legend_strip(width, counts)
-    canvas = Image.new("RGB", (max(panel.width, strip.width), panel.height + strip.height + 36), "#0B0E12")
+    canvas = Image.new("RGB", (width, panel.height + strip.height + 36), "#0B0E12")
     canvas.paste(strip, (0, 0))
     ImageDraw.Draw(canvas).text((12, strip.height + 6), title, fill="#F5F5F5", font=_font(18))
     canvas.paste(panel, (0, strip.height + 32))
@@ -590,30 +606,32 @@ def render_map_images(rows: list[dict], zoom_specs: list[dict], dest_dir: Path, 
 
     lats = [r["lat"] for r in rows]
     lons = [r["lon"] for r in rows]
-    lat_pad = max(0.04, (max(lats) - min(lats)) * 0.06)
-    lon_pad = max(0.04, (max(lons) - min(lons)) * 0.06)
+    lat_pad = max(0.02, (max(lats) - min(lats)) * 0.03)
+    lon_pad = max(0.02, (max(lons) - min(lons)) * 0.03)
     national, zoom, x0, y0 = _stitch(
         min(lats) - lat_pad,
         max(lats) + lat_pad,
         min(lons) - lon_pad,
         max(lons) + lon_pad,
-        1200,
+        2000,
     )
     blank = national.copy()
     _draw_points(national, rows, zoom, x0, y0, labels=False, emphasize_5g=True)
+    national = _scale_to_min_width(national, 1680)
     national_path = dest_dir / f"{stem}_National.jpg"
-    _frame_map(national, "National map", counts).save(national_path, format="JPEG", quality=92)
+    _frame_map(national, "National map", counts).save(national_path, format="JPEG", quality=95)
     outputs.append(("National map", national_path, "national"))
 
     severity_panel = blank.copy()
     _draw_severity_points(severity_panel, rows, zoom, x0, y0)
+    severity_panel = _scale_to_min_width(severity_panel, 1680)
     severity_path = dest_dir / f"{stem}_Severity.jpg"
     _frame_map(
         severity_panel,
         "Issue severity map",
         severity_counts(rows),
         legend="severity",
-    ).save(severity_path, format="JPEG", quality=92)
+    ).save(severity_path, format="JPEG", quality=95)
     outputs.append(("Issue severity map", severity_path, "severity"))
 
     for spec in zoom_specs:
