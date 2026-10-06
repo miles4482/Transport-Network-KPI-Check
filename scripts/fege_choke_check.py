@@ -1634,6 +1634,10 @@ def _write_geoplot(
     paired = {slot: (title, path) for title, path, slot in maps if slot in ("national", "severity")}
     zoom_maps = [(title, path) for title, path, slot in maps if slot == "zoom"]
     zoom_sevs = [(title, path) for title, path, slot in maps if slot == "zoom_sev"]
+    if len(zoom_maps) != len(zoom_sevs):
+        raise SystemExit(
+            f"GeoPlot zoom/severity mismatch: {len(zoom_maps)} vs {len(zoom_sevs)}"
+        )
 
     def _rows_for_image(path: Path, scale: float) -> int:
         from PIL import Image as PILImage
