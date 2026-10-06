@@ -267,20 +267,22 @@ def _legend_strip(width: int, counts: dict[str, int] | None = None) -> Image.Ima
 
 def _legend_strip_severity(width: int, counts: dict[str, int] | None = None) -> Image.Image:
     """Severity-only legend for the national companion map."""
-    strip = Image.new("RGB", (width, 96), "#101418")
+    strip = Image.new("RGB", (width, 132), "#101418")
     draw = ImageDraw.Draw(strip)
     font = _font(26)
     group_font = _font(20)
-    draw.text((16, 30), "Severity", fill="#90A4AE", font=group_font)
+    draw.text((16, 48), "Severity", fill="#90A4AE", font=group_font)
     overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
-    x = 160
-    for name in SEV_ORDER:
-        count = (counts or {}).get(name)
-        label = f"{name} ({count:,})" if count is not None else name
-        stamp = _circle_stamp(12, COLOR_SEV[name], "#FFFFFF", 2)
-        _paste_circle(overlay, x, 48, stamp)
-        draw.text((x + 20, 30), label, fill="#F5F5F5", font=font)
-        x += 230
+    rows = (SEV_ORDER[:2], SEV_ORDER[2:])
+    for y, names in zip((18, 78), rows):
+        x = 168
+        for name in names:
+            count = (counts or {}).get(name)
+            label = f"{name} ({count:,})" if count is not None else name
+            stamp = _circle_stamp(12, COLOR_SEV[name], "#FFFFFF", 2)
+            _paste_circle(overlay, x, y + 12, stamp)
+            draw.text((x + 20, y), label, fill="#F5F5F5", font=font)
+            x += 320
     return Image.alpha_composite(strip.convert("RGBA"), overlay).convert("RGB")
 
 
