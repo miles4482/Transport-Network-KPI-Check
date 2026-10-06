@@ -91,6 +91,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v43 fills the empty black gutter on the national pair: tighter crop, zoom-9 satellite, brighter/sharper tiles, and Excel scale that best-fits each half of the sheet. File: `FEGE_Choked_Flat_Sites_v43.xlsx`.
 - v44 returns the national pair to the compact side-by-side size, reserves enough rows so thana/cluster maps do not overlap, and enlarges every map legend. File: `FEGE_Choked_Flat_Sites_v44.xlsx`.
 - v45 pulls the national and severity maps together, leaving only a thin separator instead of a wide empty gutter. File: `FEGE_Choked_Flat_Sites_v45.xlsx`.
+- v46 retunes GeoPlot severity colours: bright red Severe, less-bright deep red High, muted amber Moderate, calm green Low. File: `FEGE_Choked_Flat_Sites_v46.xlsx`.
 
 ## Jupyter (for local Windows use)
 

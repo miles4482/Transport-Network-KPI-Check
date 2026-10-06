@@ -23,10 +23,10 @@ KIND_ISSUE_4G5G = "Issue 4G+5G"
 ISSUE_KINDS = (KIND_ISSUE_4G, KIND_ISSUE_4G5G)
 SEV_ORDER = ("Severe", "High", "Moderate", "Low")
 COLOR_SEV = {
-    "Severe": "#C62828",
-    "High": "#EF6C00",
-    "Moderate": "#F9A825",
-    "Low": "#43A047",
+    "Severe": "#FF1A1A",  # bright red — highest visibility
+    "High": "#A31B1B",  # same family, less bright
+    "Moderate": "#C47A12",  # muted amber — next step down
+    "Low": "#1F7A3A",  # calm green — lowest emphasis
 }
 TILE_SIZE = 256
 TILE_CACHE = Path("/tmp/google_sat_tiles")
@@ -721,7 +721,7 @@ def render_html(rows: list[dict], zoom_specs: list[dict], dest: Path, title: str
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="sub">Google satellite · National + severity maps, then Gulshan / Banani / Dhanmondi / Tejgaon thana maps, then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: red Severe / orange High / gold Moderate / green Low</p>
+  <p class="sub">Google satellite · National + severity maps, then Gulshan / Banani / Dhanmondi / Tejgaon thana maps, then issue clusters · Coverage: cyan 4G / yellow 5G · Issue: red 4G / orange 4G+5G · Severity map: bright red Severe / deep red High / muted amber Moderate / calm green Low</p>
   <nav id="nav"></nav>
   <div id="maps"></div>
   <script>
