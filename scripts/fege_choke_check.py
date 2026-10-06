@@ -1405,6 +1405,12 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Severe first, then highest Hours on cap (all 24h) %, then highest "
             "busy-hour cap %. Open a site name to jump to its hourly chart.",
         ),
+        (
+            "Thana summary",
+            "The Thana Name / Site Count grid is sized from the thana count. "
+            "More thanas add pairs to the right; fewer thanas shrink the grid. "
+            "Highest counts fill column 1 first, then column 2, and so on.",
+        ),
     )
     for i, (key, val) in enumerate(action_notes):
         r = action_head + 1 + i
@@ -1808,7 +1814,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v57.xlsx",
+        default="FEGE_Choked_Flat_Sites_v58.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2506,6 +2512,33 @@ def _urgent_thana_counts(
     return sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
 
 
+def _thana_summary_layout(n: int) -> tuple[int, int]:
+    """Name/Count pair count and data rows for the Thana summary.
+
+    Keep the grid short (about 8 rows) by adding pairs to the right when
+    thanas increase. Shrink both width and height when thanas decrease.
+    """
+    target_rows = 8
+    max_pairs = 16
+    if n <= 0:
+        return 1, 1
+    pair_n = min(max_pairs, max(1, (n + target_rows - 1) // target_rows))
+    n_rows = (n + pair_n - 1) // pair_n
+    while pair_n > 1 and (pair_n - 1) * n_rows >= n:
+        pair_n -= 1
+        n_rows = (n + pair_n - 1) // pair_n
+    return pair_n, n_rows
+
+
+def _thana_extra_col_widths(pair_n: int) -> tuple[int, int]:
+    """Tighter extra columns when the grid grows to the right."""
+    if pair_n <= 6:
+        return 18, 8
+    if pair_n <= 10:
+        return 16, 7
+    return 14, 6
+
+
 def _write_action_plan(
     book,
     styles,
@@ -2572,26 +2605,25 @@ def _write_action_plan(
     )
 
     thana_counts = _urgent_thana_counts(selected, geo)
-    # 12 Name/Count pairs from B through Y. Fill down each column by count
-    # so the highest thanas sit in column 1, then column 2, and so on.
-    pair_n = 12
+    pair_n, n_sum_rows = _thana_summary_layout(len(thana_counts))
     pair_start = 1  # column B; A stays the site-list No. column (width 5)
     sum_last_col = pair_start + pair_n * 2 - 1
-    n_sum_rows = (len(thana_counts) + pair_n - 1) // pair_n if thana_counts else 1
+    title_last_col = max(sum_last_col, last_col)
+    name_w, count_w = _thana_extra_col_widths(pair_n)
     for pair in range(pair_n):
         name_col = pair_start + pair * 2
         count_col = name_col + 1
         if name_col > last_col:
-            ws.set_column(name_col, name_col, 18)
+            ws.set_column(name_col, name_col, name_w)
         if count_col > last_col:
-            ws.set_column(count_col, count_col, 8)
+            ws.set_column(count_col, count_col, count_w)
 
     ws.set_row(0, 28)
     ws.merge_range(
         0,
         0,
         0,
-        sum_last_col,
+        title_last_col,
         "UrgentTxBWInc — urgent Tx BW increase",
         styles["title"],
     )
@@ -2600,7 +2632,7 @@ def _write_action_plan(
         1,
         0,
         1,
-        sum_last_col,
+        title_last_col,
         f"DHK transmission    ·    {period_txt}    ·    {len(selected)} of {len(records)} issue sites"
         f"    ·    not every issue site can take a BW upgrade",
         styles["subtitle"],
