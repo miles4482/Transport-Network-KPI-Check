@@ -1738,6 +1738,12 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
         ),
         (
+            "Filtering(7H/4H/1H)",
+            "The four Yes columns after Tech (Chocked %_Data / Chocked %_User "
+            "/ Data Busy Hour / User Busy Hour) sit under Filtering(7H/4H/1H). "
+            "Each 7H / 4H / 1H Data and User block uses its own header colour.",
+        ),
+        (
             "Chocked %_Data Busy Hour",
             f"Yes when any DataBusyHour Hours matched % (7h OR 4h OR 1h) is "
             f"≥ {OSS_CHOKE_MATCH_PCT:g}%. Filter together with Data Busy Hour "
@@ -2164,7 +2170,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v70.xlsx",
+        default="FEGE_Choked_Flat_Sites_v71.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -3099,6 +3105,23 @@ def _write_action_plan(
     ws.set_zoom(110)
 
 
+def _busy_section_header(book, bg: str, fg: str = "white"):
+    return book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "bold": True,
+            "font_color": fg,
+            "bg_color": bg,
+            "align": "center",
+            "valign": "vcenter",
+            "text_wrap": True,
+            "border": 1,
+            "border_color": bg,
+        }
+    )
+
+
 def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dict]) -> None:
     """OSS DataBusyHour / UserBusyHour for 7, 4, and 1 BusyHour."""
     ws = book.add_worksheet(BUSY_SHEET)
@@ -3213,36 +3236,55 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     data1_end = data1_start + len(data_day_headers) + len(match_1) - 1
     user1_start = data1_end + 1
     user1_end = user1_start + len(user_day_headers) + len(match_1) - 1
+    site_end = 2  # No. / eNodeB Name / Tech
+    filter_start = 3
+    filter_end = 6  # four Filtering(7H/4H/1H) flags
+    sev_col = 7
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_filter = _busy_section_header(book, "#C6EFCE", "#006100")
+    hdr_filter_col = _busy_section_header(book, "#548235", "white")
+    hdr_data7 = _busy_section_header(book, "#1F4E79", "white")
+    hdr_user7 = _busy_section_header(book, "#0D7377", "white")
+    hdr_data4 = _busy_section_header(book, "#C65911", "white")
+    hdr_user4 = _busy_section_header(book, "#B7950B", "white")
+    hdr_data1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_user1 = _busy_section_header(book, "#1A5276", "white")
+    col_fmt = [hdr_site] * len(headers)
+    for col in range(filter_start, filter_end + 1):
+        col_fmt[col] = hdr_filter_col
+    col_fmt[sev_col] = hdr_site
+    for col in range(data7_start, data7_end + 1):
+        col_fmt[col] = hdr_data7
+    for col in range(user7_start, user7_end + 1):
+        col_fmt[col] = hdr_user7
+    for col in range(data4_start, data4_end + 1):
+        col_fmt[col] = hdr_data4
+    for col in range(user4_start, user4_end + 1):
+        col_fmt[col] = hdr_user4
+    for col in range(data1_start, data1_end + 1):
+        col_fmt[col] = hdr_data1
+    for col in range(user1_start, user1_end + 1):
+        col_fmt[col] = hdr_user1
+
+    def _group(c1: int, c2: int, text: str, fmt) -> None:
+        if c1 == c2:
+            ws.write(group_row, c1, text, fmt)
+        else:
+            ws.merge_range(group_row, c1, group_row, c2, text, fmt)
+
     ws.set_row(group_row, 22)
-    if data7_start:
-        ws.merge_range(group_row, 0, group_row, data7_start - 1, "", styles["header"])
-    ws.merge_range(
-        group_row, data7_start, group_row, data7_end,
-        "DataBusyHour (7 BusyHour)", styles["header"],
-    )
-    ws.merge_range(
-        group_row, user7_start, group_row, user7_end,
-        "UserBusyHour (7 BusyHour)", styles["header"],
-    )
-    ws.merge_range(
-        group_row, data4_start, group_row, data4_end,
-        "DataBusyHour (4 BusyHour)", styles["header"],
-    )
-    ws.merge_range(
-        group_row, user4_start, group_row, user4_end,
-        "UserBusyHour (4 BusyHour)", styles["header"],
-    )
-    ws.merge_range(
-        group_row, data1_start, group_row, data1_end,
-        "DataBusyHour (1 BusyHour)", styles["header"],
-    )
-    ws.merge_range(
-        group_row, user1_start, group_row, user1_end,
-        "UserBusyHour (1 BusyHour)", styles["header"],
-    )
+    _group(0, site_end, "Site", hdr_site)
+    _group(filter_start, filter_end, "Filtering(7H/4H/1H)", hdr_filter)
+    _group(sev_col, sev_col, "Severity", hdr_site)
+    _group(data7_start, data7_end, "DataBusyHour (7 BusyHour)", hdr_data7)
+    _group(user7_start, user7_end, "UserBusyHour (7 BusyHour)", hdr_user7)
+    _group(data4_start, data4_end, "DataBusyHour (4 BusyHour)", hdr_data4)
+    _group(user4_start, user4_end, "UserBusyHour (4 BusyHour)", hdr_user4)
+    _group(data1_start, data1_end, "DataBusyHour (1 BusyHour)", hdr_data1)
+    _group(user1_start, user1_end, "UserBusyHour (1 BusyHour)", hdr_user1)
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
-        ws.write(header_row, col, text, styles["header"])
+        ws.write(header_row, col, text, col_fmt[col])
 
     def _num(row, col, value, nfmt):
         if value is None or not np.isfinite(value):
