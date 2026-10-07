@@ -3243,7 +3243,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     hdr_site = _busy_section_header(book, NAVY, "white")
     hdr_filter = _busy_section_header(book, "#C6EFCE", "#006100")
     hdr_filter_col = _busy_section_header(book, "#548235", "white")
-    hdr_data7 = _busy_section_header(book, "#1F4E79", "white")
+    hdr_data7 = _busy_section_header(book, "#2471A3", "white")
     hdr_user7 = _busy_section_header(book, "#0D7377", "white")
     hdr_data4 = _busy_section_header(book, "#C65911", "white")
     hdr_user4 = _busy_section_header(book, "#B7950B", "white")
