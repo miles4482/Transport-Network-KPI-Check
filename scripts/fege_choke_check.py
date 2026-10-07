@@ -93,6 +93,7 @@ BUSY_SHEET = "URGENTBWINC_BusyHour"
 OSS_FILE = "OSS KPI Hourly site  level.rar"
 OSS_BUSY_HOURS = 7
 OSS_BUSY_HOURS_4 = 4
+OSS_BUSY_HOURS_1 = 1
 OSS_VOL_COL = "Data Volume,GB"
 OSS_USER_COL = "Max User"
 OSS_TP_N_COL = "DL User Throughput_N"
@@ -986,7 +987,7 @@ def analyse_urgent_busy_hours(
     """Scan every OSS site independently of UrgentTxBWInc.
 
     Listing is OSS-only: DataBusyHour and UserBusyHour can be filled for any
-    day in 2–4 Oct, or for the last day. 7 BusyHour and 4 BusyHour are scored
+    day in 2–4 Oct, or for the last day. 7, 4, and 1 BusyHour are scored
     the same way. Hours matched still uses FEGE OnCap.
     """
     if oss is None or oss.empty:
@@ -1010,9 +1011,12 @@ def analyse_urgent_busy_hours(
         u7 = _score_oss_busy(frame, days, last_day, oncap, site, "users", OSS_BUSY_HOURS)
         d4 = _score_oss_busy(frame, days, last_day, oncap, site, "vol", OSS_BUSY_HOURS_4)
         u4 = _score_oss_busy(frame, days, last_day, oncap, site, "users", OSS_BUSY_HOURS_4)
+        d1 = _score_oss_busy(frame, days, last_day, oncap, site, "vol", OSS_BUSY_HOURS_1)
+        u1 = _score_oss_busy(frame, days, last_day, oncap, site, "users", OSS_BUSY_HOURS_1)
         listed_7 = (d7["any"] and u7["any"]) or (d7["last"] and u7["last"])
         listed_4 = (d4["any"] and u4["any"]) or (d4["last"] and u4["last"])
-        if not (listed_7 or listed_4):
+        listed_1 = (d1["any"] and u1["any"]) or (d1["last"] and u1["last"])
+        if not (listed_7 or listed_4 or listed_1):
             continue
         out.append(
             {
@@ -1022,6 +1026,8 @@ def analyse_urgent_busy_hours(
                 **_block_fields("user", u7, "tp_user_7h"),
                 **_block_fields("data4", d4, "tp_data_4h"),
                 **_block_fields("user4", u4, "tp_user_4h"),
+                **_block_fields("data1", d1, "tp_data_1h"),
+                **_block_fields("user1", u1, "tp_user_1h"),
             }
         )
     out.sort(
@@ -1030,6 +1036,8 @@ def analyse_urgent_busy_hours(
             -row["user_hours_matched_pct"],
             -row["data4_hours_matched_pct"],
             -row["user4_hours_matched_pct"],
+            -row["data1_hours_matched_pct"],
+            -row["user1_hours_matched_pct"],
             SEVERITY_ORDER.get(row.get("severity"), 99),
             -float(row.get("hours_pct") or 0),
             row["site"],
@@ -1641,7 +1649,7 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Why this sheet",
             "Independent of UrgentTxBWInc. This sheet scans every site in "
             f"{OSS_FILE} and scores DataBusyHour / UserBusyHour against FEGE "
-            "choke hours, once for 7 BusyHour and once for 4 BusyHour. The "
+            "choke hours for 7 BusyHour, 4 BusyHour, and 1 BusyHour. The "
             "UrgentTxBWInc 560-site filter is not used.",
         ),
         (
@@ -1670,29 +1678,40 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "20:00, 18:00, 21:00, 19:00.",
         ),
         (
+            "DataBusyHour (1 BusyHour)",
+            "Same Data Volume sort, but take only the single highest hour "
+            "each day. Example 2-Oct DHADB01: 12:00.",
+        ),
+        (
+            "UserBusyHour (1 BusyHour)",
+            "Same Max User sort, but take only the single highest hour each "
+            "day. Example 2-Oct DHADB01: 20:00.",
+        ),
+        (
             "Who is listed",
             "Every OSS site where both DataBusyHour and UserBusyHour can be "
             "filled for any day in 2–4 Oct, or for the last day (4 Oct), on "
-            "either the 7 BusyHour or the 4 BusyHour set. Not limited to "
-            "UrgentTxBWInc.",
+            "the 7, 4, or 1 BusyHour set. Not limited to UrgentTxBWInc.",
         ),
         (
             "Hours matched %",
             "A matched hour is a busy hour that is actually choked (FEGE on "
-            "cap). Each of the four blocks has its own Hours matched / % / "
-            f"Last day match / Listed because. 7 BusyHour is "
+            "cap). Each block has its own Hours matched / % / Last day match "
+            f"/ Listed because. 7 BusyHour is "
             f"{OSS_BUSY_HOURS * ANALYSIS_DAYS} hours "
-            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS}), e.g. 12/"
-            f"{OSS_BUSY_HOURS * ANALYSIS_DAYS} = 57.14%, last day choked / "
+            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS}), last day choked / "
             f"{OSS_BUSY_HOURS}. 4 BusyHour is "
             f"{OSS_BUSY_HOURS_4 * ANALYSIS_DAYS} hours "
             f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS_4}), last day choked / "
-            f"{OSS_BUSY_HOURS_4}.",
+            f"{OSS_BUSY_HOURS_4}. 1 BusyHour is "
+            f"{OSS_BUSY_HOURS_1 * ANALYSIS_DAYS} hours "
+            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS_1}), last day choked / "
+            f"{OSS_BUSY_HOURS_1}.",
         ),
         (
-            "DL Throughput 7h / 4h",
+            "DL Throughput 7h / 4h / 1h",
             "DL User Throughput,Mbps = DL User Throughput_N / DL User "
-            "Throughput_D. Each block uses only its own busy hours (7h or 4h).",
+            "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
         ),
     )
     for i, (key, val) in enumerate(busy_notes):
@@ -2097,7 +2116,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v67.xlsx",
+        default="FEGE_Choked_Flat_Sites_v68.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -3029,7 +3048,7 @@ def _write_action_plan(
 
 
 def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dict]) -> None:
-    """OSS DataBusyHour / UserBusyHour for 7 BusyHour and 4 BusyHour."""
+    """OSS DataBusyHour / UserBusyHour for 7, 4, and 1 BusyHour."""
     ws = book.add_worksheet(BUSY_SHEET)
     _page(ws, "URGENTBWINC_BusyHour — OSS data and user busy hours")
     ws.set_tab_color("#C00000")
@@ -3050,6 +3069,13 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Listed because",
         "DL Throughput 4h (Mbps)",
     ]
+    match_1 = [
+        "Hours matched",
+        "Hours matched %",
+        "Last day match",
+        "Listed because",
+        "DL Throughput 1h (Mbps)",
+    ]
     id_headers = ["No.", "eNodeB Name", "Tech", "Severity"]
     data_day_headers = [f"DataBusyHour ({label})" for label in day_labels]
     user_day_headers = [f"UserBusyHour ({label})" for label in day_labels]
@@ -3063,9 +3089,14 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         + match_4
         + user_day_headers
         + match_4
+        + data_day_headers
+        + match_1
+        + user_day_headers
+        + match_1
     )
     last_col = len(headers) - 1
     day_widths = [22] * len(days)
+    day1_widths = [12] * len(days)
     match_widths = [12, 14, 16, 16, 16]
     widths = (
         [5, 16, 10, 12]
@@ -3076,6 +3107,10 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         + day_widths
         + match_widths
         + day_widths
+        + match_widths
+        + day1_widths
+        + match_widths
+        + day1_widths
         + match_widths
     )
     for i, w in enumerate(widths):
@@ -3099,7 +3134,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         last_col,
         f"DHK transmission    ·    {period_txt}    ·    {len(busy_rows)} sites"
         f"    ·    independent of UrgentTxBWInc"
-        f"    ·    7 BusyHour and 4 BusyHour from {OSS_FILE}",
+        f"    ·    7 / 4 / 1 BusyHour from {OSS_FILE}",
         styles["subtitle"],
     )
 
@@ -3113,6 +3148,10 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     data4_end = data4_start + len(data_day_headers) + len(match_4) - 1
     user4_start = data4_end + 1
     user4_end = user4_start + len(user_day_headers) + len(match_4) - 1
+    data1_start = user4_end + 1
+    data1_end = data1_start + len(data_day_headers) + len(match_1) - 1
+    user1_start = data1_end + 1
+    user1_end = user1_start + len(user_day_headers) + len(match_1) - 1
     ws.set_row(group_row, 22)
     if data7_start:
         ws.merge_range(group_row, 0, group_row, data7_start - 1, "", styles["header"])
@@ -3131,6 +3170,14 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     ws.merge_range(
         group_row, user4_start, group_row, user4_end,
         "UserBusyHour (4 BusyHour)", styles["header"],
+    )
+    ws.merge_range(
+        group_row, data1_start, group_row, data1_end,
+        "DataBusyHour (1 BusyHour)", styles["header"],
+    )
+    ws.merge_range(
+        group_row, user1_start, group_row, user1_end,
+        "UserBusyHour (1 BusyHour)", styles["header"],
     )
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
@@ -3207,6 +3254,14 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
             ws.write_string(row, col, rec["user4_hours"].get(day, ""), c)
             col += 1
         col = _write_match_block("user4", "user4_last_match", "user4_listed", "tp_user_4h")
+        for day in days:
+            ws.write_string(row, col, rec["data1_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block("data1", "data1_last_match", "data1_listed", "tp_data_1h")
+        for day in days:
+            ws.write_string(row, col, rec["user1_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block("user1", "user1_last_match", "user1_listed", "tp_user_1h")
 
     last = header_row + max(len(busy_rows), 1)
     ws.autofilter(header_row, 0, last, last_col)
