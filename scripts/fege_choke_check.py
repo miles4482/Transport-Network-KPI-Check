@@ -1137,7 +1137,10 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
 
     cat_fmt = book.add_format({"font_name": "Calibri", "font_size": 8, "align": "center"})
 
+    print(f"Writing {len(records)} snapshot charts...")
     for i, rec in enumerate(records):
+        if i and i % 200 == 0:
+            print(f"  snapshots {i}/{len(records)}", flush=True)
         top = i * block
         anchors[rec["site"]] = top
         site = rec["site"]
@@ -2702,9 +2705,11 @@ def _write_workbook(
     _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
     if not skip_heavy:
         _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
+        print("Writing hourly KPI...", flush=True)
         _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
     if not skip_heavy and geo is not None and len(geo):
+        print("Writing GeoPlot...", flush=True)
         _write_geoplot(book, styles, work, records, geo, path, tech_by_site)
     book.close()
 
