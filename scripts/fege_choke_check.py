@@ -890,14 +890,36 @@ def _oss_ratio(num: float, den: float) -> float:
     return float(num / den)
 
 
-def analyse_urgent_busy_hours(oss: pd.DataFrame, records: list[dict]) -> list[dict]:
-    """UrgentTxBWInc sites with DataBusyHour and UserBusyHour from OSS."""
+def _fege_oncap_lookup(work: pd.DataFrame) -> dict[tuple[str, pd.Timestamp, int], bool]:
+    """(site, date, hour) → FEGE OnCap for the 2–4 Oct window."""
+    lookup: dict[tuple[str, pd.Timestamp, int], bool] = {}
+    sites = work["eNodeB Name"].astype(str).str.strip()
+    for site, date, hour, on in zip(sites, work["Date"], work["Hour"], work["OnCap"]):
+        lookup[(site, pd.Timestamp(date).normalize(), int(hour))] = bool(on)
+    return lookup
+
+
+def _count_choked_hours(
+    lookup: dict[tuple[str, pd.Timestamp, int], bool],
+    site: str,
+    day: pd.Timestamp,
+    hours: list[int],
+) -> int:
+    day = pd.Timestamp(day).normalize()
+    return sum(1 for hour in hours if lookup.get((site, day, hour), False))
+
+
+def analyse_urgent_busy_hours(
+    oss: pd.DataFrame, records: list[dict], work: pd.DataFrame
+) -> list[dict]:
+    """UrgentTxBWInc sites with DataBusyHour / UserBusyHour and FEGE choke counts."""
     selected = _action_plan_records(records)
     if oss is None or oss.empty or not selected:
         return []
     days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
     last_day = days[-1]
-    last_label = last_day.strftime("%-d-%b-%y")
+    window_hours = OSS_BUSY_HOURS * len(days)
+    oncap = _fege_oncap_lookup(work)
     by_site = {site: frame for site, frame in oss.groupby("site", sort=False)}
     out: list[dict] = []
     for rec in selected:
@@ -908,8 +930,8 @@ def analyse_urgent_busy_hours(oss: pd.DataFrame, records: list[dict]) -> list[di
         user_txt: dict[pd.Timestamp, str] = {}
         any_match = False
         last_match = False
-        last_overlap = 0
-        overlaps: list[int] = []
+        choked_window = 0
+        last_choked = 0
         vol_7_daily: list[float] = []
         user_7_daily: list[float] = []
         vol_off_daily: list[float] = []
@@ -926,9 +948,10 @@ def analyse_urgent_busy_hours(oss: pd.DataFrame, records: list[dict]) -> list[di
                 any_match = True
                 if day == last_day:
                     last_match = True
-                    last_overlap = len(set(dh) & set(uh))
-            if match:
-                overlaps.append(len(set(dh) & set(uh)))
+            choked = _count_choked_hours(oncap, rec["site"], day, dh)
+            choked_window += choked
+            if day == last_day:
+                last_choked = choked
             if dh:
                 dsub = g[g["Hour"].isin(dh)]
                 vol_7_daily.append(float(dsub["vol"].sum()))
@@ -946,7 +969,6 @@ def analyse_urgent_busy_hours(oss: pd.DataFrame, records: list[dict]) -> list[di
                 d_off += float(off["tp_d"].sum(skipna=True))
         if not (any_match or last_match):
             continue
-        hours_matched = last_overlap if last_match else (max(overlaps) if overlaps else 0)
         if any_match and last_match:
             listed = "Any day + last day"
         elif last_match:
@@ -959,13 +981,15 @@ def analyse_urgent_busy_hours(oss: pd.DataFrame, records: list[dict]) -> list[di
                 "busy_days": days,
                 "data_hours": data_txt,
                 "user_hours": user_txt,
-                "hours_matched": hours_matched,
-                "hours_matched_pct": 100.0 * hours_matched / OSS_BUSY_HOURS,
+                "hours_matched": choked_window,
+                "hours_matched_n": window_hours,
+                "hours_matched_pct": (
+                    100.0 * choked_window / window_hours if window_hours else 0.0
+                ),
                 "last_match": last_match,
+                "last_choked": last_choked,
                 "last_match_text": (
-                    f"{last_label} · {last_overlap}/{OSS_BUSY_HOURS}h"
-                    if last_match
-                    else "—"
+                    f"{last_choked}h choked / {OSS_BUSY_HOURS}" if last_match else "—"
                 ),
                 "listed_busy": listed,
                 "tp_7h": _oss_ratio(n7, d7),
@@ -1613,9 +1637,11 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Hours matched %",
-            f"Hours that sit in both top-{OSS_BUSY_HOURS} lists on the last day "
-            f"/ {OSS_BUSY_HOURS}. Example: 3 of 7 = 42.86%. The hour count can "
-            "be raised later.",
+            f"A matched hour is a DataBusyHour that is actually choked (FEGE "
+            f"on cap). Across 2–4 Oct that is {OSS_BUSY_HOURS * ANALYSIS_DAYS} "
+            f"hours ({ANALYSIS_DAYS} × {OSS_BUSY_HOURS}). Example: 12/"
+            f"{OSS_BUSY_HOURS * ANALYSIS_DAYS} = 57.14%. Last day match is "
+            f"choked hours on 4 Oct only, e.g. 5h choked / {OSS_BUSY_HOURS}.",
         ),
         (
             "7h vs 09:00–15:00",
@@ -2027,7 +2053,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v61.xlsx",
+        default="FEGE_Choked_Flat_Sites_v62.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2065,7 +2091,7 @@ def main() -> None:
     chart_end = work["Date"].max().normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
     _attach_chart_peaks(work, records, chart_start, chart_end)
-    busy_rows = analyse_urgent_busy_hours(oss, records)
+    busy_rows = analyse_urgent_busy_hours(oss, records, work)
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
@@ -3051,7 +3077,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         ws.write_string(
             row,
             col,
-            f"{rec['hours_matched']}/{OSS_BUSY_HOURS}",
+            f"{rec['hours_matched']}/{rec.get('hours_matched_n', OSS_BUSY_HOURS * ANALYSIS_DAYS)}",
             c,
         )
         col += 1
