@@ -27,7 +27,9 @@ Each snapshot chart shows the same three days.
 from __future__ import annotations
 
 import argparse
+import pickle
 import subprocess
+import time as pytime
 from collections import defaultdict
 from datetime import time
 from pathlib import Path
@@ -96,6 +98,7 @@ OSS_BUSY_HOURS_4 = 4
 OSS_BUSY_HOURS_1 = 1
 OSS_POOR_TP_MBPS = 7.0
 OSS_CHOKE_MATCH_PCT = 30.0
+REPORT_CACHE = Path("/tmp/fege_report_cache.pkl")
 OSS_VOL_COL = "Data Volume,GB"
 OSS_USER_COL = "Max User"
 OSS_TP_N_COL = "DL User Throughput_N"
@@ -173,8 +176,10 @@ def resolve_source(path: Path) -> Path:
     if path.suffix.lower() == ".rar":
         dest = Path("/tmp/dhaka_kpi")
         dest.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
         csvs = sorted(dest.glob("*.csv"))
+        if not csvs:
+            subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+            csvs = sorted(dest.glob("*.csv"))
         if not csvs:
             raise SystemExit(f"No CSV extracted from {path.name}")
         return csvs[0]
@@ -841,8 +846,10 @@ def resolve_oss(path: Path) -> Path:
     if path.suffix.lower() == ".rar":
         dest = Path("/tmp/oss_kpi")
         dest.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
         csvs = sorted(dest.glob("*.csv"))
+        if not csvs:
+            subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+            csvs = sorted(dest.glob("*.csv"))
         if not csvs:
             raise SystemExit(f"No CSV extracted from {path.name}")
         return csvs[0]
@@ -2173,47 +2180,108 @@ def main() -> None:
         default="FEGE_Choked_Flat_Sites_v71.xlsx",
         help="Report workbook to write",
     )
-    args = parser.parse_args()
-    source = resolve_source(Path(args.source))
-    output = Path(args.output)
-
-    raw = load_kpi(source)
-    required = {"Date", "Time", "eNodeB Name", RX_COL, TXBW_COL}
-    missing = required - set(raw.columns)
-    if missing:
-        raise SystemExit(f"Missing columns: {', '.join(sorted(missing))}")
-
-    work, records = analyse(raw)
-    _require_references(records)
-
-    geo_path = _find_input(GEO_FILE, source)
-    if geo_path is None:
-        raise SystemExit(f"Physical site database not found: {GEO_FILE}")
-    geo = load_site_geo(geo_path)
-
-    tech_by_site = tech_by_site_from_geo(geo)
-    checked_sites = (
-        work["eNodeB Name"].astype(str).str.strip().drop_duplicates().tolist()
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip snapshot charts, hourly KPI, and GeoPlot (BusyHour-only edits)",
     )
-    for site in checked_sites:
-        tech_by_site.setdefault(site, TECH_4G)
-    _attach_site_type(records, geo)
-    _attach_tech(records, tech_by_site)
-    tech_summary = summarise_tech(records, tech_by_site, checked_sites)
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not load /tmp/fege_report_cache.pkl",
+    )
+    args = parser.parse_args()
+    output = Path(args.output)
+    t0 = pytime.perf_counter()
 
-    oss_path = _find_input(OSS_FILE, source)
-    if oss_path is None:
-        raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
-    oss = load_oss_kpi(resolve_oss(oss_path))
-    chart_end = work["Date"].max().normalize()
-    chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
-    _attach_chart_peaks(work, records, chart_start, chart_end)
-    busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
+    cache = None
+    if not args.no_cache and REPORT_CACHE.exists():
+        try:
+            cache = pickle.loads(REPORT_CACHE.read_bytes())
+            print(f"Loaded analysis cache {REPORT_CACHE}")
+        except Exception as exc:
+            print(f"Cache unused ({exc})")
+            cache = None
+
+    if cache:
+        source_name = cache["source_name"]
+        work = cache["work"]
+        records = cache["records"]
+        geo = cache["geo"]
+        tech_summary = cache["tech_summary"]
+        tech_by_site = cache["tech_by_site"]
+        busy_rows = cache["busy_rows"]
+    else:
+        source = resolve_source(Path(args.source))
+        source_name = source.name
+        raw = load_kpi(source)
+        required = {"Date", "Time", "eNodeB Name", RX_COL, TXBW_COL}
+        missing = required - set(raw.columns)
+        if missing:
+            raise SystemExit(f"Missing columns: {', '.join(sorted(missing))}")
+
+        work, records = analyse(raw)
+        _require_references(records)
+
+        geo_path = _find_input(GEO_FILE, source)
+        if geo_path is None:
+            raise SystemExit(f"Physical site database not found: {GEO_FILE}")
+        geo = load_site_geo(geo_path)
+
+        tech_by_site = tech_by_site_from_geo(geo)
+        checked_sites = (
+            work["eNodeB Name"].astype(str).str.strip().drop_duplicates().tolist()
+        )
+        for site in checked_sites:
+            tech_by_site.setdefault(site, TECH_4G)
+        _attach_site_type(records, geo)
+        _attach_tech(records, tech_by_site)
+        tech_summary = summarise_tech(records, tech_by_site, checked_sites)
+
+        oss_path = _find_input(OSS_FILE, source)
+        if oss_path is None:
+            raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
+        oss = load_oss_kpi(resolve_oss(oss_path))
+        chart_end = work["Date"].max().normalize()
+        chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
+        _attach_chart_peaks(work, records, chart_start, chart_end)
+        busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
+        REPORT_CACHE.write_bytes(
+            pickle.dumps(
+                {
+                    "source_name": source_name,
+                    "work": work,
+                    "records": records,
+                    "geo": geo,
+                    "tech_summary": tech_summary,
+                    "tech_by_site": tech_by_site,
+                    "busy_rows": busy_rows,
+                },
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        )
+        print(f"Saved analysis cache {REPORT_CACHE}")
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
+    if args.fast:
+        print("Fast mode: skipping snapshot charts, hourly KPI, and GeoPlot")
+    t_write = pytime.perf_counter()
     _write_workbook(
-        output, source.name, work, records, geo, tech_summary, tech_by_site, busy_rows
+        output,
+        source_name,
+        work,
+        records,
+        geo,
+        tech_summary,
+        tech_by_site,
+        busy_rows,
+        skip_heavy=args.fast,
+    )
+    print(
+        f"Workbook write {pytime.perf_counter() - t_write:.1f}s"
+        f" (total {pytime.perf_counter() - t0:.1f}s)"
+        + (" [fast]" if args.fast else "")
     )
 
     by_sev = defaultdict(int)
@@ -2546,6 +2614,7 @@ def _write_workbook(
     tech_summary: dict[str, int] | None = None,
     tech_by_site: dict[str, str] | None = None,
     busy_rows: list[dict] | None = None,
+    skip_heavy: bool = False,
 ) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
@@ -2562,17 +2631,19 @@ def _write_workbook(
     # Dashboard is the first sheet so the file opens on the report view.
     chart_end = period_end.normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
-    _attach_chart_peaks(work, records, chart_start, chart_end)
+    if not skip_heavy and records and "peak_72" not in records[0]:
+        _attach_chart_peaks(work, records, chart_start, chart_end)
     _write_summary(
         book, styles, source_name, period_txt, n_sites, records, tech_summary, tech_by_site
     )
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
     _write_action_plan(book, styles, source_name, period_txt, n_sites, records, geo)
     _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
-    _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
-    _write_hourly(book, styles, work, records)
+    if not skip_heavy:
+        _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
+        _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
-    if geo is not None and len(geo):
+    if not skip_heavy and geo is not None and len(geo):
         _write_geoplot(book, styles, work, records, geo, path, tech_by_site)
     book.close()
 
@@ -3390,6 +3461,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     ws.autofilter(header_row, 0, last, last_col)
     ws.repeat_rows(group_row, header_row)
     ws.set_zoom(100)
+
 
 
 if __name__ == "__main__":
