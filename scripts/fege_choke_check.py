@@ -89,6 +89,15 @@ SEV_LOW = "Low"
 REPORT_TITLE = "Transmission Link Health Review"
 SNAP_SHEET = "2. HourlyChartOfIssueSites"
 ACTION_SHEET = "UrgentTxBWInc"
+BUSY_SHEET = "URGENTBWINC_BusyHour"
+OSS_FILE = "OSS KPI Hourly site  level.rar"
+OSS_BUSY_HOURS = 7
+OSS_OFFPEAK_START = 9
+OSS_OFFPEAK_END = 15  # inclusive, 09:00–15:00
+OSS_VOL_COL = "Data Volume,GB"
+OSS_USER_COL = "Max User"
+OSS_TP_N_COL = "DL User Throughput_N"
+OSS_TP_D_COL = "DL User Throughput_D"
 GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
@@ -823,6 +832,161 @@ def _action_plan_records(records: list[dict]) -> list[dict]:
     return selected
 
 
+def resolve_oss(path: Path) -> Path:
+    """Extract the OSS hourly CSV from the uploaded RAR, or use a CSV/xlsx as-is."""
+    if path.suffix.lower() == ".rar":
+        dest = Path("/tmp/oss_kpi")
+        dest.mkdir(parents=True, exist_ok=True)
+        subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+        csvs = sorted(dest.glob("*.csv"))
+        if not csvs:
+            raise SystemExit(f"No CSV extracted from {path.name}")
+        return csvs[0]
+    return path
+
+
+def load_oss_kpi(path: Path) -> pd.DataFrame:
+    """Hourly OSS radio KPI for 2–4 Oct. Throughput is N/D, not the file’s Mbps column."""
+    raw = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    need = {
+        "Date",
+        "Time",
+        "eNodeB Name",
+        OSS_VOL_COL,
+        OSS_USER_COL,
+        OSS_TP_N_COL,
+        OSS_TP_D_COL,
+    }
+    missing = need - set(raw.columns)
+    if missing:
+        raise SystemExit(f"OSS KPI missing columns: {', '.join(sorted(missing))}")
+    work = raw.copy()
+    work["Date"] = parse_kpi_date(work["Date"])
+    work["Hour"] = parse_hour(work["Time"])
+    work["site"] = work["eNodeB Name"].astype(str).str.strip()
+    work["vol"] = pd.to_numeric(work[OSS_VOL_COL], errors="coerce")
+    work["users"] = pd.to_numeric(work[OSS_USER_COL], errors="coerce")
+    work["tp_n"] = pd.to_numeric(work[OSS_TP_N_COL], errors="coerce")
+    work["tp_d"] = pd.to_numeric(work[OSS_TP_D_COL], errors="coerce")
+    work = work[(work["Date"] >= ANALYSIS_START) & (work["Date"] <= ANALYSIS_END)].copy()
+    if work.empty:
+        raise SystemExit("OSS KPI has no rows in the 2–4 Oct window")
+    return work
+
+
+def _format_busy_hours(hours: list[int]) -> str:
+    return ", ".join(f"{hour}:00" for hour in hours)
+
+
+def _top_n_hours(day: pd.DataFrame, col: str, n: int) -> list[int]:
+    """Largest-to-lowest values; keep the first n hours in that rank order."""
+    ranked = day.dropna(subset=[col]).sort_values(col, ascending=False, kind="mergesort")
+    return [int(hour) for hour in ranked["Hour"].head(n).tolist()]
+
+
+def _oss_ratio(num: float, den: float) -> float:
+    if not (np.isfinite(den) and den):
+        return float("nan")
+    return float(num / den)
+
+
+def analyse_urgent_busy_hours(oss: pd.DataFrame, records: list[dict]) -> list[dict]:
+    """UrgentTxBWInc sites with DataBusyHour and UserBusyHour from OSS."""
+    selected = _action_plan_records(records)
+    if oss is None or oss.empty or not selected:
+        return []
+    days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
+    last_day = days[-1]
+    last_label = last_day.strftime("%-d-%b-%y")
+    by_site = {site: frame for site, frame in oss.groupby("site", sort=False)}
+    out: list[dict] = []
+    for rec in selected:
+        frame = by_site.get(rec["site"])
+        if frame is None or frame.empty:
+            continue
+        data_txt: dict[pd.Timestamp, str] = {}
+        user_txt: dict[pd.Timestamp, str] = {}
+        any_match = False
+        last_match = False
+        last_overlap = 0
+        overlaps: list[int] = []
+        vol_7_daily: list[float] = []
+        user_7_daily: list[float] = []
+        vol_off_daily: list[float] = []
+        user_off: list[float] = []
+        n7 = d7 = n_off = d_off = 0.0
+        for day in days:
+            g = frame[frame["Date"] == day]
+            dh = _top_n_hours(g, "vol", OSS_BUSY_HOURS)
+            uh = _top_n_hours(g, "users", OSS_BUSY_HOURS)
+            data_txt[day] = _format_busy_hours(dh)
+            user_txt[day] = _format_busy_hours(uh)
+            match = bool(dh) and bool(uh)
+            if match:
+                any_match = True
+                if day == last_day:
+                    last_match = True
+                    last_overlap = len(set(dh) & set(uh))
+            if match:
+                overlaps.append(len(set(dh) & set(uh)))
+            if dh:
+                dsub = g[g["Hour"].isin(dh)]
+                vol_7_daily.append(float(dsub["vol"].sum()))
+                n7 += float(dsub["tp_n"].sum(skipna=True))
+                d7 += float(dsub["tp_d"].sum(skipna=True))
+            if uh:
+                usub = g[g["Hour"].isin(uh)]
+                if usub["users"].notna().any():
+                    user_7_daily.append(float(usub["users"].mean()))
+            off = g[(g["Hour"] >= OSS_OFFPEAK_START) & (g["Hour"] <= OSS_OFFPEAK_END)]
+            if len(off):
+                vol_off_daily.append(float(off["vol"].sum(skipna=True)))
+                user_off.extend(off["users"].dropna().tolist())
+                n_off += float(off["tp_n"].sum(skipna=True))
+                d_off += float(off["tp_d"].sum(skipna=True))
+        if not (any_match or last_match):
+            continue
+        hours_matched = last_overlap if last_match else (max(overlaps) if overlaps else 0)
+        if any_match and last_match:
+            listed = "Any day + last day"
+        elif last_match:
+            listed = "Last day"
+        else:
+            listed = "Any day"
+        out.append(
+            {
+                **rec,
+                "busy_days": days,
+                "data_hours": data_txt,
+                "user_hours": user_txt,
+                "hours_matched": hours_matched,
+                "hours_matched_pct": 100.0 * hours_matched / OSS_BUSY_HOURS,
+                "last_match": last_match,
+                "last_match_text": (
+                    f"{last_label} · {last_overlap}/{OSS_BUSY_HOURS}h"
+                    if last_match
+                    else "—"
+                ),
+                "listed_busy": listed,
+                "tp_7h": _oss_ratio(n7, d7),
+                "tp_off": _oss_ratio(n_off, d_off),
+                "vol_7h": float(np.mean(vol_7_daily)) if vol_7_daily else float("nan"),
+                "vol_off": float(np.mean(vol_off_daily)) if vol_off_daily else float("nan"),
+                "user_7h": float(np.mean(user_7_daily)) if user_7_daily else float("nan"),
+                "user_off": float(np.mean(user_off)) if user_off else float("nan"),
+            }
+        )
+    out.sort(
+        key=lambda row: (
+            SEVERITY_ORDER[row["severity"]],
+            -row["hours_matched_pct"],
+            -row.get("hours_pct", 0),
+            row["site"],
+        )
+    )
+    return out
+
+
 def _attach_chart_peaks(work: pd.DataFrame, records: list[dict], chart_start, chart_end) -> None:
     for rec in records:
         peak_72, avg_peak, *_rest = _site_chart_peaks(work, rec, chart_start, chart_end)
@@ -1418,6 +1582,55 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ws.write(r, 0, key, styles["method_key"])
         ws.write(r, 1, val, styles["method_val"])
 
+    busy_head = action_head + 1 + len(action_notes) + 1
+    ws.set_row(busy_head, 20)
+    ws.merge_range(busy_head, 0, busy_head, 1, "URGENTBWINC_BusyHour", styles["section"])
+    busy_notes = (
+        (
+            "Why this sheet",
+            "Tx still cannot raise BW on every UrgentTxBWInc site. "
+            "This sheet uses OSS radio KPI to show which of those sites are "
+            "busy on both data volume and users.",
+        ),
+        (
+            "DataBusyHour",
+            f"From {OSS_FILE} only. Each day, sort Data Volume,GB largest to "
+            f"lowest and take the top {OSS_BUSY_HOURS} hours (any hour, peak "
+            "and off-peak). Example 2-Oct DHADB01: 12:00, 11:00, 3:00, 13:00, "
+            "2:00, 1:00, 0:00.",
+        ),
+        (
+            "UserBusyHour",
+            f"Same file and days. Sort Max User largest to lowest and take the "
+            f"top {OSS_BUSY_HOURS} hours. Example 2-Oct DHADB01: 20:00, 18:00, "
+            "21:00, 19:00, 13:00, 17:00, 14:00.",
+        ),
+        (
+            "Who is listed",
+            "UrgentTxBWInc sites where both DataBusyHour and UserBusyHour can "
+            "be filled for any day in 2–4 Oct, or for the last day (4 Oct). "
+            "Last day match is tagged in its own column.",
+        ),
+        (
+            "Hours matched %",
+            f"Hours that sit in both top-{OSS_BUSY_HOURS} lists on the last day "
+            f"/ {OSS_BUSY_HOURS}. Example: 3 of 7 = 42.86%. The hour count can "
+            "be raised later.",
+        ),
+        (
+            "7h vs 09:00–15:00",
+            "DL User Throughput,Mbps = DL User Throughput_N / DL User "
+            "Throughput_D. 7h throughput and Data Volume use DataBusyHour; "
+            f"7h Max User uses UserBusyHour. Non-peak is {OSS_OFFPEAK_START:02d}:00–"
+            f"{OSS_OFFPEAK_END:02d}:00 on the same days.",
+        ),
+    )
+    for i, (key, val) in enumerate(busy_notes):
+        r = busy_head + 1 + i
+        ws.set_row(r, 64)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
 
 
 def load_site_geo(path: Path) -> pd.DataFrame:
@@ -1814,7 +2027,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v60.xlsx",
+        default="FEGE_Choked_Flat_Sites_v61.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -1845,9 +2058,17 @@ def main() -> None:
     _attach_tech(records, tech_by_site)
     tech_summary = summarise_tech(records, tech_by_site, checked_sites)
 
+    oss_path = _find_input(OSS_FILE, source)
+    if oss_path is None:
+        raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
+    oss = load_oss_kpi(resolve_oss(oss_path))
+    busy_rows = analyse_urgent_busy_hours(oss, records)
+
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
-    _write_workbook(output, source.name, work, records, geo, tech_summary, tech_by_site)
+    _write_workbook(
+        output, source.name, work, records, geo, tech_summary, tech_by_site, busy_rows
+    )
 
     by_sev = defaultdict(int)
     for rec in records:
@@ -1893,6 +2114,10 @@ def main() -> None:
                 f"days {rec['days_on_cap']}/{rec['days_total']}, "
                 f"{last_day_text(rec)}"
             )
+    print(
+        f"URGENTBWINC_BusyHour: {len(busy_rows)} UrgentTxBWInc sites "
+        f"with DataBusyHour + UserBusyHour from {OSS_FILE}"
+    )
     print(f"Wrote {output}")
 
 
@@ -2170,6 +2395,7 @@ def _write_workbook(
     geo: pd.DataFrame | None = None,
     tech_summary: dict[str, int] | None = None,
     tech_by_site: dict[str, str] | None = None,
+    busy_rows: list[dict] | None = None,
 ) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
@@ -2192,6 +2418,7 @@ def _write_workbook(
     )
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
     _write_action_plan(book, styles, source_name, period_txt, n_sites, records, geo)
+    _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
     _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
     _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
@@ -2728,6 +2955,130 @@ def _write_action_plan(
     ws.set_zoom(110)
 
 
+def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dict]) -> None:
+    """UrgentTxBWInc sites with OSS DataBusyHour / UserBusyHour."""
+    ws = book.add_worksheet(BUSY_SHEET)
+    _page(ws, "URGENTBWINC_BusyHour — OSS data and user busy hours")
+    ws.set_tab_color("#C00000")
+
+    days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
+    day_labels = [day.strftime("%-d-%b") for day in days]
+    headers = (
+        ["No.", "eNodeB Name", "Tech", "Severity"]
+        + [f"DataBusyHour ({label})" for label in day_labels]
+        + [f"UserBusyHour ({label})" for label in day_labels]
+        + [
+            "Hours matched",
+            "Hours matched %",
+            "Last day match",
+            "Listed because",
+            "DL Throughput 7h (Mbps)",
+            "DL Throughput 09:00–15:00 (Mbps)",
+            "Data Volume 7h (GB)",
+            "Data Volume 09:00–15:00 (GB)",
+            "Max User 7h",
+            "Max User 09:00–15:00",
+        ]
+    )
+    last_col = len(headers) - 1
+    widths = [5, 16, 10, 12] + [28] * (2 * len(days)) + [12, 14, 18, 16, 16, 18, 16, 18, 12, 16]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    chart_row = {rec["site"]: i * BLOCK_ROWS + 1 for i, rec in enumerate(records)}
+    ws.set_row(0, 28)
+    ws.merge_range(
+        0,
+        0,
+        0,
+        last_col,
+        "URGENTBWINC_BusyHour — most critical UrgentTxBWInc sites from OSS KPI",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        1,
+        0,
+        1,
+        last_col,
+        f"DHK transmission    ·    {period_txt}    ·    {len(busy_rows)} sites"
+        f"    ·    DataBusyHour + UserBusyHour from {OSS_FILE}",
+        styles["subtitle"],
+    )
+
+    header_row = 3
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, styles["header"])
+
+    def _num(row, col, value, nfmt):
+        if value is None or not np.isfinite(value):
+            ws.write_blank(row, col, None, nfmt)
+        else:
+            ws.write_number(row, col, value, nfmt)
+
+    for i, rec in enumerate(busy_rows):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 22)
+        n = styles["num_z"] if zebra else styles["num"]
+        c = styles["center_z"] if zebra else styles["center"]
+        link = styles["link_z"] if zebra else styles["link"]
+        col = 0
+        ws.write_number(row, col, i + 1, styles["int_z"] if zebra else styles["int"])
+        col += 1
+        ws.write_url(
+            row,
+            col,
+            f"internal:'{SNAP_SHEET}'!A{chart_row.get(rec['site'], 1)}",
+            link,
+            string=rec["site"],
+        )
+        col += 1
+        ws.write_string(row, col, _rec_tech(rec), c)
+        col += 1
+        ws.write_string(row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra))
+        col += 1
+        for day in days:
+            ws.write_string(row, col, rec["data_hours"].get(day, ""), c)
+            col += 1
+        for day in days:
+            ws.write_string(row, col, rec["user_hours"].get(day, ""), c)
+            col += 1
+        ws.write_string(
+            row,
+            col,
+            f"{rec['hours_matched']}/{OSS_BUSY_HOURS}",
+            c,
+        )
+        col += 1
+        ws.write_string(row, col, f"{rec['hours_matched_pct']:.2f}%", c)
+        col += 1
+        ws.write_string(
+            row,
+            col,
+            rec["last_match_text"],
+            styles["yes"] if rec.get("last_match") else c,
+        )
+        col += 1
+        ws.write_string(row, col, rec["listed_busy"], c)
+        col += 1
+        _num(row, col, rec["tp_7h"], n)
+        col += 1
+        _num(row, col, rec["tp_off"], n)
+        col += 1
+        _num(row, col, rec["vol_7h"], n)
+        col += 1
+        _num(row, col, rec["vol_off"], n)
+        col += 1
+        _num(row, col, rec["user_7h"], n)
+        col += 1
+        _num(row, col, rec["user_off"], n)
+
+    last = header_row + max(len(busy_rows), 1)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(header_row, header_row)
+    ws.set_zoom(100)
 
 
 if __name__ == "__main__":
