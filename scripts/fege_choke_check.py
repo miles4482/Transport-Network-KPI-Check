@@ -2062,6 +2062,9 @@ def main() -> None:
     if oss_path is None:
         raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
     oss = load_oss_kpi(resolve_oss(oss_path))
+    chart_end = work["Date"].max().normalize()
+    chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
+    _attach_chart_peaks(work, records, chart_start, chart_end)
     busy_rows = analyse_urgent_busy_hours(oss, records)
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
