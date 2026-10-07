@@ -911,6 +911,43 @@ def _high_choke(*pcts: float) -> bool:
     return any(np.isfinite(v) and float(v) >= OSS_CHOKE_MATCH_PCT for v in pcts)
 
 
+def _busy_sort_key(row: dict):
+    return (
+        0 if row.get("data4_choke_high") else 1,
+        0 if row.get("user4_choke_high") else 1,
+        0 if row.get("data4_busy_poor") else 1,
+        0 if row.get("user4_busy_poor") else 1,
+        0 if row.get("data_choke_high") else 1,
+        0 if row.get("user_choke_high") else 1,
+        0 if row.get("data_busy_poor") else 1,
+        0 if row.get("user_busy_poor") else 1,
+        -float(row.get("data4_hours_matched_pct") or 0),
+        -float(row.get("user4_hours_matched_pct") or 0),
+        -float(row.get("data_hours_matched_pct") or 0),
+        -float(row.get("user_hours_matched_pct") or 0),
+        -float(row.get("data1_hours_matched_pct") or 0),
+        -float(row.get("user1_hours_matched_pct") or 0),
+        SEVERITY_ORDER.get(row.get("severity"), 99),
+        -float(row.get("hours_pct") or 0),
+        row["site"],
+    )
+
+
+def _attach_4h_only_flags(rows: list[dict]) -> list[dict]:
+    """Yes flags from the 4 BusyHour section only (not 7h/1h OR)."""
+    for row in rows:
+        row["data4_choke_high"] = _high_choke(
+            row.get("data4_hours_matched_pct", float("nan"))
+        )
+        row["user4_choke_high"] = _high_choke(
+            row.get("user4_hours_matched_pct", float("nan"))
+        )
+        row["data4_busy_poor"] = _poor_dl(row.get("tp_data_4h", float("nan")))
+        row["user4_busy_poor"] = _poor_dl(row.get("tp_user_4h", float("nan")))
+    rows.sort(key=_busy_sort_key)
+    return rows
+
+
 def _fege_oncap_lookup(work: pd.DataFrame) -> dict[tuple[str, pd.Timestamp, int], bool]:
     """(site, date, hour) → FEGE OnCap for the 2–4 Oct window."""
     lookup: dict[tuple[str, pd.Timestamp, int], bool] = {}
@@ -1057,24 +1094,7 @@ def analyse_urgent_busy_hours(
                 ),
             }
         )
-    out.sort(
-        key=lambda row: (
-            0 if row.get("data_choke_high") else 1,
-            0 if row.get("user_choke_high") else 1,
-            0 if row.get("data_busy_poor") else 1,
-            0 if row.get("user_busy_poor") else 1,
-            -row["data_hours_matched_pct"],
-            -row["user_hours_matched_pct"],
-            -row["data4_hours_matched_pct"],
-            -row["user4_hours_matched_pct"],
-            -row["data1_hours_matched_pct"],
-            -row["user1_hours_matched_pct"],
-            SEVERITY_ORDER.get(row.get("severity"), 99),
-            -float(row.get("hours_pct") or 0),
-            row["site"],
-        )
-    )
-    return out
+    return _attach_4h_only_flags(out)
 
 
 def _attach_chart_peaks(work: pd.DataFrame, records: list[dict], chart_start, chart_end) -> None:
@@ -1745,8 +1765,17 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
         ),
         (
+            "Filtering(4H only)",
+            "The four Yes columns immediately after Tech use the 4 BusyHour "
+            "section only (not 7h/1h). Chocked %_Data / Chocked %_User are Yes "
+            f"when that 4h Hours matched % is ≥ {OSS_CHOKE_MATCH_PCT:g}%. "
+            "Data Busy Hour_TP / User Busy Hour_TP are Yes when that 4h DL "
+            f"Throughput is ≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter the four "
+            "columns together with OR.",
+        ),
+        (
             "Filtering(7H/4H/1H)",
-            "The four Yes columns after Tech (Chocked %_Data / Chocked %_User "
+            "The next four Yes columns (Chocked %_Data / Chocked %_User "
             "/ Data Busy Hour / User Busy Hour) sit under Filtering(7H/4H/1H). "
             "Each 7H / 4H / 1H Data and User block uses its own header colour.",
         ),
@@ -2177,7 +2206,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v71.xlsx",
+        default="FEGE_Choked_Flat_Sites_v72.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2210,7 +2239,7 @@ def main() -> None:
         geo = cache["geo"]
         tech_summary = cache["tech_summary"]
         tech_by_site = cache["tech_by_site"]
-        busy_rows = cache["busy_rows"]
+        busy_rows = _attach_4h_only_flags(cache["busy_rows"])
     else:
         source = resolve_source(Path(args.source))
         source_name = source.name
@@ -2331,7 +2360,13 @@ def main() -> None:
     print(
         f"URGENTBWINC_BusyHour: {len(busy_rows)} OSS sites "
         f"(independent of UrgentTxBWInc) from {OSS_FILE}; "
-        f"Data Busy Hour Yes: {sum(1 for r in busy_rows if r.get('data_busy_poor'))}; "
+        f"Filtering(4H only) Chocked %_Data Yes: "
+        f"{sum(1 for r in busy_rows if r.get('data4_choke_high'))}; "
+        f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user4_choke_high'))}; "
+        f"Data Busy Hour_TP Yes: {sum(1 for r in busy_rows if r.get('data4_busy_poor'))}; "
+        f"User Busy Hour_TP Yes: {sum(1 for r in busy_rows if r.get('user4_busy_poor'))}; "
+        f"Filtering(7H/4H/1H) Data Busy Hour Yes: "
+        f"{sum(1 for r in busy_rows if r.get('data_busy_poor'))}; "
         f"User Busy Hour Yes: {sum(1 for r in busy_rows if r.get('user_busy_poor'))}; "
         f"Chocked %_Data Yes: {sum(1 for r in busy_rows if r.get('data_choke_high'))}; "
         f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user_choke_high'))}"
@@ -3228,6 +3263,10 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Tech",
         "Chocked %_Data Busy Hour",
         "Chocked %_User Busy Hour",
+        "Data Busy Hour_TP",
+        "User Busy Hour_TP",
+        "Chocked %_Data Busy Hour",
+        "Chocked %_User Busy Hour",
         "Data Busy Hour",
         "User Busy Hour",
         "Severity",
@@ -3254,7 +3293,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     day1_widths = [12] * len(days)
     match_widths = [12, 14, 16, 16, 16]
     widths = (
-        [5, 16, 10, 22, 22, 16, 16, 12]
+        [5, 16, 10, 22, 22, 16, 16, 22, 22, 16, 16, 12]
         + day_widths
         + match_widths
         + day_widths
@@ -3308,10 +3347,14 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     user1_start = data1_end + 1
     user1_end = user1_start + len(user_day_headers) + len(match_1) - 1
     site_end = 2  # No. / eNodeB Name / Tech
-    filter_start = 3
-    filter_end = 6  # four Filtering(7H/4H/1H) flags
-    sev_col = 7
+    filter4_start = 3
+    filter4_end = 6  # Filtering(4H only)
+    filter_start = 7
+    filter_end = 10  # Filtering(7H/4H/1H)
+    sev_col = 11
     hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_filter4 = _busy_section_header(book, "#F4CBE8", "#9B2D8A")
+    hdr_filter4_col = _busy_section_header(book, "#134F5C", "white")
     hdr_filter = _busy_section_header(book, "#C6EFCE", "#006100")
     hdr_filter_col = _busy_section_header(book, "#548235", "white")
     hdr_data7 = _busy_section_header(book, "#2471A3", "white")
@@ -3321,6 +3364,8 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     hdr_data1 = _busy_section_header(book, "#6C3483", "white")
     hdr_user1 = _busy_section_header(book, "#1A5276", "white")
     col_fmt = [hdr_site] * len(headers)
+    for col in range(filter4_start, filter4_end + 1):
+        col_fmt[col] = hdr_filter4_col
     for col in range(filter_start, filter_end + 1):
         col_fmt[col] = hdr_filter_col
     col_fmt[sev_col] = hdr_site
@@ -3345,6 +3390,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
 
     ws.set_row(group_row, 22)
     _group(0, site_end, "Site", hdr_site)
+    _group(filter4_start, filter4_end, "Filtering(4H only)", hdr_filter4)
     _group(filter_start, filter_end, "Filtering(7H/4H/1H)", hdr_filter)
     _group(sev_col, sev_col, "Severity", hdr_site)
     _group(data7_start, data7_end, "DataBusyHour (7 BusyHour)", hdr_data7)
@@ -3386,26 +3432,21 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col += 1
         ws.write_string(row, col, _rec_tech(rec), c)
         col += 1
-        data_choke = bool(rec.get("data_choke_high"))
-        ws.write_string(
-            row, col, "Yes" if data_choke else "", styles["yes"] if data_choke else c
-        )
-        col += 1
-        user_choke = bool(rec.get("user_choke_high"))
-        ws.write_string(
-            row, col, "Yes" if user_choke else "", styles["yes"] if user_choke else c
-        )
-        col += 1
-        data_poor = bool(rec.get("data_busy_poor"))
-        ws.write_string(
-            row, col, "Yes" if data_poor else "", styles["yes"] if data_poor else c
-        )
-        col += 1
-        user_poor = bool(rec.get("user_busy_poor"))
-        ws.write_string(
-            row, col, "Yes" if user_poor else "", styles["yes"] if user_poor else c
-        )
-        col += 1
+
+        def _write_flag(on: bool) -> int:
+            ws.write_string(
+                row, col, "Yes" if on else "", styles["yes"] if on else c
+            )
+            return col + 1
+
+        col = _write_flag(bool(rec.get("data4_choke_high")))
+        col = _write_flag(bool(rec.get("user4_choke_high")))
+        col = _write_flag(bool(rec.get("data4_busy_poor")))
+        col = _write_flag(bool(rec.get("user4_busy_poor")))
+        col = _write_flag(bool(rec.get("data_choke_high")))
+        col = _write_flag(bool(rec.get("user_choke_high")))
+        col = _write_flag(bool(rec.get("data_busy_poor")))
+        col = _write_flag(bool(rec.get("user_busy_poor")))
         ws.write_string(row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra))
         col += 1
 

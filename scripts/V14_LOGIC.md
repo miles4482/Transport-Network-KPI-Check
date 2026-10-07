@@ -117,6 +117,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v69 adds **Data Busy Hour** and **User Busy Hour** flag columns after Tech: Yes when any of that section’s 7h/4h/1h DL Throughput is ≤ 7 Mbps (OR). File: `FEGE_Choked_Flat_Sites_v69.xlsx`.
 - v70 adds **Chocked %_Data Busy Hour** and **Chocked %_User Busy Hour** after Tech: Yes when any of that section’s Hours matched % (7h OR 4h OR 1h) is ≥ 30%. The ≤ 7 Mbps flags are unchanged. File: `FEGE_Choked_Flat_Sites_v70.xlsx`.
 - v71 groups the four Yes flags under **Filtering(7H/4H/1H)** and colours each BusyHour section header differently. File: `FEGE_Choked_Flat_Sites_v71.xlsx`. BusyHour-only edits use `--fast` (skip snapshot charts, hourly KPI, and GeoPlot) plus `/tmp/fege_report_cache.pkl` so the 1,808 charts are not rebuilt.
+- v72 adds **Filtering(4H only)** after Tech and before Filtering(7H/4H/1H): Chocked %_Data / Chocked %_User Yes when that 4h Hours matched % ≥ 30%; Data Busy Hour_TP / User Busy Hour_TP Yes when that 4h DL Throughput ≤ 7 Mbps. File: `FEGE_Choked_Flat_Sites_v72.xlsx`.
 
 ## Jupyter (for local Windows use)
 
