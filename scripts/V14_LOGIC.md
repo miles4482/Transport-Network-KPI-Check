@@ -108,6 +108,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v60 removes the Dashboard UrgentTxBWInc banner, the Tech-source note, and the UrgentTxBWInc Crowded/Hard ceiling footer. File: `FEGE_Choked_Flat_Sites_v60.xlsx`.
 - v61 adds **URGENTBWINC_BusyHour** from `OSS KPI Hourly site  level.rar`: per day the 7 highest Data Volume hours and 7 highest Max User hours (any hour of the day), last-day tag, matched-hour %, and 7h vs 09:00–15:00 Data Volume / Max User / DL throughput. File: `FEGE_Choked_Flat_Sites_v61.xlsx`.
 - v62 counts Hours matched as FEGE choked hours among the 21 DataBusyHours (7 × 3 days), % over 21, and Last day match as choked / 7 on 4 Oct only. File: `FEGE_Choked_Flat_Sites_v62.xlsx`.
+- v63 splits Hours matched / % / Last day match / Listed because (and 7h DL throughput) into separate DataBusyHour and UserBusyHour blocks. File: `FEGE_Choked_Flat_Sites_v63.xlsx`.
 
 ## Jupyter (for local Windows use)
 

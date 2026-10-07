@@ -928,71 +928,96 @@ def analyse_urgent_busy_hours(
             continue
         data_txt: dict[pd.Timestamp, str] = {}
         user_txt: dict[pd.Timestamp, str] = {}
-        any_match = False
-        last_match = False
-        choked_window = 0
-        last_choked = 0
+        data_any = False
+        user_any = False
+        data_last = False
+        user_last = False
+        data_choked = 0
+        user_choked = 0
+        data_last_choked = 0
+        user_last_choked = 0
         vol_7_daily: list[float] = []
         user_7_daily: list[float] = []
         vol_off_daily: list[float] = []
         user_off: list[float] = []
-        n7 = d7 = n_off = d_off = 0.0
+        n_data = d_data = n_user = d_user = n_off = d_off = 0.0
         for day in days:
             g = frame[frame["Date"] == day]
             dh = _top_n_hours(g, "vol", OSS_BUSY_HOURS)
             uh = _top_n_hours(g, "users", OSS_BUSY_HOURS)
             data_txt[day] = _format_busy_hours(dh)
             user_txt[day] = _format_busy_hours(uh)
-            match = bool(dh) and bool(uh)
-            if match:
-                any_match = True
+            if dh:
+                data_any = True
                 if day == last_day:
-                    last_match = True
-            choked = _count_choked_hours(oncap, rec["site"], day, dh)
-            choked_window += choked
+                    data_last = True
+            if uh:
+                user_any = True
+                if day == last_day:
+                    user_last = True
+            d_choke = _count_choked_hours(oncap, rec["site"], day, dh)
+            u_choke = _count_choked_hours(oncap, rec["site"], day, uh)
+            data_choked += d_choke
+            user_choked += u_choke
             if day == last_day:
-                last_choked = choked
+                data_last_choked = d_choke
+                user_last_choked = u_choke
             if dh:
                 dsub = g[g["Hour"].isin(dh)]
                 vol_7_daily.append(float(dsub["vol"].sum()))
-                n7 += float(dsub["tp_n"].sum(skipna=True))
-                d7 += float(dsub["tp_d"].sum(skipna=True))
+                n_data += float(dsub["tp_n"].sum(skipna=True))
+                d_data += float(dsub["tp_d"].sum(skipna=True))
             if uh:
                 usub = g[g["Hour"].isin(uh)]
                 if usub["users"].notna().any():
                     user_7_daily.append(float(usub["users"].mean()))
+                n_user += float(usub["tp_n"].sum(skipna=True))
+                d_user += float(usub["tp_d"].sum(skipna=True))
             off = g[(g["Hour"] >= OSS_OFFPEAK_START) & (g["Hour"] <= OSS_OFFPEAK_END)]
             if len(off):
                 vol_off_daily.append(float(off["vol"].sum(skipna=True)))
                 user_off.extend(off["users"].dropna().tolist())
                 n_off += float(off["tp_n"].sum(skipna=True))
                 d_off += float(off["tp_d"].sum(skipna=True))
-        if not (any_match or last_match):
+        if not (data_any or user_any or data_last or user_last):
             continue
-        if any_match and last_match:
-            listed = "Any day + last day"
-        elif last_match:
-            listed = "Last day"
-        else:
-            listed = "Any day"
+
+        def _listed(any_day: bool, last_day_ok: bool) -> str:
+            if any_day and last_day_ok:
+                return "Any day + last day"
+            if last_day_ok:
+                return "Last day"
+            if any_day:
+                return "Any day"
+            return "—"
+
         out.append(
             {
                 **rec,
                 "busy_days": days,
                 "data_hours": data_txt,
                 "user_hours": user_txt,
-                "hours_matched": choked_window,
                 "hours_matched_n": window_hours,
-                "hours_matched_pct": (
-                    100.0 * choked_window / window_hours if window_hours else 0.0
+                "data_hours_matched": data_choked,
+                "data_hours_matched_pct": (
+                    100.0 * data_choked / window_hours if window_hours else 0.0
                 ),
-                "last_match": last_match,
-                "last_choked": last_choked,
-                "last_match_text": (
-                    f"{last_choked}h choked / {OSS_BUSY_HOURS}" if last_match else "—"
+                "data_last_match": data_last,
+                "data_last_match_text": (
+                    f"{data_last_choked}h choked / {OSS_BUSY_HOURS}" if data_last else "—"
                 ),
-                "listed_busy": listed,
-                "tp_7h": _oss_ratio(n7, d7),
+                "data_listed": _listed(data_any, data_last),
+                "user_hours_matched": user_choked,
+                "user_hours_matched_pct": (
+                    100.0 * user_choked / window_hours if window_hours else 0.0
+                ),
+                "user_last_match": user_last,
+                "user_last_match_text": (
+                    f"{user_last_choked}h choked / {OSS_BUSY_HOURS}" if user_last else "—"
+                ),
+                "user_listed": _listed(user_any, user_last),
+                "tp_data_7h": _oss_ratio(n_data, d_data),
+                "tp_user_7h": _oss_ratio(n_user, d_user),
                 "tp_off": _oss_ratio(n_off, d_off),
                 "vol_7h": float(np.mean(vol_7_daily)) if vol_7_daily else float("nan"),
                 "vol_off": float(np.mean(vol_off_daily)) if vol_off_daily else float("nan"),
@@ -1003,7 +1028,8 @@ def analyse_urgent_busy_hours(
     out.sort(
         key=lambda row: (
             SEVERITY_ORDER[row["severity"]],
-            -row["hours_matched_pct"],
+            -row["data_hours_matched_pct"],
+            -row["user_hours_matched_pct"],
             -row.get("hours_pct", 0),
             row["site"],
         )
@@ -1637,17 +1663,19 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Hours matched %",
-            f"A matched hour is a DataBusyHour that is actually choked (FEGE "
-            f"on cap). Across 2–4 Oct that is {OSS_BUSY_HOURS * ANALYSIS_DAYS} "
-            f"hours ({ANALYSIS_DAYS} × {OSS_BUSY_HOURS}). Example: 12/"
+            f"A matched hour is a busy hour that is actually choked (FEGE on "
+            f"cap). DataBusyHour and UserBusyHour each have their own Hours "
+            f"matched / % / Last day match / Listed because. Across 2–4 Oct "
+            f"that is {OSS_BUSY_HOURS * ANALYSIS_DAYS} hours "
+            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS}), e.g. 12/"
             f"{OSS_BUSY_HOURS * ANALYSIS_DAYS} = 57.14%. Last day match is "
-            f"choked hours on 4 Oct only, e.g. 5h choked / {OSS_BUSY_HOURS}.",
+            f"choked / {OSS_BUSY_HOURS} on 4 Oct only.",
         ),
         (
             "7h vs 09:00–15:00",
             "DL User Throughput,Mbps = DL User Throughput_N / DL User "
-            "Throughput_D. 7h throughput and Data Volume use DataBusyHour; "
-            f"7h Max User uses UserBusyHour. Non-peak is {OSS_OFFPEAK_START:02d}:00–"
+            "Throughput_D. Each block has its own 7h throughput (DataBusyHour "
+            f"or UserBusyHour). Non-peak is {OSS_OFFPEAK_START:02d}:00–"
             f"{OSS_OFFPEAK_END:02d}:00 on the same days.",
         ),
     )
@@ -2053,7 +2081,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v62.xlsx",
+        default="FEGE_Choked_Flat_Sites_v63.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2992,25 +3020,40 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
 
     days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
     day_labels = [day.strftime("%-d-%b") for day in days]
+    match_headers = [
+        "Hours matched",
+        "Hours matched %",
+        "Last day match",
+        "Listed because",
+        "DL Throughput 7h (Mbps)",
+    ]
+    extra_headers = [
+        "DL Throughput 09:00–15:00 (Mbps)",
+        "Data Volume 7h (GB)",
+        "Data Volume 09:00–15:00 (GB)",
+        "Max User 7h",
+        "Max User 09:00–15:00",
+    ]
+    id_headers = ["No.", "eNodeB Name", "Tech", "Severity"]
+    data_day_headers = [f"DataBusyHour ({label})" for label in day_labels]
+    user_day_headers = [f"UserBusyHour ({label})" for label in day_labels]
     headers = (
-        ["No.", "eNodeB Name", "Tech", "Severity"]
-        + [f"DataBusyHour ({label})" for label in day_labels]
-        + [f"UserBusyHour ({label})" for label in day_labels]
-        + [
-            "Hours matched",
-            "Hours matched %",
-            "Last day match",
-            "Listed because",
-            "DL Throughput 7h (Mbps)",
-            "DL Throughput 09:00–15:00 (Mbps)",
-            "Data Volume 7h (GB)",
-            "Data Volume 09:00–15:00 (GB)",
-            "Max User 7h",
-            "Max User 09:00–15:00",
-        ]
+        id_headers
+        + data_day_headers
+        + match_headers
+        + user_day_headers
+        + match_headers
+        + extra_headers
     )
     last_col = len(headers) - 1
-    widths = [5, 16, 10, 12] + [28] * (2 * len(days)) + [12, 14, 18, 16, 16, 18, 16, 18, 12, 16]
+    widths = (
+        [5, 16, 10, 12]
+        + [28] * len(days)
+        + [12, 14, 16, 16, 16]
+        + [28] * len(days)
+        + [12, 14, 16, 16, 16]
+        + [18, 16, 18, 12, 16]
+    )
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
@@ -3031,11 +3074,23 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         1,
         last_col,
         f"DHK transmission    ·    {period_txt}    ·    {len(busy_rows)} sites"
-        f"    ·    DataBusyHour + UserBusyHour from {OSS_FILE}",
+        f"    ·    DataBusyHour and UserBusyHour scored separately from {OSS_FILE}",
         styles["subtitle"],
     )
 
-    header_row = 3
+    group_row = 3
+    header_row = 4
+    data_start = len(id_headers)
+    data_end = data_start + len(data_day_headers) + len(match_headers) - 1
+    user_start = data_end + 1
+    user_end = user_start + len(user_day_headers) + len(match_headers) - 1
+    ws.set_row(group_row, 22)
+    if data_start:
+        ws.merge_range(group_row, 0, group_row, data_start - 1, "", styles["header"])
+    ws.merge_range(group_row, data_start, group_row, data_end, "DataBusyHour", styles["header"])
+    ws.merge_range(group_row, user_start, group_row, user_end, "UserBusyHour", styles["header"])
+    if user_end < last_col:
+        ws.merge_range(group_row, user_end + 1, group_row, last_col, "", styles["header"])
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
         ws.write(header_row, col, text, styles["header"])
@@ -3068,32 +3123,36 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col += 1
         ws.write_string(row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra))
         col += 1
+        window_n = rec.get("hours_matched_n", OSS_BUSY_HOURS * ANALYSIS_DAYS)
+
+        def _write_match_block(prefix: str, last_key: str, listed_key: str, tp_key: str) -> int:
+            pos = col
+            ws.write_string(
+                row, pos, f"{rec[f'{prefix}_hours_matched']}/{window_n}", c
+            )
+            pos += 1
+            ws.write_string(row, pos, f"{rec[f'{prefix}_hours_matched_pct']:.2f}%", c)
+            pos += 1
+            ws.write_string(
+                row,
+                pos,
+                rec[f"{prefix}_last_match_text"],
+                styles["yes"] if rec.get(last_key) else c,
+            )
+            pos += 1
+            ws.write_string(row, pos, rec[listed_key], c)
+            pos += 1
+            _num(row, pos, rec[tp_key], n)
+            return pos + 1
+
         for day in days:
             ws.write_string(row, col, rec["data_hours"].get(day, ""), c)
             col += 1
+        col = _write_match_block("data", "data_last_match", "data_listed", "tp_data_7h")
         for day in days:
             ws.write_string(row, col, rec["user_hours"].get(day, ""), c)
             col += 1
-        ws.write_string(
-            row,
-            col,
-            f"{rec['hours_matched']}/{rec.get('hours_matched_n', OSS_BUSY_HOURS * ANALYSIS_DAYS)}",
-            c,
-        )
-        col += 1
-        ws.write_string(row, col, f"{rec['hours_matched_pct']:.2f}%", c)
-        col += 1
-        ws.write_string(
-            row,
-            col,
-            rec["last_match_text"],
-            styles["yes"] if rec.get("last_match") else c,
-        )
-        col += 1
-        ws.write_string(row, col, rec["listed_busy"], c)
-        col += 1
-        _num(row, col, rec["tp_7h"], n)
-        col += 1
+        col = _write_match_block("user", "user_last_match", "user_listed", "tp_user_7h")
         _num(row, col, rec["tp_off"], n)
         col += 1
         _num(row, col, rec["vol_7h"], n)
@@ -3106,7 +3165,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
 
     last = header_row + max(len(busy_rows), 1)
     ws.autofilter(header_row, 0, last, last_col)
-    ws.repeat_rows(header_row, header_row)
+    ws.repeat_rows(group_row, header_row)
     ws.set_zoom(100)
 
 
