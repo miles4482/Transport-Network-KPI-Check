@@ -687,7 +687,9 @@ def _severity_format(styles, level: str, zebra: bool):
         return styles["high"]
     if level == SEV_MODERATE:
         return styles["moderate"]
-    return styles["low"]
+    if level == SEV_LOW:
+        return styles["low"]
+    return styles["center_z"] if zebra else styles["center"]
 
 
 def _page(ws, title: str, *, fit_width: bool = True):
@@ -910,22 +912,34 @@ def _count_choked_hours(
 
 
 def analyse_urgent_busy_hours(
-    oss: pd.DataFrame, records: list[dict], work: pd.DataFrame
+    oss: pd.DataFrame,
+    records: list[dict],
+    work: pd.DataFrame,
+    tech_by_site: dict[str, str] | None = None,
 ) -> list[dict]:
-    """UrgentTxBWInc sites with DataBusyHour / UserBusyHour and FEGE choke counts."""
-    selected = _action_plan_records(records)
-    if oss is None or oss.empty or not selected:
+    """Scan every OSS site independently of UrgentTxBWInc.
+
+    Listing is OSS-only: DataBusyHour and UserBusyHour can be filled for any
+    day in 2–4 Oct, or for the last day. Hours matched still uses FEGE OnCap.
+    """
+    if oss is None or oss.empty:
         return []
+    tech_by_site = tech_by_site or {}
+    issue_by_site = {rec["site"]: rec for rec in records}
     days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
     last_day = days[-1]
     window_hours = OSS_BUSY_HOURS * len(days)
     oncap = _fege_oncap_lookup(work)
-    by_site = {site: frame for site, frame in oss.groupby("site", sort=False)}
     out: list[dict] = []
-    for rec in selected:
-        frame = by_site.get(rec["site"])
+    for site, frame in oss.groupby("site", sort=False):
         if frame is None or frame.empty:
             continue
+        rec = issue_by_site.get(site) or {
+            "site": site,
+            "tech": tech_by_site.get(site, TECH_4G),
+            "severity": "—",
+            "hours_pct": 0.0,
+        }
         data_txt: dict[pd.Timestamp, str] = {}
         user_txt: dict[pd.Timestamp, str] = {}
         data_any = False
@@ -955,8 +969,8 @@ def analyse_urgent_busy_hours(
                 user_any = True
                 if day == last_day:
                     user_last = True
-            d_choke = _count_choked_hours(oncap, rec["site"], day, dh)
-            u_choke = _count_choked_hours(oncap, rec["site"], day, uh)
+            d_choke = _count_choked_hours(oncap, site, day, dh)
+            u_choke = _count_choked_hours(oncap, site, day, uh)
             data_choked += d_choke
             user_choked += u_choke
             if day == last_day:
@@ -979,7 +993,7 @@ def analyse_urgent_busy_hours(
                 user_off.extend(off["users"].dropna().tolist())
                 n_off += float(off["tp_n"].sum(skipna=True))
                 d_off += float(off["tp_d"].sum(skipna=True))
-        if not (data_any or user_any or data_last or user_last):
+        if not ((data_any and user_any) or (data_last and user_last)):
             continue
 
         def _listed(any_day: bool, last_day_ok: bool) -> str:
@@ -1027,10 +1041,10 @@ def analyse_urgent_busy_hours(
         )
     out.sort(
         key=lambda row: (
-            SEVERITY_ORDER[row["severity"]],
             -row["data_hours_matched_pct"],
             -row["user_hours_matched_pct"],
-            -row.get("hours_pct", 0),
+            SEVERITY_ORDER.get(row.get("severity"), 99),
+            -float(row.get("hours_pct") or 0),
             row["site"],
         )
     )
@@ -1638,9 +1652,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
     busy_notes = (
         (
             "Why this sheet",
-            "Tx still cannot raise BW on every UrgentTxBWInc site. "
-            "This sheet uses OSS radio KPI to show which of those sites are "
-            "busy on both data volume and users.",
+            "Independent of UrgentTxBWInc. This sheet scans every site in "
+            f"{OSS_FILE} and scores DataBusyHour / UserBusyHour against FEGE "
+            "choke hours. The UrgentTxBWInc 560-site filter is not used.",
         ),
         (
             "DataBusyHour",
@@ -1657,9 +1671,10 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Who is listed",
-            "UrgentTxBWInc sites where both DataBusyHour and UserBusyHour can "
-            "be filled for any day in 2–4 Oct, or for the last day (4 Oct). "
-            "Last day match is tagged in its own column.",
+            "Every OSS site where both DataBusyHour and UserBusyHour can be "
+            "filled for any day in 2–4 Oct, or for the last day (4 Oct). "
+            "Not limited to UrgentTxBWInc. Last day match is tagged in its "
+            "own column.",
         ),
         (
             "Hours matched %",
@@ -2081,7 +2096,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v63.xlsx",
+        default="FEGE_Choked_Flat_Sites_v64.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2119,7 +2134,7 @@ def main() -> None:
     chart_end = work["Date"].max().normalize()
     chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
     _attach_chart_peaks(work, records, chart_start, chart_end)
-    busy_rows = analyse_urgent_busy_hours(oss, records, work)
+    busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
@@ -2172,8 +2187,8 @@ def main() -> None:
                 f"{last_day_text(rec)}"
             )
     print(
-        f"URGENTBWINC_BusyHour: {len(busy_rows)} UrgentTxBWInc sites "
-        f"with DataBusyHour + UserBusyHour from {OSS_FILE}"
+        f"URGENTBWINC_BusyHour: {len(busy_rows)} OSS sites "
+        f"(independent of UrgentTxBWInc) from {OSS_FILE}"
     )
     print(f"Wrote {output}")
 
@@ -3013,7 +3028,7 @@ def _write_action_plan(
 
 
 def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dict]) -> None:
-    """UrgentTxBWInc sites with OSS DataBusyHour / UserBusyHour."""
+    """OSS DataBusyHour / UserBusyHour for every listed OSS site."""
     ws = book.add_worksheet(BUSY_SHEET)
     _page(ws, "URGENTBWINC_BusyHour — OSS data and user busy hours")
     ws.set_tab_color("#C00000")
@@ -3064,7 +3079,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         0,
         0,
         last_col,
-        "URGENTBWINC_BusyHour — most critical UrgentTxBWInc sites from OSS KPI",
+        "URGENTBWINC_BusyHour — OSS DataBusyHour / UserBusyHour choke match",
         styles["title"],
     )
     ws.set_row(1, 18)
@@ -3074,6 +3089,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         1,
         last_col,
         f"DHK transmission    ·    {period_txt}    ·    {len(busy_rows)} sites"
+        f"    ·    independent of UrgentTxBWInc"
         f"    ·    DataBusyHour and UserBusyHour scored separately from {OSS_FILE}",
         styles["subtitle"],
     )
@@ -3111,13 +3127,16 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col = 0
         ws.write_number(row, col, i + 1, styles["int_z"] if zebra else styles["int"])
         col += 1
-        ws.write_url(
-            row,
-            col,
-            f"internal:'{SNAP_SHEET}'!A{chart_row.get(rec['site'], 1)}",
-            link,
-            string=rec["site"],
-        )
+        if rec["site"] in chart_row:
+            ws.write_url(
+                row,
+                col,
+                f"internal:'{SNAP_SHEET}'!A{chart_row[rec['site']]}",
+                link,
+                string=rec["site"],
+            )
+        else:
+            ws.write_string(row, col, rec["site"], c)
         col += 1
         ws.write_string(row, col, _rec_tech(rec), c)
         col += 1
