@@ -121,6 +121,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v73 adds **Filtering(1H only)** after Tech and before Filtering(4H only), same Yes rules on the 1 BusyHour section (Hours matched % ≥ 30%; DL Throughput ≤ 7 Mbps). File: `FEGE_Choked_Flat_Sites_v73.xlsx`.
 - v74 moves **Severity** to immediately after Tech on URGENTBWINC_BusyHour and adds **Site Type** from `Physical_Site_Database_24Sep26.xlsx` after Severity (unmapped = Not found). File: `FEGE_Choked_Flat_Sites_v74.xlsx`.
 - v75 adds **4 BH Flag** and **1 BH Flag** after Site Type: Yes if any Filtering(4H only) / Filtering(1H only) column is Yes (OR). File: `FEGE_Choked_Flat_Sites_v75.xlsx`.
+- v76 revises BH Flag: Yes when (Chocked %_Data OR Chocked %_User) **and** (Data Busy Hour_TP OR User Busy Hour_TP) in that 4H or 1H section. File: `FEGE_Choked_Flat_Sites_v76.xlsx`.
 
 ## Jupyter (for local Windows use)
 

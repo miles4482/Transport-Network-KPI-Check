@@ -958,22 +958,12 @@ def _attach_window_filter_flags(rows: list[dict]) -> list[dict]:
         )
         row["data4_busy_poor"] = _poor_dl(row.get("tp_data_4h", float("nan")))
         row["user4_busy_poor"] = _poor_dl(row.get("tp_user_4h", float("nan")))
-        row["flag_4h"] = any(
-            (
-                row["data4_choke_high"],
-                row["user4_choke_high"],
-                row["data4_busy_poor"],
-                row["user4_busy_poor"],
-            )
-        )
-        row["flag_1h"] = any(
-            (
-                row["data1_choke_high"],
-                row["user1_choke_high"],
-                row["data1_busy_poor"],
-                row["user1_busy_poor"],
-            )
-        )
+        choke4 = row["data4_choke_high"] or row["user4_choke_high"]
+        tp4 = row["data4_busy_poor"] or row["user4_busy_poor"]
+        row["flag_4h"] = bool(choke4 and tp4)
+        choke1 = row["data1_choke_high"] or row["user1_choke_high"]
+        tp1 = row["data1_busy_poor"] or row["user1_busy_poor"]
+        row["flag_1h"] = bool(choke1 and tp1)
     rows.sort(key=_busy_sort_key)
     return rows
 
@@ -1800,15 +1790,15 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "4 BH Flag",
-            "Yes when any Filtering(4H only) column is Yes (Chocked %_Data, "
-            "Chocked %_User, Data Busy Hour_TP, or User Busy Hour_TP). OR of "
-            "the 4 BusyHour section only.",
+            "Filtering(4H only) only. (1) Chocked %_Data OR Chocked %_User. "
+            "(2) Data Busy Hour_TP OR User Busy Hour_TP. Yes when both (1) "
+            "and (2) are true — choked and poor throughput in the 4h window.",
         ),
         (
             "1 BH Flag",
-            "Yes when any Filtering(1H only) column is Yes (Chocked %_Data, "
-            "Chocked %_User, Data Busy Hour_TP, or User Busy Hour_TP). OR of "
-            "the 1 BusyHour section only.",
+            "Filtering(1H only) only. (1) Chocked %_Data OR Chocked %_User. "
+            "(2) Data Busy Hour_TP OR User Busy Hour_TP. Yes when both (1) "
+            "and (2) are true — choked and poor throughput in the 1h window.",
         ),
         (
             "Filtering(1H only)",
@@ -2261,7 +2251,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v75.xlsx",
+        default="FEGE_Choked_Flat_Sites_v76.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
