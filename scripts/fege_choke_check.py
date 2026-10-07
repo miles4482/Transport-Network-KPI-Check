@@ -1656,7 +1656,8 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Site Type",
-            f"Site List Site Type is copied from the Site Type column in {GEO_FILE}. "
+            f"Site List and URGENTBWINC_BusyHour Site Type are copied from the "
+            f"Site Type column in {GEO_FILE} (GF, RTT, RTP, IBS, and so on). "
             "If the site is not in that file, the cell is Not found.",
         ),
     ]
@@ -1781,7 +1782,7 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         ),
         (
             "Filtering(1H only)",
-            "The four Yes columns immediately after Tech use the 1 BusyHour "
+            "The four Yes columns after Site Type use the 1 BusyHour "
             "section only (not 7h/4h). Chocked %_Data / Chocked %_User are Yes "
             f"when that 1h Hours matched % is ≥ {OSS_CHOKE_MATCH_PCT:g}%. "
             "Data Busy Hour_TP / User Busy Hour_TP are Yes when that 1h DL "
@@ -2230,7 +2231,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v73.xlsx",
+        default="FEGE_Choked_Flat_Sites_v74.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2264,6 +2265,7 @@ def main() -> None:
         tech_summary = cache["tech_summary"]
         tech_by_site = cache["tech_by_site"]
         busy_rows = _attach_window_filter_flags(cache["busy_rows"])
+        _attach_site_type(busy_rows, geo)
     else:
         source = resolve_source(Path(args.source))
         source_name = source.name
@@ -2299,6 +2301,7 @@ def main() -> None:
         chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
         _attach_chart_peaks(work, records, chart_start, chart_end)
         busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
+        _attach_site_type(busy_rows, geo)
         REPORT_CACHE.write_bytes(
             pickle.dumps(
                 {
@@ -3292,6 +3295,8 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "No.",
         "eNodeB Name",
         "Tech",
+        "Severity",
+        "Site Type",
         "Chocked %_Data Busy Hour",
         "Chocked %_User Busy Hour",
         "Data Busy Hour_TP",
@@ -3304,7 +3309,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Chocked %_User Busy Hour",
         "Data Busy Hour",
         "User Busy Hour",
-        "Severity",
     ]
     data_day_headers = [f"DataBusyHour ({label})" for label in day_labels]
     user_day_headers = [f"UserBusyHour ({label})" for label in day_labels]
@@ -3328,7 +3332,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     day1_widths = [12] * len(days)
     match_widths = [12, 14, 16, 16, 16]
     widths = (
-        [5, 16, 10, 22, 22, 16, 16, 22, 22, 16, 16, 22, 22, 16, 16, 12]
+        [5, 16, 10, 12, 14, 22, 22, 16, 16, 22, 22, 16, 16, 22, 22, 16, 16]
         + day_widths
         + match_widths
         + day_widths
@@ -3381,14 +3385,13 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     data1_end = data1_start + len(data_day_headers) + len(match_1) - 1
     user1_start = data1_end + 1
     user1_end = user1_start + len(user_day_headers) + len(match_1) - 1
-    site_end = 2  # No. / eNodeB Name / Tech
-    filter1_start = 3
-    filter1_end = 6  # Filtering(1H only)
-    filter4_start = 7
-    filter4_end = 10  # Filtering(4H only)
-    filter_start = 11
-    filter_end = 14  # Filtering(7H/4H/1H)
-    sev_col = 15
+    site_end = 4  # No. / eNodeB Name / Tech / Severity / Site Type
+    filter1_start = 5
+    filter1_end = 8  # Filtering(1H only)
+    filter4_start = 9
+    filter4_end = 12  # Filtering(4H only)
+    filter_start = 13
+    filter_end = 16  # Filtering(7H/4H/1H)
     hdr_site = _busy_section_header(book, NAVY, "white")
     hdr_filter1 = _busy_section_header(book, "#E2D4F8", "#5B2C6F")
     hdr_filter1_col = _busy_section_header(book, "#1B4F72", "white")
@@ -3409,7 +3412,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col_fmt[col] = hdr_filter4_col
     for col in range(filter_start, filter_end + 1):
         col_fmt[col] = hdr_filter_col
-    col_fmt[sev_col] = hdr_site
     for col in range(data7_start, data7_end + 1):
         col_fmt[col] = hdr_data7
     for col in range(user7_start, user7_end + 1):
@@ -3434,7 +3436,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     _group(filter1_start, filter1_end, "Filtering(1H only)", hdr_filter1)
     _group(filter4_start, filter4_end, "Filtering(4H only)", hdr_filter4)
     _group(filter_start, filter_end, "Filtering(7H/4H/1H)", hdr_filter)
-    _group(sev_col, sev_col, "Severity", hdr_site)
     _group(data7_start, data7_end, "DataBusyHour (7 BusyHour)", hdr_data7)
     _group(user7_start, user7_end, "UserBusyHour (7 BusyHour)", hdr_user7)
     _group(data4_start, data4_end, "DataBusyHour (4 BusyHour)", hdr_data4)
@@ -3474,6 +3475,18 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col += 1
         ws.write_string(row, col, _rec_tech(rec), c)
         col += 1
+        ws.write_string(
+            row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra)
+        )
+        col += 1
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row,
+            col,
+            site_type,
+            styles["below"] if site_type == "Not found" else c,
+        )
+        col += 1
 
         def _write_flag(on: bool) -> int:
             ws.write_string(
@@ -3493,8 +3506,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col = _write_flag(bool(rec.get("user_choke_high")))
         col = _write_flag(bool(rec.get("data_busy_poor")))
         col = _write_flag(bool(rec.get("user_busy_poor")))
-        ws.write_string(row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra))
-        col += 1
 
         def _write_match_block(prefix: str, last_key: str, listed_key: str, tp_key: str) -> int:
             pos = col
