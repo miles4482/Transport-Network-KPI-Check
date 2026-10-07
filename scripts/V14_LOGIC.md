@@ -111,6 +111,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v63 splits Hours matched / % / Last day match / Listed because (and 7h DL throughput) into separate DataBusyHour and UserBusyHour blocks. File: `FEGE_Choked_Flat_Sites_v63.xlsx`.
 - v64 makes **URGENTBWINC_BusyHour** independent of UrgentTxBWInc: it scans every OSS site with DataBusyHour and UserBusyHour (any day or last day), not the 560 UrgentTxBWInc list. Hours matched is still FEGE choke among those busy hours. File: `FEGE_Choked_Flat_Sites_v64.xlsx`.
 - v65 drops **DL Throughput 09:00–15:00** from URGENTBWINC_BusyHour (7h DL throughput in each Data/User block remains). File: `FEGE_Choked_Flat_Sites_v65.xlsx`.
+- v66 drops Data Volume 7h, Data Volume 09:00–15:00, Max User 7h, and Max User 09:00–15:00 from URGENTBWINC_BusyHour, and removes the 09:00–15:00 Method rule. File: `FEGE_Choked_Flat_Sites_v66.xlsx`.
 
 ## Jupyter (for local Windows use)
 

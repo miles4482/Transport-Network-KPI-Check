@@ -92,8 +92,6 @@ ACTION_SHEET = "UrgentTxBWInc"
 BUSY_SHEET = "URGENTBWINC_BusyHour"
 OSS_FILE = "OSS KPI Hourly site  level.rar"
 OSS_BUSY_HOURS = 7
-OSS_OFFPEAK_START = 9
-OSS_OFFPEAK_END = 15  # inclusive, 09:00–15:00
 OSS_VOL_COL = "Data Volume,GB"
 OSS_USER_COL = "Max User"
 OSS_TP_N_COL = "DL User Throughput_N"
@@ -950,10 +948,6 @@ def analyse_urgent_busy_hours(
         user_choked = 0
         data_last_choked = 0
         user_last_choked = 0
-        vol_7_daily: list[float] = []
-        user_7_daily: list[float] = []
-        vol_off_daily: list[float] = []
-        user_off: list[float] = []
         n_data = d_data = n_user = d_user = 0.0
         for day in days:
             g = frame[frame["Date"] == day]
@@ -978,19 +972,12 @@ def analyse_urgent_busy_hours(
                 user_last_choked = u_choke
             if dh:
                 dsub = g[g["Hour"].isin(dh)]
-                vol_7_daily.append(float(dsub["vol"].sum()))
                 n_data += float(dsub["tp_n"].sum(skipna=True))
                 d_data += float(dsub["tp_d"].sum(skipna=True))
             if uh:
                 usub = g[g["Hour"].isin(uh)]
-                if usub["users"].notna().any():
-                    user_7_daily.append(float(usub["users"].mean()))
                 n_user += float(usub["tp_n"].sum(skipna=True))
                 d_user += float(usub["tp_d"].sum(skipna=True))
-            off = g[(g["Hour"] >= OSS_OFFPEAK_START) & (g["Hour"] <= OSS_OFFPEAK_END)]
-            if len(off):
-                vol_off_daily.append(float(off["vol"].sum(skipna=True)))
-                user_off.extend(off["users"].dropna().tolist())
         if not ((data_any and user_any) or (data_last and user_last)):
             continue
 
@@ -1030,10 +1017,6 @@ def analyse_urgent_busy_hours(
                 "user_listed": _listed(user_any, user_last),
                 "tp_data_7h": _oss_ratio(n_data, d_data),
                 "tp_user_7h": _oss_ratio(n_user, d_user),
-                "vol_7h": float(np.mean(vol_7_daily)) if vol_7_daily else float("nan"),
-                "vol_off": float(np.mean(vol_off_daily)) if vol_off_daily else float("nan"),
-                "user_7h": float(np.mean(user_7_daily)) if user_7_daily else float("nan"),
-                "user_off": float(np.mean(user_off)) if user_off else float("nan"),
             }
         )
     out.sort(
@@ -1684,12 +1667,10 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"choked / {OSS_BUSY_HOURS} on 4 Oct only.",
         ),
         (
-            "7h vs 09:00–15:00",
+            "DL Throughput 7h",
             "DL User Throughput,Mbps = DL User Throughput_N / DL User "
-            "Throughput_D. Each block has its own 7h throughput (DataBusyHour "
-            "or UserBusyHour). Data Volume 7h / Max User 7h use those same "
-            f"busy hours; Data Volume and Max User 09:00–15:00 use "
-            f"{OSS_OFFPEAK_START:02d}:00–{OSS_OFFPEAK_END:02d}:00 on the same days.",
+            "Throughput_D. Each of DataBusyHour and UserBusyHour has its own "
+            "7h throughput over those busy hours.",
         ),
     )
     for i, (key, val) in enumerate(busy_notes):
@@ -2094,7 +2075,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v65.xlsx",
+        default="FEGE_Choked_Flat_Sites_v66.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -3040,12 +3021,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Listed because",
         "DL Throughput 7h (Mbps)",
     ]
-    extra_headers = [
-        "Data Volume 7h (GB)",
-        "Data Volume 09:00–15:00 (GB)",
-        "Max User 7h",
-        "Max User 09:00–15:00",
-    ]
     id_headers = ["No.", "eNodeB Name", "Tech", "Severity"]
     data_day_headers = [f"DataBusyHour ({label})" for label in day_labels]
     user_day_headers = [f"UserBusyHour ({label})" for label in day_labels]
@@ -3055,7 +3030,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         + match_headers
         + user_day_headers
         + match_headers
-        + extra_headers
     )
     last_col = len(headers) - 1
     widths = (
@@ -3064,7 +3038,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         + [12, 14, 16, 16, 16]
         + [28] * len(days)
         + [12, 14, 16, 16, 16]
-        + [16, 18, 12, 16]
     )
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
@@ -3169,13 +3142,6 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
             ws.write_string(row, col, rec["user_hours"].get(day, ""), c)
             col += 1
         col = _write_match_block("user", "user_last_match", "user_listed", "tp_user_7h")
-        _num(row, col, rec["vol_7h"], n)
-        col += 1
-        _num(row, col, rec["vol_off"], n)
-        col += 1
-        _num(row, col, rec["user_7h"], n)
-        col += 1
-        _num(row, col, rec["user_off"], n)
 
     last = header_row + max(len(busy_rows), 1)
     ws.autofilter(header_row, 0, last, last_col)
