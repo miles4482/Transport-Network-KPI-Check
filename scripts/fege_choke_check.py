@@ -94,6 +94,7 @@ OSS_FILE = "OSS KPI Hourly site  level.rar"
 OSS_BUSY_HOURS = 7
 OSS_BUSY_HOURS_4 = 4
 OSS_BUSY_HOURS_1 = 1
+OSS_POOR_TP_MBPS = 7.0
 OSS_VOL_COL = "Data Volume,GB"
 OSS_USER_COL = "Max User"
 OSS_TP_N_COL = "DL User Throughput_N"
@@ -892,6 +893,11 @@ def _oss_ratio(num: float, den: float) -> float:
     return float(num / den)
 
 
+def _poor_dl(*values: float) -> bool:
+    """True when any finite DL throughput is ≤ OSS_POOR_TP_MBPS."""
+    return any(np.isfinite(v) and float(v) <= OSS_POOR_TP_MBPS for v in values)
+
+
 def _fege_oncap_lookup(work: pd.DataFrame) -> dict[tuple[str, pd.Timestamp, int], bool]:
     """(site, date, hour) → FEGE OnCap for the 2–4 Oct window."""
     lookup: dict[tuple[str, pd.Timestamp, int], bool] = {}
@@ -1028,10 +1034,14 @@ def analyse_urgent_busy_hours(
                 **_block_fields("user4", u4, "tp_user_4h"),
                 **_block_fields("data1", d1, "tp_data_1h"),
                 **_block_fields("user1", u1, "tp_user_1h"),
+                "data_busy_poor": _poor_dl(d7["tp"], d4["tp"], d1["tp"]),
+                "user_busy_poor": _poor_dl(u7["tp"], u4["tp"], u1["tp"]),
             }
         )
     out.sort(
         key=lambda row: (
+            0 if row.get("data_busy_poor") else 1,
+            0 if row.get("user_busy_poor") else 1,
             -row["data_hours_matched_pct"],
             -row["user_hours_matched_pct"],
             -row["data4_hours_matched_pct"],
@@ -1713,6 +1723,18 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "DL User Throughput,Mbps = DL User Throughput_N / DL User "
             "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
         ),
+        (
+            "Data Busy Hour",
+            f"Yes when any DataBusyHour DL Throughput (7h OR 4h OR 1h) is "
+            f"≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter this column for worst "
+            "data-busy throughput sites.",
+        ),
+        (
+            "User Busy Hour",
+            f"Yes when any UserBusyHour DL Throughput (7h OR 4h OR 1h) is "
+            f"≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter this column for worst "
+            "user-busy throughput sites.",
+        ),
     )
     for i, (key, val) in enumerate(busy_notes):
         r = busy_head + 1 + i
@@ -2116,7 +2138,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v68.xlsx",
+        default="FEGE_Choked_Flat_Sites_v69.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2208,7 +2230,9 @@ def main() -> None:
             )
     print(
         f"URGENTBWINC_BusyHour: {len(busy_rows)} OSS sites "
-        f"(independent of UrgentTxBWInc) from {OSS_FILE}"
+        f"(independent of UrgentTxBWInc) from {OSS_FILE}; "
+        f"Data Busy Hour Yes: {sum(1 for r in busy_rows if r.get('data_busy_poor'))}; "
+        f"User Busy Hour Yes: {sum(1 for r in busy_rows if r.get('user_busy_poor'))}"
     )
     print(f"Wrote {output}")
 
@@ -3076,7 +3100,14 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Listed because",
         "DL Throughput 1h (Mbps)",
     ]
-    id_headers = ["No.", "eNodeB Name", "Tech", "Severity"]
+    id_headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Data Busy Hour",
+        "User Busy Hour",
+        "Severity",
+    ]
     data_day_headers = [f"DataBusyHour ({label})" for label in day_labels]
     user_day_headers = [f"UserBusyHour ({label})" for label in day_labels]
     headers = (
@@ -3099,7 +3130,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     day1_widths = [12] * len(days)
     match_widths = [12, 14, 16, 16, 16]
     widths = (
-        [5, 16, 10, 12]
+        [5, 16, 10, 16, 16, 12]
         + day_widths
         + match_widths
         + day_widths
@@ -3211,6 +3242,16 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
             ws.write_string(row, col, rec["site"], c)
         col += 1
         ws.write_string(row, col, _rec_tech(rec), c)
+        col += 1
+        data_poor = bool(rec.get("data_busy_poor"))
+        ws.write_string(
+            row, col, "Yes" if data_poor else "", styles["yes"] if data_poor else c
+        )
+        col += 1
+        user_poor = bool(rec.get("user_busy_poor"))
+        ws.write_string(
+            row, col, "Yes" if user_poor else "", styles["yes"] if user_poor else c
+        )
         col += 1
         ws.write_string(row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra))
         col += 1

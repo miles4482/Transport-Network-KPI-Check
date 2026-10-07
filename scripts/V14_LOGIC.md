@@ -114,6 +114,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v66 drops Data Volume 7h, Data Volume 09:00–15:00, Max User 7h, and Max User 09:00–15:00 from URGENTBWINC_BusyHour, and removes the 09:00–15:00 Method rule. File: `FEGE_Choked_Flat_Sites_v66.xlsx`.
 - v67 keeps 7 BusyHour and adds matching **4 BusyHour** Data/User blocks (top 4 hours, Hours matched /12, last day choked / 4, DL Throughput 4h). File: `FEGE_Choked_Flat_Sites_v67.xlsx`.
 - v68 adds matching **1 BusyHour** Data/User blocks to the right of 4 BusyHour (single highest hour, Hours matched /3, last day choked / 1, DL Throughput 1h). File: `FEGE_Choked_Flat_Sites_v68.xlsx`.
+- v69 adds **Data Busy Hour** and **User Busy Hour** flag columns after Tech: Yes when any of that section’s 7h/4h/1h DL Throughput is ≤ 7 Mbps (OR). File: `FEGE_Choked_Flat_Sites_v69.xlsx`.
 
 ## Jupyter (for local Windows use)
 
