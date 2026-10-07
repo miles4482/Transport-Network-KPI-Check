@@ -95,6 +95,7 @@ OSS_BUSY_HOURS = 7
 OSS_BUSY_HOURS_4 = 4
 OSS_BUSY_HOURS_1 = 1
 OSS_POOR_TP_MBPS = 7.0
+OSS_CHOKE_MATCH_PCT = 30.0
 OSS_VOL_COL = "Data Volume,GB"
 OSS_USER_COL = "Max User"
 OSS_TP_N_COL = "DL User Throughput_N"
@@ -898,6 +899,11 @@ def _poor_dl(*values: float) -> bool:
     return any(np.isfinite(v) and float(v) <= OSS_POOR_TP_MBPS for v in values)
 
 
+def _high_choke(*pcts: float) -> bool:
+    """True when any Hours matched % is ≥ OSS_CHOKE_MATCH_PCT."""
+    return any(np.isfinite(v) and float(v) >= OSS_CHOKE_MATCH_PCT for v in pcts)
+
+
 def _fege_oncap_lookup(work: pd.DataFrame) -> dict[tuple[str, pd.Timestamp, int], bool]:
     """(site, date, hour) → FEGE OnCap for the 2–4 Oct window."""
     lookup: dict[tuple[str, pd.Timestamp, int], bool] = {}
@@ -1036,10 +1042,18 @@ def analyse_urgent_busy_hours(
                 **_block_fields("user1", u1, "tp_user_1h"),
                 "data_busy_poor": _poor_dl(d7["tp"], d4["tp"], d1["tp"]),
                 "user_busy_poor": _poor_dl(u7["tp"], u4["tp"], u1["tp"]),
+                "data_choke_high": _high_choke(
+                    d7["matched_pct"], d4["matched_pct"], d1["matched_pct"]
+                ),
+                "user_choke_high": _high_choke(
+                    u7["matched_pct"], u4["matched_pct"], u1["matched_pct"]
+                ),
             }
         )
     out.sort(
         key=lambda row: (
+            0 if row.get("data_choke_high") else 1,
+            0 if row.get("user_choke_high") else 1,
             0 if row.get("data_busy_poor") else 1,
             0 if row.get("user_busy_poor") else 1,
             -row["data_hours_matched_pct"],
@@ -1724,6 +1738,18 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
         ),
         (
+            "Chocked %_Data Busy Hour",
+            f"Yes when any DataBusyHour Hours matched % (7h OR 4h OR 1h) is "
+            f"≥ {OSS_CHOKE_MATCH_PCT:g}%. Filter together with Data Busy Hour "
+            "to find poor throughput sites that are also FEGE-choked.",
+        ),
+        (
+            "Chocked %_User Busy Hour",
+            f"Yes when any UserBusyHour Hours matched % (7h OR 4h OR 1h) is "
+            f"≥ {OSS_CHOKE_MATCH_PCT:g}%. Filter together with User Busy Hour "
+            "to find poor throughput sites that are also FEGE-choked.",
+        ),
+        (
             "Data Busy Hour",
             f"Yes when any DataBusyHour DL Throughput (7h OR 4h OR 1h) is "
             f"≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter this column for worst "
@@ -2138,7 +2164,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v69.xlsx",
+        default="FEGE_Choked_Flat_Sites_v70.xlsx",
         help="Report workbook to write",
     )
     args = parser.parse_args()
@@ -2232,7 +2258,9 @@ def main() -> None:
         f"URGENTBWINC_BusyHour: {len(busy_rows)} OSS sites "
         f"(independent of UrgentTxBWInc) from {OSS_FILE}; "
         f"Data Busy Hour Yes: {sum(1 for r in busy_rows if r.get('data_busy_poor'))}; "
-        f"User Busy Hour Yes: {sum(1 for r in busy_rows if r.get('user_busy_poor'))}"
+        f"User Busy Hour Yes: {sum(1 for r in busy_rows if r.get('user_busy_poor'))}; "
+        f"Chocked %_Data Yes: {sum(1 for r in busy_rows if r.get('data_choke_high'))}; "
+        f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user_choke_high'))}"
     )
     print(f"Wrote {output}")
 
@@ -3104,6 +3132,8 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "No.",
         "eNodeB Name",
         "Tech",
+        "Chocked %_Data Busy Hour",
+        "Chocked %_User Busy Hour",
         "Data Busy Hour",
         "User Busy Hour",
         "Severity",
@@ -3130,7 +3160,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     day1_widths = [12] * len(days)
     match_widths = [12, 14, 16, 16, 16]
     widths = (
-        [5, 16, 10, 16, 16, 12]
+        [5, 16, 10, 22, 22, 16, 16, 12]
         + day_widths
         + match_widths
         + day_widths
@@ -3242,6 +3272,16 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
             ws.write_string(row, col, rec["site"], c)
         col += 1
         ws.write_string(row, col, _rec_tech(rec), c)
+        col += 1
+        data_choke = bool(rec.get("data_choke_high"))
+        ws.write_string(
+            row, col, "Yes" if data_choke else "", styles["yes"] if data_choke else c
+        )
+        col += 1
+        user_choke = bool(rec.get("user_choke_high"))
+        ws.write_string(
+            row, col, "Yes" if user_choke else "", styles["yes"] if user_choke else c
+        )
         col += 1
         data_poor = bool(rec.get("data_busy_poor"))
         ws.write_string(
