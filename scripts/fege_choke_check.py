@@ -111,6 +111,15 @@ OSS_TP_N_COL = "DL User Throughput_N"
 OSS_TP_D_COL = "DL User Throughput_D"
 OSS_PRB_N_COL = "DL PRB Utilization_N"
 OSS_PRB_D_COL = "DL PRB Utilization_D"
+# Cell-level OSS (pending upload): Layer = MID(Cell Name, 8, 3).
+# L09 = L900 coverage (drop). L21 = L2100, L26 = L2600, else = L1800 capacity (keep).
+OSS_CELL_COL = "Cell Name"
+OSS_LAYER_START = 7  # Excel MID is 1-based start 8
+OSS_LAYER_LEN = 3
+OSS_BAND_COVERAGE = "L900"
+OSS_BAND_L21 = "L2100"
+OSS_BAND_L26 = "L2600"
+OSS_BAND_CAPACITY_DEFAULT = "L1800"
 GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
@@ -971,6 +980,29 @@ def resolve_oss(path: Path) -> Path:
             raise SystemExit(f"No CSV extracted from {path.name}")
         return csvs[0]
     return path
+
+
+def oss_cell_layer_token(cell_name: str) -> str:
+    """Excel MID(Cell Name, 8, 3): L09 / L21 / L26 / LA."""
+    name = str(cell_name or "").strip().upper()
+    return name[OSS_LAYER_START : OSS_LAYER_START + OSS_LAYER_LEN]
+
+
+def oss_cell_band(cell_name: str) -> str:
+    """Map Cell Name layer token to L900 / L1800 / L2100 / L2600."""
+    token = oss_cell_layer_token(cell_name)
+    if token.startswith("L09"):
+        return OSS_BAND_COVERAGE
+    if token.startswith("L21"):
+        return OSS_BAND_L21
+    if token.startswith("L26"):
+        return OSS_BAND_L26
+    return OSS_BAND_CAPACITY_DEFAULT
+
+
+def oss_cell_is_capacity(cell_name: str) -> bool:
+    """Keep L1800 / L2100 / L2600. Drop L900 coverage."""
+    return oss_cell_band(cell_name) != OSS_BAND_COVERAGE
 
 
 def load_oss_kpi(path: Path) -> pd.DataFrame:
