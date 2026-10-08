@@ -901,6 +901,12 @@ def _oss_ratio(num: float, den: float) -> float:
     return float(num / den)
 
 
+def _nanmean(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size else float("nan")
+
+
 def _poor_dl(*values: float) -> bool:
     """True when any finite DL throughput is ≤ OSS_POOR_TP_MBPS."""
     return any(np.isfinite(v) and float(v) <= OSS_POOR_TP_MBPS for v in values)
@@ -1006,11 +1012,13 @@ def _score_oss_busy(
     value_col: str,
     n: int,
 ) -> dict:
-    """Top-n busy hours, FEGE choke overlap, and n-hour DL throughput."""
+    """Top-n busy hours, FEGE choke overlap, n-hour DL tp, avg volume/users."""
     txt: dict[pd.Timestamp, str] = {}
     any_day = last_ok = False
     choked = last_choked = 0
     n_tp = d_tp = 0.0
+    vols: list[float] = []
+    users: list[float] = []
     for day in days:
         g = frame[frame["Date"] == day]
         hours = _top_n_hours(g, value_col, n)
@@ -1027,6 +1035,8 @@ def _score_oss_busy(
             sub = g[g["Hour"].isin(hours)]
             n_tp += float(sub["tp_n"].sum(skipna=True))
             d_tp += float(sub["tp_d"].sum(skipna=True))
+            vols.extend(sub["vol"].tolist())
+            users.extend(sub["users"].tolist())
     window = n * len(days)
     return {
         "hours": txt,
@@ -1038,10 +1048,12 @@ def _score_oss_busy(
         "last_text": f"{last_choked}h choked / {n}" if last_ok else "—",
         "listed": _listed_because(any_day, last_ok),
         "tp": _oss_ratio(n_tp, d_tp),
+        "avg_vol": _nanmean(vols),
+        "avg_users": _nanmean(users),
     }
 
 
-def _block_fields(prefix: str, scored: dict, tp_key: str) -> dict:
+def _block_fields(prefix: str, scored: dict, tp_key: str, vol_key: str, user_key: str) -> dict:
     return {
         f"{prefix}_hours": scored["hours"],
         f"{prefix}_hours_matched": scored["matched"],
@@ -1051,6 +1063,8 @@ def _block_fields(prefix: str, scored: dict, tp_key: str) -> dict:
         f"{prefix}_last_match_text": scored["last_text"],
         f"{prefix}_listed": scored["listed"],
         tp_key: scored["tp"],
+        vol_key: scored["avg_vol"],
+        user_key: scored["avg_users"],
     }
 
 
@@ -1098,12 +1112,12 @@ def analyse_urgent_busy_hours(
             {
                 **rec,
                 "busy_days": days,
-                **_block_fields("data", d7, "tp_data_7h"),
-                **_block_fields("user", u7, "tp_user_7h"),
-                **_block_fields("data4", d4, "tp_data_4h"),
-                **_block_fields("user4", u4, "tp_user_4h"),
-                **_block_fields("data1", d1, "tp_data_1h"),
-                **_block_fields("user1", u1, "tp_user_1h"),
+                **_block_fields("data", d7, "tp_data_7h", "vol_data_7h", "users_data_7h"),
+                **_block_fields("user", u7, "tp_user_7h", "vol_user_7h", "users_user_7h"),
+                **_block_fields("data4", d4, "tp_data_4h", "vol_data_4h", "users_data_4h"),
+                **_block_fields("user4", u4, "tp_user_4h", "vol_user_4h", "users_user_4h"),
+                **_block_fields("data1", d1, "tp_data_1h", "vol_data_1h", "users_data_1h"),
+                **_block_fields("user1", u1, "tp_user_1h", "vol_user_1h", "users_user_1h"),
                 "data_busy_poor": _poor_dl(d7["tp"], d4["tp"], d1["tp"]),
                 "user_busy_poor": _poor_dl(u7["tp"], u4["tp"], u1["tp"]),
                 "data_choke_high": _high_choke(
@@ -1789,6 +1803,12 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
         ),
         (
+            "Data Volume / Max User 7h / 4h / 1h",
+            "Average Data Volume,GB and average Max User over that block’s own "
+            "busy hours (7 × 3, 4 × 3, or 1 × 3). DataBusyHour uses top volume "
+            "hours; UserBusyHour uses top Max User hours. Not added to BH Flag.",
+        ),
+        (
             "4 BH Flag",
             "Filtering(4H only) only. (1) Chocked %_Data OR Chocked %_User. "
             "(2) Data Busy Hour_TP OR User Busy Hour_TP. Yes when both (1) "
@@ -2240,6 +2260,49 @@ def _write_geoplot(
 BLOCK_ROWS = 32
 
 
+def _dump_report_cache(
+    source_name: str,
+    work: pd.DataFrame,
+    records: list[dict],
+    geo,
+    tech_summary,
+    tech_by_site,
+    busy_rows: list[dict],
+) -> None:
+    REPORT_CACHE.write_bytes(
+        pickle.dumps(
+            {
+                "source_name": source_name,
+                "work": work,
+                "records": records,
+                "geo": geo,
+                "tech_summary": tech_summary,
+                "tech_by_site": tech_by_site,
+                "busy_rows": busy_rows,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )
+    print(f"Saved analysis cache {REPORT_CACHE}")
+
+
+def _refresh_busy_rows(
+    records: list[dict],
+    work: pd.DataFrame,
+    geo,
+    tech_by_site: dict[str, str],
+    source: Path | None = None,
+) -> list[dict]:
+    oss_path = _find_input(OSS_FILE, source)
+    if oss_path is None:
+        raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
+    print("Scoring OSS BusyHour Data Volume / Max User averages...")
+    oss = load_oss_kpi(resolve_oss(oss_path))
+    busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
+    _attach_site_type(busy_rows, geo)
+    return busy_rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2251,7 +2314,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v76.xlsx",
+        default="FEGE_Choked_Flat_Sites_v77.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2284,8 +2347,15 @@ def main() -> None:
         geo = cache["geo"]
         tech_summary = cache["tech_summary"]
         tech_by_site = cache["tech_by_site"]
-        busy_rows = _attach_window_filter_flags(cache["busy_rows"])
-        _attach_site_type(busy_rows, geo)
+        busy_rows = cache["busy_rows"]
+        if not busy_rows or "vol_data_7h" not in busy_rows[0]:
+            busy_rows = _refresh_busy_rows(records, work, geo, tech_by_site)
+            _dump_report_cache(
+                source_name, work, records, geo, tech_summary, tech_by_site, busy_rows
+            )
+        else:
+            busy_rows = _attach_window_filter_flags(busy_rows)
+            _attach_site_type(busy_rows, geo)
     else:
         source = resolve_source(Path(args.source))
         source_name = source.name
@@ -2313,30 +2383,13 @@ def main() -> None:
         _attach_tech(records, tech_by_site)
         tech_summary = summarise_tech(records, tech_by_site, checked_sites)
 
-        oss_path = _find_input(OSS_FILE, source)
-        if oss_path is None:
-            raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
-        oss = load_oss_kpi(resolve_oss(oss_path))
         chart_end = work["Date"].max().normalize()
         chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
         _attach_chart_peaks(work, records, chart_start, chart_end)
-        busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
-        _attach_site_type(busy_rows, geo)
-        REPORT_CACHE.write_bytes(
-            pickle.dumps(
-                {
-                    "source_name": source_name,
-                    "work": work,
-                    "records": records,
-                    "geo": geo,
-                    "tech_summary": tech_summary,
-                    "tech_by_site": tech_by_site,
-                    "busy_rows": busy_rows,
-                },
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
+        busy_rows = _refresh_busy_rows(records, work, geo, tech_by_site, source)
+        _dump_report_cache(
+            source_name, work, records, geo, tech_summary, tech_by_site, busy_rows
         )
-        print(f"Saved analysis cache {REPORT_CACHE}")
 
     # Snapshots are laid out at a fixed stride so the site-list links can be
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
@@ -3298,6 +3351,8 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Last day match",
         "Listed because",
         "DL Throughput 7h (Mbps)",
+        "Data Volume 7h (GB)",
+        "Max User 7h",
     ]
     match_4 = [
         "Hours matched",
@@ -3305,6 +3360,8 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Last day match",
         "Listed because",
         "DL Throughput 4h (Mbps)",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
     ]
     match_1 = [
         "Hours matched",
@@ -3312,6 +3369,8 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Last day match",
         "Listed because",
         "DL Throughput 1h (Mbps)",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
     ]
     id_headers = [
         "No.",
@@ -3354,7 +3413,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     last_col = len(headers) - 1
     day_widths = [22] * len(days)
     day1_widths = [12] * len(days)
-    match_widths = [12, 14, 16, 16, 16]
+    match_widths = [12, 14, 16, 16, 16, 16, 12]
     widths = (
         [5, 16, 10, 12, 14, 12, 12, 22, 22, 16, 16, 22, 22, 16, 16, 22, 22, 16, 16]
         + day_widths
@@ -3541,7 +3600,14 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         col = _write_flag(bool(rec.get("data_busy_poor")))
         col = _write_flag(bool(rec.get("user_busy_poor")))
 
-        def _write_match_block(prefix: str, last_key: str, listed_key: str, tp_key: str) -> int:
+        def _write_match_block(
+            prefix: str,
+            last_key: str,
+            listed_key: str,
+            tp_key: str,
+            vol_key: str,
+            user_key: str,
+        ) -> int:
             pos = col
             window_n = rec.get(
                 f"{prefix}_hours_matched_n", OSS_BUSY_HOURS * ANALYSIS_DAYS
@@ -3562,32 +3628,48 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
             ws.write_string(row, pos, rec[listed_key], c)
             pos += 1
             _num(row, pos, rec[tp_key], n)
+            pos += 1
+            _num(row, pos, rec.get(vol_key), n)
+            pos += 1
+            _num(row, pos, rec.get(user_key), n)
             return pos + 1
 
         for day in days:
             ws.write_string(row, col, rec["data_hours"].get(day, ""), c)
             col += 1
-        col = _write_match_block("data", "data_last_match", "data_listed", "tp_data_7h")
+        col = _write_match_block(
+            "data", "data_last_match", "data_listed", "tp_data_7h", "vol_data_7h", "users_data_7h"
+        )
         for day in days:
             ws.write_string(row, col, rec["user_hours"].get(day, ""), c)
             col += 1
-        col = _write_match_block("user", "user_last_match", "user_listed", "tp_user_7h")
+        col = _write_match_block(
+            "user", "user_last_match", "user_listed", "tp_user_7h", "vol_user_7h", "users_user_7h"
+        )
         for day in days:
             ws.write_string(row, col, rec["data4_hours"].get(day, ""), c)
             col += 1
-        col = _write_match_block("data4", "data4_last_match", "data4_listed", "tp_data_4h")
+        col = _write_match_block(
+            "data4", "data4_last_match", "data4_listed", "tp_data_4h", "vol_data_4h", "users_data_4h"
+        )
         for day in days:
             ws.write_string(row, col, rec["user4_hours"].get(day, ""), c)
             col += 1
-        col = _write_match_block("user4", "user4_last_match", "user4_listed", "tp_user_4h")
+        col = _write_match_block(
+            "user4", "user4_last_match", "user4_listed", "tp_user_4h", "vol_user_4h", "users_user_4h"
+        )
         for day in days:
             ws.write_string(row, col, rec["data1_hours"].get(day, ""), c)
             col += 1
-        col = _write_match_block("data1", "data1_last_match", "data1_listed", "tp_data_1h")
+        col = _write_match_block(
+            "data1", "data1_last_match", "data1_listed", "tp_data_1h", "vol_data_1h", "users_data_1h"
+        )
         for day in days:
             ws.write_string(row, col, rec["user1_hours"].get(day, ""), c)
             col += 1
-        col = _write_match_block("user1", "user1_last_match", "user1_listed", "tp_user_1h")
+        col = _write_match_block(
+            "user1", "user1_last_match", "user1_listed", "tp_user_1h", "vol_user_1h", "users_user_1h"
+        )
 
     last = header_row + max(len(busy_rows), 1)
     ws.autofilter(header_row, 0, last, last_col)

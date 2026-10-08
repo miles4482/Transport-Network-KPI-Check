@@ -122,6 +122,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v74 moves **Severity** to immediately after Tech on URGENTBWINC_BusyHour and adds **Site Type** from `Physical_Site_Database_24Sep26.xlsx` after Severity (unmapped = Not found). File: `FEGE_Choked_Flat_Sites_v74.xlsx`.
 - v75 adds **4 BH Flag** and **1 BH Flag** after Site Type: Yes if any Filtering(4H only) / Filtering(1H only) column is Yes (OR). File: `FEGE_Choked_Flat_Sites_v75.xlsx`.
 - v76 revises BH Flag: Yes when (Chocked %_Data OR Chocked %_User) **and** (Data Busy Hour_TP OR User Busy Hour_TP) in that 4H or 1H section. File: `FEGE_Choked_Flat_Sites_v76.xlsx`.
+- v77 adds **Data Volume Nh (GB)** and **Max User Nh** to every 7H / 4H / 1H Data and User block (average over that block’s own busy hours). Not added to BH Flag. File: `FEGE_Choked_Flat_Sites_v77.xlsx`.
 
 ## Jupyter (for local Windows use)
 
