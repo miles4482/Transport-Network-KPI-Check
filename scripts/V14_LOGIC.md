@@ -129,7 +129,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v81 Comparison uses **RxMaxSpeed only** (Tx Total BW columns removed). File: `FEGE_Choked_Flat_Sites_v81.xlsx`.
 - v82 adds **DLPRBUtilization,%** to every 7H / 4H / 1H DataBusyHour and UserBusyHour block: `(DL PRB Utilization_N / DL PRB Utilization_D) × 100` over that block’s own busy hours. Not added to BH Flag. File: `FEGE_Choked_Flat_Sites_v82.xlsx`.
 - v83 copies DataBusyHour / UserBusyHour **4H and 1H** DL Throughput, DLPRBUtilization,%, Data Volume, and Max User onto **1. Site List**, as a separate block immediately after Site Type. File: `FEGE_Choked_Flat_Sites_v83.xlsx`.
-- Pending cell-level OSS: site-level file mixes coverage+capacity. After cell-level hourly upload: (1) Layer = `MID(Cell Name, 8, 3)` — **L09 → L900 coverage (exclude)**; **L21 → L2100**, **L26 → L2600**, **else (e.g. LA) → L1800 capacity (keep)**. (2) Cell → site-hour: **Sum** Data Volume,GB, DL User Throughput_N/D, Mean User, Max User, DL PRB Utilization_N/D; **Avg** DL PRB Utilization (main); **Avg** DL User Throughput,Mbps is optional and unused (BusyHour still uses N/D). Then score BusyHour on that capacity-only site file.
+- Pending cell-level OSS: after upload, drop L900 (`MID(Cell Name,8,3)=L09`), keep L1800/L2100/L2600, then one site-hour row **like previous OSS KPI Hourly site level**. **Skip** Cell TDD Indication, Cell Name, LocalCell Id, eNodeB Function Name, Integrity. **Sum** Data Volume,GB, Throughput N/D, Mean User, Max User, PRB N/D. **Average** DL User Throughput,Mbps and DL PRB Utilization. Keep original KPI column names (not “Sum of …”). BusyHour still uses N/D.
 
 ## Jupyter (for local Windows use)
 

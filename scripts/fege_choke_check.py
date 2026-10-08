@@ -123,8 +123,16 @@ OSS_BAND_CAPACITY_DEFAULT = "L1800"
 OSS_MEAN_USER_COL = "Mean User"
 OSS_TP_MBPS_COL = "DL User Throughput,Mbps"
 OSS_PRB_PCT_COL = "DL PRB Utilization"
-# Cell → site (capacity cells only). Sum counters; avg already-computed %.
-# Throughput Mbps is optional — BusyHour still uses N/D, not that column.
+# Cell → site-hour, same columns as previous "OSS KPI Hourly site  level" file.
+# Drop cell-only fields (Cell TDD Indication, Cell Name, LocalCell Id,
+# eNodeB Function Name, Integrity). Keep original KPI names, not "Sum of …".
+OSS_CELL_SKIP_COLS = (
+    "Cell TDD Indication",
+    OSS_CELL_COL,
+    "LocalCell Id",
+    "eNodeB Function Name",
+    "Integrity",
+)
 OSS_CELL_SUM_COLS = (
     OSS_VOL_COL,
     OSS_TP_N_COL,
@@ -134,8 +142,21 @@ OSS_CELL_SUM_COLS = (
     OSS_PRB_N_COL,
     OSS_PRB_D_COL,
 )
-OSS_CELL_AVG_COLS = (OSS_PRB_PCT_COL,)
-OSS_CELL_AVG_OPTIONAL_COLS = (OSS_TP_MBPS_COL,)
+OSS_CELL_AVG_COLS = (OSS_TP_MBPS_COL, OSS_PRB_PCT_COL)
+OSS_SITE_OUT_COLS = (
+    "Date",
+    "Time",
+    "eNodeB Name",
+    OSS_VOL_COL,
+    OSS_TP_N_COL,
+    OSS_TP_D_COL,
+    OSS_MEAN_USER_COL,
+    OSS_USER_COL,
+    OSS_PRB_N_COL,
+    OSS_PRB_D_COL,
+    OSS_TP_MBPS_COL,
+    OSS_PRB_PCT_COL,
+)
 GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
@@ -1022,11 +1043,12 @@ def oss_cell_is_capacity(cell_name: str) -> bool:
 
 
 def aggregate_capacity_cells_to_site(cell_df: pd.DataFrame) -> pd.DataFrame:
-    """Drop L900 cells, then one row per site-hour.
+    """Capacity cells only → one row per site-hour, like the previous OSS site file.
 
-    Sum: Data Volume, Throughput N/D, Mean User, Max User, PRB N/D.
-    Avg (main): DL PRB Utilization. Avg (optional, skipped): Throughput Mbps.
-    BusyHour DL Throughput / DLPRBUtilization,% still use N/D after this rollup.
+    Skip: Cell TDD Indication, Cell Name, LocalCell Id, eNodeB Function Name,
+    Integrity. Sum volume / N / D / Mean User / Max User / PRB N/D.
+    Average DL User Throughput,Mbps and DL PRB Utilization.
+    BusyHour still scores Throughput and DLPRBUtilization,% from N/D.
     """
     work = cell_df.copy()
     if OSS_CELL_COL not in work.columns:
@@ -1046,12 +1068,22 @@ def aggregate_capacity_cells_to_site(cell_df: pd.DataFrame) -> pd.DataFrame:
             agg[col] = "mean"
     if not agg:
         raise SystemExit("Cell-level OSS has none of the expected KPI columns")
-    return work.groupby(keys, as_index=False, sort=False).agg(agg)
+    out = work.groupby(keys, as_index=False, sort=False).agg(agg)
+    ordered = [c for c in OSS_SITE_OUT_COLS if c in out.columns]
+    return out[ordered]
+
+
+def load_oss_table(path: Path) -> pd.DataFrame:
+    """Read CSV/xlsx; if Cell Name is present, roll capacity cells up to site-hour."""
+    raw = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    if OSS_CELL_COL in raw.columns:
+        raw = aggregate_capacity_cells_to_site(raw)
+    return raw
 
 
 def load_oss_kpi(path: Path) -> pd.DataFrame:
     """Hourly OSS radio KPI for the analysis window. Throughput is N/D, not the file’s Mbps column."""
-    raw = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    raw = load_oss_table(path)
     need = {
         "Date",
         "Time",
