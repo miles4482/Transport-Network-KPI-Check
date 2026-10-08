@@ -98,7 +98,9 @@ REPORT_TITLE = "Transmission Link Health Review"
 SNAP_SHEET = "2. HourlyChartOfIssueSites"
 ACTION_SHEET = "UrgentTxBWInc"
 BUSY_SHEET = "URGENTBWINC_BusyHour"
-OSS_FILE = "OSS KPI Hourly site  level.rar"
+OSS_FILE = "OSS KPI Hourly site  level_capacity.csv"
+OSS_CELL_PART1_GLOB = "OSS KPI Hourly Cel Level_*.part1.rar"
+OSS_CELL_COMBINED = Path("/tmp/oss_cell_combined.csv")
 OSS_BUSY_HOURS = 7
 OSS_BUSY_HOURS_4 = 4
 OSS_BUSY_HOURS_1 = 1
@@ -203,6 +205,8 @@ def parse_kpi_date(series: pd.Series) -> pd.Series:
     if numeric.notna().all():
         return excel_serial_to_datetime(numeric)
     parsed = pd.to_datetime(text + f"-{KPI_YEAR}", format="%d-%b-%Y", errors="coerce")
+    if parsed.isna().any():
+        parsed = parsed.fillna(pd.to_datetime(text, format="%d-%m-%y", errors="coerce"))
     if parsed.isna().any():
         parsed = parsed.fillna(pd.to_datetime(text, errors="coerce", dayfirst=True))
     if parsed.isna().any():
@@ -1042,18 +1046,28 @@ def oss_cell_is_capacity(cell_name: str) -> bool:
     return oss_cell_band(cell_name) != OSS_BAND_COVERAGE
 
 
+def _capacity_mask(names: pd.Series) -> pd.Series:
+    """True for L1800 / L2100 / L2600. False for L900 (MID 8,3 = L09)."""
+    token = (
+        names.astype(str)
+        .str.strip()
+        .str.upper()
+        .str.slice(OSS_LAYER_START, OSS_LAYER_START + OSS_LAYER_LEN)
+    )
+    return ~token.str.startswith("L09", na=False)
+
+
 def aggregate_capacity_cells_to_site(cell_df: pd.DataFrame) -> pd.DataFrame:
     """Capacity cells only → one row per site-hour, like the previous OSS site file.
 
-    Skip: Cell TDD Indication, Cell Name, LocalCell Id, eNodeB Function Name,
-    Integrity. Sum volume / N / D / Mean User / Max User / PRB N/D.
-    Average DL User Throughput,Mbps and DL PRB Utilization.
+    Skip: Cell TDD Indication / Cell FDD TDD Indication, Cell Name, LocalCell Id,
+    eNodeB Function Name, Integrity. Sum volume / N / D / Mean User / Max User /
+    PRB N/D. Average DL User Throughput,Mbps and DL PRB Utilization.
     BusyHour still scores Throughput and DLPRBUtilization,% from N/D.
     """
-    work = cell_df.copy()
-    if OSS_CELL_COL not in work.columns:
+    if OSS_CELL_COL not in cell_df.columns:
         raise SystemExit(f"Cell-level OSS missing column: {OSS_CELL_COL}")
-    work = work[work[OSS_CELL_COL].map(oss_cell_is_capacity)].copy()
+    work = cell_df.loc[_capacity_mask(cell_df[OSS_CELL_COL])].copy()
     keys = [c for c in ("Date", "Time", "eNodeB Name") if c in work.columns]
     if len(keys) < 3:
         raise SystemExit("Cell-level OSS needs Date, Time, and eNodeB Name")
@@ -1071,6 +1085,72 @@ def aggregate_capacity_cells_to_site(cell_df: pd.DataFrame) -> pd.DataFrame:
     out = work.groupby(keys, as_index=False, sort=False).agg(agg)
     ordered = [c for c in OSS_SITE_OUT_COLS if c in out.columns]
     return out[ordered]
+
+
+def _cell_part1_files() -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for folder in (Path("/workspace"), Path(".")):
+        for path in sorted(folder.glob(OSS_CELL_PART1_GLOB)):
+            key = path.resolve()
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+    return out
+
+
+def _extract_split_rar(part1: Path, dest: Path) -> Path:
+    dest.mkdir(parents=True, exist_ok=True)
+    csvs = sorted(dest.glob("*.csv"))
+    if csvs:
+        return csvs[0]
+    subprocess.check_call(["unrar", "x", "-o+", str(part1), f"{dest}/"])
+    csvs = sorted(dest.glob("*.csv"))
+    if not csvs:
+        raise SystemExit(f"No CSV extracted from {part1.name}")
+    return csvs[0]
+
+
+def combine_cell_level_oss() -> pd.DataFrame:
+    """Unrar each day’s split parts and concatenate into one cell-level table."""
+    parts = _cell_part1_files()
+    if not parts:
+        raise SystemExit(f"No cell-level OSS parts matching {OSS_CELL_PART1_GLOB}")
+    frames: list[pd.DataFrame] = []
+    for part1 in parts:
+        dest = Path("/tmp/oss_cell_extract") / part1.name.replace(".part1.rar", "")
+        csv_path = _extract_split_rar(part1, dest)
+        print(f"Loaded cell-level {csv_path.name}", flush=True)
+        frames.append(pd.read_csv(csv_path))
+    combined = pd.concat(frames, ignore_index=True)
+    OSS_CELL_COMBINED.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(OSS_CELL_COMBINED, index=False)
+    print(
+        f"Combined cell-level: {len(combined):,} rows → {OSS_CELL_COMBINED}",
+        flush=True,
+    )
+    return combined
+
+
+def ensure_capacity_site_oss() -> Path:
+    """Build capacity-only site-hour OSS from cell-level parts if needed."""
+    out = _find_input(OSS_FILE) or Path("/workspace") / OSS_FILE
+    parts = _cell_part1_files()
+    if out.exists() and parts:
+        newest_part = max(p.stat().st_mtime for p in parts)
+        if out.stat().st_mtime >= newest_part:
+            print(f"Using existing capacity site OSS {out}", flush=True)
+            return out
+    print("Building capacity-only site-hour OSS (exclude L900)...", flush=True)
+    combined = combine_cell_level_oss()
+    n_cell = len(combined)
+    keep = int(_capacity_mask(combined[OSS_CELL_COL]).sum()) if OSS_CELL_COL in combined.columns else n_cell
+    print(f"L900 coverage dropped: {n_cell - keep:,} of {n_cell:,} cells", flush=True)
+    site = aggregate_capacity_cells_to_site(combined)
+    out = Path("/workspace") / OSS_FILE
+    site.to_csv(out, index=False)
+    print(f"Wrote capacity site-hour OSS: {len(site):,} rows → {out}", flush=True)
+    return out
 
 
 def load_oss_table(path: Path) -> pd.DataFrame:
@@ -1997,13 +2077,14 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         (
             "Why this sheet",
             "Independent of UrgentTxBWInc. This sheet scans every site in "
-            f"{OSS_FILE} and scores DataBusyHour / UserBusyHour against FEGE "
-            "choke hours for 7 BusyHour, 4 BusyHour, and 1 BusyHour. The "
-            "UrgentTxBWInc 560-site filter is not used.",
+            f"{OSS_FILE} (capacity layer only: L1800/L2100/L2600, L900 coverage "
+            "dropped from cell-level hourly) and scores DataBusyHour / "
+            "UserBusyHour against FEGE choke hours for 7 BusyHour, 4 BusyHour, "
+            "and 1 BusyHour. The UrgentTxBWInc 560-site filter is not used.",
         ),
         (
             "DataBusyHour (7 BusyHour)",
-            f"From {OSS_FILE} only. Each day, sort Data Volume,GB largest to "
+            f"From capacity-only {OSS_FILE} only. Each day, sort Data Volume,GB largest to "
             f"lowest and take the top {OSS_BUSY_HOURS} hours (any hour). "
             "Example 2-Oct DHADB01: 12:00, 11:00, 3:00, 13:00, 2:00, 1:00, "
             "0:00.",
@@ -2564,6 +2645,7 @@ def _dump_report_cache(
                 "tech_summary": tech_summary,
                 "tech_by_site": tech_by_site,
                 "busy_rows": busy_rows,
+                "oss_file": OSS_FILE,
             },
             protocol=pickle.HIGHEST_PROTOCOL,
         )
@@ -2578,11 +2660,9 @@ def _refresh_busy_rows(
     tech_by_site: dict[str, str],
     source: Path | None = None,
 ) -> list[dict]:
-    oss_path = _find_input(OSS_FILE, source)
-    if oss_path is None:
-        raise SystemExit(f"OSS KPI file not found: {OSS_FILE}")
+    oss_path = ensure_capacity_site_oss()
     print("Scoring OSS BusyHour Data Volume / Max User / DL PRB Utilization...")
-    oss = load_oss_kpi(resolve_oss(oss_path))
+    oss = load_oss_kpi(oss_path)
     busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
     _attach_site_type(busy_rows, geo)
     return busy_rows
@@ -2599,7 +2679,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v83.xlsx",
+        default="FEGE_Choked_Flat_Sites_v84.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2633,7 +2713,11 @@ def main() -> None:
         tech_summary = cache["tech_summary"]
         tech_by_site = cache["tech_by_site"]
         busy_rows = cache["busy_rows"]
-        if not busy_rows or "prb_data_7h" not in busy_rows[0]:
+        if (
+            not busy_rows
+            or "prb_data_7h" not in busy_rows[0]
+            or cache.get("oss_file") != OSS_FILE
+        ):
             busy_rows = _refresh_busy_rows(records, work, geo, tech_by_site)
             _dump_report_cache(
                 source_name, work, records, geo, tech_summary, tech_by_site, busy_rows
