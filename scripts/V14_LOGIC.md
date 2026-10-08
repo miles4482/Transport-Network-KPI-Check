@@ -126,6 +126,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v78 adds **4/1BH Flag** in the BH Flag block: Yes when 4 BH Flag OR 1 BH Flag is Yes. File: `FEGE_Choked_Flat_Sites_v78.xlsx`.
 - v79 rebuilds the full report from **`FEG_KPI_DHAKA_5Oct.rar`** (single volume, replaces the part1/part2 split) and the updated **`OSS KPI Hourly site  level.rar`**. Scoring window is **5–7 Oct 2026**. File: `FEGE_Choked_Flat_Sites_v79.xlsx`.
 - v80 adds **Comparison**: all sites, busy-hour RxMaxSpeed p90 on 2–4 Oct (part1/part2) vs 5–7 Oct (current RAR). **BW Increased** is Yes when the ceiling rises ≥ 40 Mbit/s or 12% (DHKKTE2 / GPSDR01 Tx step-up shape). File: `FEGE_Choked_Flat_Sites_v80.xlsx`.
+- v81 Comparison uses **RxMaxSpeed only** (Tx Total BW columns removed). File: `FEGE_Choked_Flat_Sites_v81.xlsx`.
 
 ## Jupyter (for local Windows use)
 

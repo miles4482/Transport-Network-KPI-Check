@@ -206,20 +206,15 @@ def _kpi_window(raw: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd
 
 
 def _site_busy_levels(work: pd.DataFrame) -> dict[str, dict[str, float]]:
-    """Busy-hour (08:00–22:00) RxMaxSpeed / TxBW ceiling per site."""
+    """Busy-hour (08:00–22:00) RxMaxSpeed ceiling per site."""
     busy = work[(work["Hour"] >= BUSY_START) & (work["Hour"] <= BUSY_END)]
     out: dict[str, dict[str, float]] = {}
     for site, g in busy.groupby("eNodeB Name", sort=False):
         rx = g["Rx"].to_numpy(dtype=float)
-        tx = g["TxBW"].to_numpy(dtype=float)
         rx = rx[np.isfinite(rx)]
-        tx = tx[np.isfinite(tx)]
         if rx.size < 6:
             continue
-        out[str(site)] = {
-            "rx_p90": float(np.quantile(rx, 0.90)),
-            "tx_p90": float(np.quantile(tx, 0.90)) if tx.size else float("nan"),
-        }
+        out[str(site)] = {"rx_p90": float(np.quantile(rx, 0.90))}
     return out
 
 
@@ -293,8 +288,6 @@ def _build_bw_comparison(
                 "new_rx": new_rx,
                 "delta_rx": delta,
                 "delta_pct": pct,
-                "old_tx": old.get("tx_p90", float("nan")),
-                "new_tx": new.get("tx_p90", float("nan")),
                 "bw_up": _bw_increased(old_rx, new_rx),
             }
         )
@@ -1959,9 +1952,10 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"{COMPARE_OLD_END.strftime('%-d %b')} from {COMPARE_OLD_FILE} "
             f"versus {ANALYSIS_START.strftime('%-d %b')}–"
             f"{ANALYSIS_END.strftime('%-d %b')} from the current FEGE file. "
-            f"BW Increased is Yes when the ceiling steps up by at least "
+            f"RxMaxSpeed only (Tx Total BW is not used). BW Increased is Yes "
+            f"when the RxMaxSpeed ceiling steps up by at least "
             f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}% (the DHKKTE2 / "
-            "GPSDR01 shape after a Tx BW increase).",
+            "GPSDR01 shape).",
         ),
         (
             "Filtering(1H only)",
@@ -2457,7 +2451,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v80.xlsx",
+        default="FEGE_Choked_Flat_Sites_v81.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2917,15 +2911,13 @@ def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
         "Site Type",
         "Severity",
         f"RxMaxSpeed {old_lbl} (Mbps)",
-        f"Tx Total BW {old_lbl} (Mbit/s)",
         f"RxMaxSpeed {new_lbl} (Mbps)",
-        f"Tx Total BW {new_lbl} (Mbit/s)",
         "Increase (Mbps)",
         "Increase %",
         "BW Increased",
     ]
     last_col = len(headers) - 1
-    widths = [5, 16, 10, 14, 12, 22, 20, 24, 22, 14, 12, 14]
+    widths = [5, 16, 10, 14, 12, 26, 28, 14, 12, 14]
     for i, w in enumerate(widths):
         ws.set_column(i, i, w)
 
@@ -2935,7 +2927,7 @@ def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
         0,
         0,
         last_col,
-        "Comparison — sites where RxMaxSpeed ceiling increased (Tx BW step-up)",
+        "Comparison — sites where RxMaxSpeed ceiling increased",
         styles["title"],
     )
     ws.set_row(1, 18)
@@ -2958,7 +2950,7 @@ def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
     hdr_new = _busy_section_header(book, "#0D7377", "white")
     hdr_chg = _busy_section_header(book, "#C65911", "white")
     hdr_flag = _busy_section_header(book, "#548235", "white")
-    col_fmt = [hdr_site] * 5 + [hdr_old] * 2 + [hdr_new] * 2 + [hdr_chg] * 2 + [hdr_flag]
+    col_fmt = [hdr_site] * 5 + [hdr_old] + [hdr_new] + [hdr_chg] * 2 + [hdr_flag]
 
     def _group(c1: int, c2: int, text: str, fmt) -> None:
         if c1 == c2:
@@ -2968,10 +2960,10 @@ def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
 
     ws.set_row(group_row, 22)
     _group(0, 4, "Site", hdr_site)
-    _group(5, 6, f"Previous ({old_lbl})", hdr_old)
-    _group(7, 8, f"Current ({new_lbl})", hdr_new)
-    _group(9, 10, "Change", hdr_chg)
-    _group(11, 11, "BW Increased", hdr_flag)
+    _group(5, 5, f"Previous ({old_lbl})", hdr_old)
+    _group(6, 6, f"Current ({new_lbl})", hdr_new)
+    _group(7, 8, "Change", hdr_chg)
+    _group(9, 9, "BW Increased", hdr_flag)
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
         ws.write(header_row, col, text, col_fmt[col])
@@ -3002,13 +2994,11 @@ def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
             row, 4, rec["severity"], _severity_format(styles, rec["severity"], zebra)
         )
         _num(row, 5, rec.get("old_rx"), n)
-        _num(row, 6, rec.get("old_tx"), n)
-        _num(row, 7, rec.get("new_rx"), n)
-        _num(row, 8, rec.get("new_tx"), n)
-        _num(row, 9, rec.get("delta_rx"), n)
-        _num(row, 10, rec.get("delta_pct"), n)
+        _num(row, 6, rec.get("new_rx"), n)
+        _num(row, 7, rec.get("delta_rx"), n)
+        _num(row, 8, rec.get("delta_pct"), n)
         up = bool(rec.get("bw_up"))
-        ws.write_string(row, 11, "Yes" if up else "", styles["yes"] if up else c)
+        ws.write_string(row, 9, "Yes" if up else "", styles["yes"] if up else c)
 
     last = header_row + max(len(compare_rows), 1)
     ws.autofilter(header_row, 0, last, last_col)
