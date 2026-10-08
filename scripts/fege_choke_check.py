@@ -919,6 +919,7 @@ def _high_choke(*pcts: float) -> bool:
 
 def _busy_sort_key(row: dict):
     return (
+        0 if row.get("flag_41h") else 1,
         0 if row.get("flag_4h") else 1,
         0 if row.get("flag_1h") else 1,
         0 if row.get("data1_choke_high") else 1,
@@ -970,6 +971,7 @@ def _attach_window_filter_flags(rows: list[dict]) -> list[dict]:
         choke1 = row["data1_choke_high"] or row["user1_choke_high"]
         tp1 = row["data1_busy_poor"] or row["user1_busy_poor"]
         row["flag_1h"] = bool(choke1 and tp1)
+        row["flag_41h"] = bool(row["flag_4h"] or row["flag_1h"])
     rows.sort(key=_busy_sort_key)
     return rows
 
@@ -1821,6 +1823,10 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "and (2) are true — choked and poor throughput in the 1h window.",
         ),
         (
+            "4/1BH Flag",
+            "Yes when 4 BH Flag OR 1 BH Flag is Yes.",
+        ),
+        (
             "Filtering(1H only)",
             "The four Yes columns after the BH Flag columns use the 1 BusyHour "
             "section only (not 7h/4h). Chocked %_Data / Chocked %_User are Yes "
@@ -2314,7 +2320,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v77.xlsx",
+        default="FEGE_Choked_Flat_Sites_v78.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2462,6 +2468,7 @@ def main() -> None:
         f"(independent of UrgentTxBWInc) from {OSS_FILE}; "
         f"4 BH Flag Yes: {sum(1 for r in busy_rows if r.get('flag_4h'))}; "
         f"1 BH Flag Yes: {sum(1 for r in busy_rows if r.get('flag_1h'))}; "
+        f"4/1BH Flag Yes: {sum(1 for r in busy_rows if r.get('flag_41h'))}; "
         f"Filtering(1H only) Chocked %_Data Yes: "
         f"{sum(1 for r in busy_rows if r.get('data1_choke_high'))}; "
         f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user1_choke_high'))}; "
@@ -3380,6 +3387,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
         "Site Type",
         "4 BH Flag",
         "1 BH Flag",
+        "4/1BH Flag",
         "Chocked %_Data Busy Hour",
         "Chocked %_User Busy Hour",
         "Data Busy Hour_TP",
@@ -3415,7 +3423,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     day1_widths = [12] * len(days)
     match_widths = [12, 14, 16, 16, 16, 16, 12]
     widths = (
-        [5, 16, 10, 12, 14, 12, 12, 22, 22, 16, 16, 22, 22, 16, 16, 22, 22, 16, 16]
+        [5, 16, 10, 12, 14, 12, 12, 14, 22, 22, 16, 16, 22, 22, 16, 16, 22, 22, 16, 16]
         + day_widths
         + match_widths
         + day_widths
@@ -3471,16 +3479,18 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     site_end = 4  # No. / eNodeB Name / Tech / Severity / Site Type
     flag4_col = 5
     flag1_col = 6
-    filter1_start = 7
-    filter1_end = 10  # Filtering(1H only)
-    filter4_start = 11
-    filter4_end = 14  # Filtering(4H only)
-    filter_start = 15
-    filter_end = 18  # Filtering(7H/4H/1H)
+    flag41_col = 7
+    filter1_start = 8
+    filter1_end = 11  # Filtering(1H only)
+    filter4_start = 12
+    filter4_end = 15  # Filtering(4H only)
+    filter_start = 16
+    filter_end = 19  # Filtering(7H/4H/1H)
     hdr_site = _busy_section_header(book, NAVY, "white")
     hdr_bhflag = _busy_section_header(book, "#FFF2CC", "#7F6000")
     hdr_flag4 = _busy_section_header(book, "#C65911", "white")
     hdr_flag1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_flag41 = _busy_section_header(book, "#833C0C", "white")
     hdr_filter1 = _busy_section_header(book, "#E2D4F8", "#5B2C6F")
     hdr_filter1_col = _busy_section_header(book, "#1B4F72", "white")
     hdr_filter4 = _busy_section_header(book, "#F4CBE8", "#9B2D8A")
@@ -3496,6 +3506,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
     col_fmt = [hdr_site] * len(headers)
     col_fmt[flag4_col] = hdr_flag4
     col_fmt[flag1_col] = hdr_flag1
+    col_fmt[flag41_col] = hdr_flag41
     for col in range(filter1_start, filter1_end + 1):
         col_fmt[col] = hdr_filter1_col
     for col in range(filter4_start, filter4_end + 1):
@@ -3523,7 +3534,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
 
     ws.set_row(group_row, 22)
     _group(0, site_end, "Site", hdr_site)
-    _group(flag4_col, flag1_col, "BH Flag", hdr_bhflag)
+    _group(flag4_col, flag41_col, "BH Flag", hdr_bhflag)
     _group(filter1_start, filter1_end, "Filtering(1H only)", hdr_filter1)
     _group(filter4_start, filter4_end, "Filtering(4H only)", hdr_filter4)
     _group(filter_start, filter_end, "Filtering(7H/4H/1H)", hdr_filter)
@@ -3587,6 +3598,7 @@ def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dic
 
         col = _write_flag(bool(rec.get("flag_4h")))
         col = _write_flag(bool(rec.get("flag_1h")))
+        col = _write_flag(bool(rec.get("flag_41h")))
         col = _write_flag(bool(rec.get("data1_choke_high")))
         col = _write_flag(bool(rec.get("user1_choke_high")))
         col = _write_flag(bool(rec.get("data1_busy_poor")))
