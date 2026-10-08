@@ -128,6 +128,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v80 adds **Comparison**: all sites, busy-hour RxMaxSpeed p90 on 2–4 Oct (part1/part2) vs 5–7 Oct (current RAR). **BW Increased** is Yes when the ceiling rises ≥ 40 Mbit/s or 12% (DHKKTE2 / GPSDR01 Tx step-up shape). File: `FEGE_Choked_Flat_Sites_v80.xlsx`.
 - v81 Comparison uses **RxMaxSpeed only** (Tx Total BW columns removed). File: `FEGE_Choked_Flat_Sites_v81.xlsx`.
 - v82 adds **DLPRBUtilization,%** to every 7H / 4H / 1H DataBusyHour and UserBusyHour block: `(DL PRB Utilization_N / DL PRB Utilization_D) × 100` over that block’s own busy hours. Not added to BH Flag. File: `FEGE_Choked_Flat_Sites_v82.xlsx`.
+- v83 copies DataBusyHour / UserBusyHour **4H and 1H** DL Throughput, DLPRBUtilization,%, Data Volume, and Max User onto **1. Site List**, as a separate block immediately after Site Type. File: `FEGE_Choked_Flat_Sites_v83.xlsx`.
 
 ## Jupyter (for local Windows use)
 

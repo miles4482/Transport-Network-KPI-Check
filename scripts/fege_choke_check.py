@@ -1827,6 +1827,13 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"Site Type column in {GEO_FILE} (GF, RTT, RTP, IBS, and so on). "
             "If the site is not in that file, the cell is Not found.",
         ),
+        (
+            "Site List 4H / 1H OSS KPIs",
+            "The four blocks after Site Type on 1. Site List copy DataBusyHour "
+            "and UserBusyHour 4h / 1h values from URGENTBWINC_BusyHour: "
+            "DL Throughput, DLPRBUtilization,%, Data Volume, and Max User. "
+            "Blank means the issue site is not in the OSS BusyHour scan.",
+        ),
     ]
     for i, (key, val) in enumerate(kept):
         r = kept_head + 1 + i
@@ -2484,7 +2491,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v82.xlsx",
+        default="FEGE_Choked_Flat_Sites_v83.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -3071,7 +3078,9 @@ def _write_workbook(
     _write_summary(
         book, styles, source_name, period_txt, n_sites, records, tech_summary, tech_by_site
     )
-    _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
+    _write_list_linked(
+        book, styles, source_name, period_txt, n_sites, records, busy_rows or []
+    )
     _write_action_plan(book, styles, source_name, period_txt, n_sites, records, geo)
     _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
     _write_comparison(book, styles, compare_rows or [])
@@ -3086,31 +3095,26 @@ def _write_workbook(
     book.close()
 
 
-def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
+def _write_list_linked(
+    book, styles, source_name, period_txt, n_sites, records, busy_rows: list[dict] | None = None
+):
     """Same list as _write_list, with each site name linked to its snapshot."""
     ws = book.add_worksheet("1. Site List")
     _page(ws, REPORT_TITLE)
 
-    widths = [5, 14, 12, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 14]
-    for i, w in enumerate(widths):
-        ws.set_column(i, i, w)
-
     last_day_hdr = records[0]["last_day_label"] if records else "last day"
-    last_col_letter = "P"
-    ws.set_row(0, 28)
-    ws.merge_range(
-        f"A1:{last_col_letter}1",
-        f"{REPORT_TITLE} — issue sites ({ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b %Y')})",
-        styles["title"],
-    )
-    ws.set_row(1, 18)
-    ws.merge_range(
-        f"A2:{last_col_letter}2",
-        f"DHK transmission    ·    {period_txt}    ·    hourly    ·    "
-        f"{n_sites} sites checked    ·    {len(records)} issue sites",
-        styles["subtitle"],
-    )
-
+    kpi_4 = [
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+    ]
+    kpi_1 = [
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+    ]
     headers = [
         "No.",
         "eNodeB Name",
@@ -3128,11 +3132,50 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         "Longest flat run (h)",
         "Double check",
         "Site Type",
+        *kpi_4,
+        *kpi_4,
+        *kpi_1,
+        *kpi_1,
     ]
-    header_row = 3
+    last_col = len(headers) - 1
+    last_col_letter = xl_rowcol_to_cell(0, last_col).rstrip("0123456789")
+    widths = [5, 14, 12, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 14] + [16] * 16
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    ws.set_row(0, 28)
+    ws.merge_range(
+        f"A1:{last_col_letter}1",
+        f"{REPORT_TITLE} — issue sites ({ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b %Y')})",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        f"A2:{last_col_letter}2",
+        f"DHK transmission    ·    {period_txt}    ·    hourly    ·    "
+        f"{n_sites} sites checked    ·    {len(records)} issue sites    ·    "
+        "4H / 1H OSS KPIs from URGENTBWINC_BusyHour after Site Type",
+        styles["subtitle"],
+    )
+
+    group_row = 3
+    header_row = 4
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_data4 = _busy_section_header(book, "#C65911", "white")
+    hdr_user4 = _busy_section_header(book, "#B7950B", "white")
+    hdr_data1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_user1 = _busy_section_header(book, "#1A5276", "white")
+    col_fmt = [styles["header"]] * 16 + [hdr_data4] * 4 + [hdr_user4] * 4 + [hdr_data1] * 4 + [hdr_user1] * 4
+    ws.set_row(group_row, 22)
+    ws.merge_range(group_row, 0, group_row, 15, "Site", hdr_site)
+    ws.merge_range(group_row, 16, group_row, 19, "DataBusyHour (4 BusyHour)", hdr_data4)
+    ws.merge_range(group_row, 20, group_row, 23, "UserBusyHour (4 BusyHour)", hdr_user4)
+    ws.merge_range(group_row, 24, group_row, 27, "DataBusyHour (1 BusyHour)", hdr_data1)
+    ws.merge_range(group_row, 28, group_row, 31, "UserBusyHour (1 BusyHour)", hdr_user1)
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
-        ws.write(header_row, col, text, styles["header"])
+        ws.write(header_row, col, text, col_fmt[col])
+    busy_by_site = {row["site"]: row for row in (busy_rows or [])}
 
     for i, rec in enumerate(records):
         row = header_row + 1 + i
@@ -3178,11 +3221,38 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
             styles["below"] if site_type == "Not found" else c,
         )
 
-    last = header_row + len(records)
-    ws.autofilter(header_row, 0, last, len(headers) - 1)
-    ws.repeat_rows(header_row, header_row)
+        def _num(r, col, value):
+            if value is None or not np.isfinite(value):
+                ws.write_blank(r, col, None, n)
+            else:
+                ws.write_number(r, col, value, n)
 
-    last_col = 15
+        busy = busy_by_site.get(rec["site"], {})
+        kpi_keys = (
+            "tp_data_4h",
+            "prb_data_4h",
+            "vol_data_4h",
+            "users_data_4h",
+            "tp_user_4h",
+            "prb_user_4h",
+            "vol_user_4h",
+            "users_user_4h",
+            "tp_data_1h",
+            "prb_data_1h",
+            "vol_data_1h",
+            "users_data_1h",
+            "tp_user_1h",
+            "prb_user_1h",
+            "vol_user_1h",
+            "users_user_1h",
+        )
+        for offset, key in enumerate(kpi_keys):
+            _num(row, 16 + offset, busy.get(key, float("nan")))
+
+    last = header_row + len(records)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(group_row, header_row)
+
     note_row = last + 2
     ws.set_row(note_row, 20)
     ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
@@ -3264,7 +3334,27 @@ def _write_list_linked(book, styles, source_name, period_txt, n_sites, records):
         styles["body"],
     )
 
-    tech_row = st_row + 3
+    oss_row = st_row + 3
+    ws.set_row(oss_row, 20)
+    ws.merge_range(
+        oss_row, 0, oss_row, last_col, "How to read 4H / 1H OSS KPIs", styles["section"]
+    )
+    ws.set_row(oss_row + 1, 44)
+    ws.merge_range(
+        oss_row + 1,
+        0,
+        oss_row + 1,
+        last_col,
+        "The four coloured blocks after Site Type are copied from URGENTBWINC_BusyHour "
+        "for the same eNodeB: DataBusyHour (4 BusyHour), UserBusyHour (4 BusyHour), "
+        "DataBusyHour (1 BusyHour), UserBusyHour (1 BusyHour). Each block has "
+        "DL Throughput, DLPRBUtilization,% = (DL PRB Utilization_N / DL PRB "
+        "Utilization_D) × 100, Data Volume, and Max User. Blank means the site is "
+        "not in the OSS BusyHour scan.",
+        styles["body"],
+    )
+
+    tech_row = oss_row + 3
     ws.set_row(tech_row, 20)
     ws.merge_range(tech_row, 0, tech_row, last_col, "How to read Tech", styles["section"])
     ws.set_row(tech_row + 1, 32)
