@@ -52,6 +52,12 @@ NIGHT_END = 6  # inclusive, the valley on the sample charts
 KPI_YEAR = 2026
 ANALYSIS_START = pd.Timestamp(f"{KPI_YEAR}-10-05")
 ANALYSIS_END = pd.Timestamp(f"{KPI_YEAR}-10-07")
+COMPARE_OLD_START = pd.Timestamp(f"{KPI_YEAR}-10-02")
+COMPARE_OLD_END = pd.Timestamp(f"{KPI_YEAR}-10-04")
+COMPARE_OLD_FILE = "FEG_KPI_DHAKA_5Oct.part1.rar"
+COMPARE_SHEET = "Comparison"
+BW_UP_MBPS = 40.0
+BW_UP_FRAC = 0.12
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
 # Hard ceiling. A few hours may sit a little above the crowded level.
@@ -184,6 +190,122 @@ def resolve_source(path: Path) -> Path:
             raise SystemExit(f"No CSV extracted from {path.name}")
         return csvs[0]
     return path
+
+
+def _kpi_window(raw: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Hourly RxMaxSpeed / TxBW for one date window."""
+    work = raw.copy()
+    work["Date"] = parse_kpi_date(work["Date"])
+    work["Rx"] = work[RX_COL] / 1000.0 / 1000.0
+    work["TxBW"] = work[TXBW_COL] / 1000.0
+    work["Hour"] = parse_hour(work["Time"])
+    work["eNodeB Name"] = work["eNodeB Name"].astype(str).str.strip()
+    work = work[(work["Date"] >= start) & (work["Date"] <= end)].copy()
+    work = work.drop_duplicates(["eNodeB Name", "Date", "Hour"], keep="last")
+    return work
+
+
+def _site_busy_levels(work: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Busy-hour (08:00–22:00) RxMaxSpeed / TxBW ceiling per site."""
+    busy = work[(work["Hour"] >= BUSY_START) & (work["Hour"] <= BUSY_END)]
+    out: dict[str, dict[str, float]] = {}
+    for site, g in busy.groupby("eNodeB Name", sort=False):
+        rx = g["Rx"].to_numpy(dtype=float)
+        tx = g["TxBW"].to_numpy(dtype=float)
+        rx = rx[np.isfinite(rx)]
+        tx = tx[np.isfinite(tx)]
+        if rx.size < 6:
+            continue
+        out[str(site)] = {
+            "rx_p90": float(np.quantile(rx, 0.90)),
+            "tx_p90": float(np.quantile(tx, 0.90)) if tx.size else float("nan"),
+        }
+    return out
+
+
+def _bw_increased(old_rx: float, new_rx: float) -> bool:
+    """True when the busy-hour RxMaxSpeed ceiling steps up (DHKKTE2 / GPSDR01)."""
+    if not (np.isfinite(old_rx) and np.isfinite(new_rx)):
+        return False
+    need = max(BW_UP_MBPS, BW_UP_FRAC * float(old_rx))
+    return (float(new_rx) - float(old_rx)) >= need
+
+
+def _load_previous_fege() -> pd.DataFrame | None:
+    """Load the part1/part2 Dhaka dump for the previous 2–4 Oct window."""
+    path = _find_input(COMPARE_OLD_FILE)
+    if path is None:
+        return None
+    dest = Path("/tmp/dhaka_kpi_old")
+    dest.mkdir(parents=True, exist_ok=True)
+    csvs = sorted(dest.glob("*.csv"))
+    if not csvs:
+        if path.suffix.lower() == ".rar":
+            subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+            csvs = sorted(dest.glob("*.csv"))
+        else:
+            return _kpi_window(load_kpi(path), COMPARE_OLD_START, COMPARE_OLD_END)
+    if not csvs:
+        return None
+    return _kpi_window(load_kpi(csvs[0]), COMPARE_OLD_START, COMPARE_OLD_END)
+
+
+def _build_bw_comparison(
+    new_work: pd.DataFrame,
+    records: list[dict],
+    tech_by_site: dict[str, str] | None,
+    geo: pd.DataFrame | None,
+) -> list[dict]:
+    """All-site previous vs current RxMaxSpeed ceiling."""
+    old_work = _load_previous_fege()
+    if old_work is None or old_work.empty:
+        print(f"Comparison skipped: {COMPARE_OLD_FILE} not found")
+        return []
+    old_lv = _site_busy_levels(old_work)
+    new_lv = _site_busy_levels(new_work)
+    types = site_type_by_site_from_geo(geo) if geo is not None else {}
+    tech_by_site = tech_by_site or {}
+    sev_by_site = {rec["site"]: rec["severity"] for rec in records}
+    sites = sorted(set(old_lv) | set(new_lv))
+    rows: list[dict] = []
+    for site in sites:
+        old = old_lv.get(site, {})
+        new = new_lv.get(site, {})
+        old_rx = old.get("rx_p90", float("nan"))
+        new_rx = new.get("rx_p90", float("nan"))
+        delta = (
+            float(new_rx) - float(old_rx)
+            if np.isfinite(old_rx) and np.isfinite(new_rx)
+            else float("nan")
+        )
+        pct = (
+            100.0 * delta / old_rx
+            if np.isfinite(delta) and old_rx
+            else float("nan")
+        )
+        rows.append(
+            {
+                "site": site,
+                "tech": tech_by_site.get(site, TECH_4G),
+                "site_type": types.get(site) or "Not found",
+                "severity": sev_by_site.get(site, "—"),
+                "old_rx": old_rx,
+                "new_rx": new_rx,
+                "delta_rx": delta,
+                "delta_pct": pct,
+                "old_tx": old.get("tx_p90", float("nan")),
+                "new_tx": new.get("tx_p90", float("nan")),
+                "bw_up": _bw_increased(old_rx, new_rx),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            0 if r["bw_up"] else 1,
+            -float(r["delta_rx"]) if np.isfinite(r.get("delta_rx")) else 0,
+            r["site"],
+        )
+    )
+    return rows
 
 
 def load_kpi(path: Path) -> pd.DataFrame:
@@ -1831,6 +1953,17 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "Yes when 4 BH Flag OR 1 BH Flag is Yes.",
         ),
         (
+            "Comparison / BW Increased",
+            f"All-site sheet comparing busy-hour RxMaxSpeed (90th percentile, "
+            f"08:00–22:00) on {COMPARE_OLD_START.strftime('%-d %b')}–"
+            f"{COMPARE_OLD_END.strftime('%-d %b')} from {COMPARE_OLD_FILE} "
+            f"versus {ANALYSIS_START.strftime('%-d %b')}–"
+            f"{ANALYSIS_END.strftime('%-d %b')} from the current FEGE file. "
+            f"BW Increased is Yes when the ceiling steps up by at least "
+            f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}% (the DHKKTE2 / "
+            "GPSDR01 shape after a Tx BW increase).",
+        ),
+        (
             "Filtering(1H only)",
             "The four Yes columns after the BH Flag columns use the 1 BusyHour "
             "section only (not 7h/4h). Chocked %_Data / Chocked %_User are Yes "
@@ -2324,7 +2457,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v79.xlsx",
+        default="FEGE_Choked_Flat_Sites_v80.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -2405,6 +2538,8 @@ def main() -> None:
     # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
     if args.fast:
         print("Fast mode: skipping snapshot charts, hourly KPI, and GeoPlot")
+    print("Building Comparison (previous 2–4 Oct vs current 5–7 Oct)...", flush=True)
+    compare_rows = _build_bw_comparison(work, records, tech_by_site, geo)
     t_write = pytime.perf_counter()
     _write_workbook(
         output,
@@ -2416,6 +2551,7 @@ def main() -> None:
         tech_by_site,
         busy_rows,
         skip_heavy=args.fast,
+        compare_rows=compare_rows,
     )
     print(
         f"Workbook write {pytime.perf_counter() - t_write:.1f}s"
@@ -2488,6 +2624,10 @@ def main() -> None:
         f"User Busy Hour Yes: {sum(1 for r in busy_rows if r.get('user_busy_poor'))}; "
         f"Chocked %_Data Yes: {sum(1 for r in busy_rows if r.get('data_choke_high'))}; "
         f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user_choke_high'))}"
+    )
+    print(
+        f"Comparison: {len(compare_rows)} sites, "
+        f"BW Increased Yes: {sum(1 for r in compare_rows if r.get('bw_up'))}"
     )
     print(f"Wrote {output}")
 
@@ -2758,6 +2898,124 @@ def _write_summary(
     ws.set_zoom(110)
 
 
+def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
+    """Previous vs current busy-hour RxMaxSpeed ceiling for every site."""
+    ws = book.add_worksheet(COMPARE_SHEET)
+    _page(ws, "Comparison — RxMaxSpeed BW increase")
+    ws.set_tab_color("#548235")
+    old_lbl = (
+        f"{COMPARE_OLD_START.strftime('%-d %b')}–{COMPARE_OLD_END.strftime('%-d %b')}"
+    )
+    new_lbl = (
+        f"{ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b %Y')}"
+    )
+    n_yes = sum(1 for r in compare_rows if r.get("bw_up"))
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Site Type",
+        "Severity",
+        f"RxMaxSpeed {old_lbl} (Mbps)",
+        f"Tx Total BW {old_lbl} (Mbit/s)",
+        f"RxMaxSpeed {new_lbl} (Mbps)",
+        f"Tx Total BW {new_lbl} (Mbit/s)",
+        "Increase (Mbps)",
+        "Increase %",
+        "BW Increased",
+    ]
+    last_col = len(headers) - 1
+    widths = [5, 16, 10, 14, 12, 22, 20, 24, 22, 14, 12, 14]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    ws.set_row(0, 28)
+    ws.merge_range(
+        0,
+        0,
+        0,
+        last_col,
+        "Comparison — sites where RxMaxSpeed ceiling increased (Tx BW step-up)",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        1,
+        0,
+        1,
+        last_col,
+        f"{old_lbl} from {COMPARE_OLD_FILE}    ·    {new_lbl} from current FEGE    ·    "
+        f"{len(compare_rows)} sites    ·    BW Increased Yes: {n_yes}    ·    "
+        f"Yes when busy-hour RxMaxSpeed p90 rises ≥ {BW_UP_MBPS:g} Mbit/s or "
+        f"{100 * BW_UP_FRAC:.0f}% (DHKKTE2 / GPSDR01 shape)",
+        styles["subtitle"],
+    )
+
+    group_row = 3
+    header_row = 4
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_old = _busy_section_header(book, "#2471A3", "white")
+    hdr_new = _busy_section_header(book, "#0D7377", "white")
+    hdr_chg = _busy_section_header(book, "#C65911", "white")
+    hdr_flag = _busy_section_header(book, "#548235", "white")
+    col_fmt = [hdr_site] * 5 + [hdr_old] * 2 + [hdr_new] * 2 + [hdr_chg] * 2 + [hdr_flag]
+
+    def _group(c1: int, c2: int, text: str, fmt) -> None:
+        if c1 == c2:
+            ws.write(group_row, c1, text, fmt)
+        else:
+            ws.merge_range(group_row, c1, group_row, c2, text, fmt)
+
+    ws.set_row(group_row, 22)
+    _group(0, 4, "Site", hdr_site)
+    _group(5, 6, f"Previous ({old_lbl})", hdr_old)
+    _group(7, 8, f"Current ({new_lbl})", hdr_new)
+    _group(9, 10, "Change", hdr_chg)
+    _group(11, 11, "BW Increased", hdr_flag)
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, col_fmt[col])
+
+    def _num(row, col, value, nfmt):
+        if value is None or not np.isfinite(value):
+            ws.write_blank(row, col, None, nfmt)
+        else:
+            ws.write_number(row, col, value, nfmt)
+
+    for i, rec in enumerate(compare_rows):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 18)
+        n = styles["num_z"] if zebra else styles["num"]
+        c = styles["center_z"] if zebra else styles["center"]
+        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        ws.write_string(row, 1, rec["site"], c)
+        ws.write_string(row, 2, rec.get("tech") or TECH_4G, c)
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row,
+            3,
+            site_type,
+            styles["below"] if site_type == "Not found" else c,
+        )
+        ws.write_string(
+            row, 4, rec["severity"], _severity_format(styles, rec["severity"], zebra)
+        )
+        _num(row, 5, rec.get("old_rx"), n)
+        _num(row, 6, rec.get("old_tx"), n)
+        _num(row, 7, rec.get("new_rx"), n)
+        _num(row, 8, rec.get("new_tx"), n)
+        _num(row, 9, rec.get("delta_rx"), n)
+        _num(row, 10, rec.get("delta_pct"), n)
+        up = bool(rec.get("bw_up"))
+        ws.write_string(row, 11, "Yes" if up else "", styles["yes"] if up else c)
+
+    last = header_row + max(len(compare_rows), 1)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(group_row, header_row)
+    ws.set_zoom(110)
+
+
 def _write_workbook(
     path: Path,
     source_name: str,
@@ -2768,6 +3026,7 @@ def _write_workbook(
     tech_by_site: dict[str, str] | None = None,
     busy_rows: list[dict] | None = None,
     skip_heavy: bool = False,
+    compare_rows: list[dict] | None = None,
 ) -> None:
     """Write the report. List links use the fixed snapshot block stride."""
     import xlsxwriter
@@ -2792,6 +3051,7 @@ def _write_workbook(
     _write_list_linked(book, styles, source_name, period_txt, n_sites, records)
     _write_action_plan(book, styles, source_name, period_txt, n_sites, records, geo)
     _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
+    _write_comparison(book, styles, compare_rows or [])
     if not skip_heavy:
         _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
         print("Writing hourly KPI...", flush=True)
