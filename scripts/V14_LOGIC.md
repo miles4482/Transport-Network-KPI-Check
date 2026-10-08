@@ -124,6 +124,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v76 revises BH Flag: Yes when (Chocked %_Data OR Chocked %_User) **and** (Data Busy Hour_TP OR User Busy Hour_TP) in that 4H or 1H section. File: `FEGE_Choked_Flat_Sites_v76.xlsx`.
 - v77 adds **Data Volume Nh (GB)** and **Max User Nh** to every 7H / 4H / 1H Data and User block (average over that block’s own busy hours). Not added to BH Flag. File: `FEGE_Choked_Flat_Sites_v77.xlsx`.
 - v78 adds **4/1BH Flag** in the BH Flag block: Yes when 4 BH Flag OR 1 BH Flag is Yes. File: `FEGE_Choked_Flat_Sites_v78.xlsx`.
+- v79 rebuilds the full report from **`FEG_KPI_DHAKA_5Oct.rar`** (single volume, replaces the part1/part2 split) and the updated **`OSS KPI Hourly site  level.rar`**. Scoring window is **5–7 Oct 2026**. File: `FEGE_Choked_Flat_Sites_v79.xlsx`.
 
 ## Jupyter (for local Windows use)
 

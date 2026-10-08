@@ -16,12 +16,12 @@ trace moves up and down during the day but every rise stops at the same
 top value and never goes above it (the clipped ~500 Mbit/s sites such as
 DHSVRS5 / GPSDR01). Jagged traces whose peaks keep changing are not listed.
 
-The rule is applied to every site over 2–4 Oct 2026 only (the window
-requested for this source). Earlier days in the combined Dhaka file
-are ignored. Every hour is scored, including night and other off-peak
-hours. A site is listed when at least three of those days have three
-hours on the cap, or when the last day has two hours on the cap.
-Each snapshot chart shows the same three days.
+The rule is applied to every site over 5–7 Oct 2026 only (the window
+in the current FEG_KPI_DHAKA_5Oct.rar source). Earlier days in a
+combined Dhaka file are ignored. Every hour is scored, including night
+and other off-peak hours. A site is listed when at least three of those
+days have three hours on the cap, or when the last day has two hours
+on the cap. Each snapshot chart shows the same three days.
 """
 
 from __future__ import annotations
@@ -45,13 +45,13 @@ BUSY_END = 22  # inclusive
 NIGHT_START = 2
 NIGHT_END = 6  # inclusive, the valley on the sample charts
 
-# Flat-cap test on 2–4 Oct 2026 only (combined FEG_KPI_DHAKA_5Oct source).
+# Flat-cap test on 5–7 Oct 2026 only (FEG_KPI_DHAKA_5Oct.rar source).
 # A day is on-cap when at least 3 hours (busy or off-peak) sit on the ceiling.
 # A site is listed when that happens on at least 3 of those days.
 # Separately, the last day is flagged when at least 2 hours sit on the ceiling.
 KPI_YEAR = 2026
-ANALYSIS_START = pd.Timestamp(f"{KPI_YEAR}-10-02")
-ANALYSIS_END = pd.Timestamp(f"{KPI_YEAR}-10-04")
+ANALYSIS_START = pd.Timestamp(f"{KPI_YEAR}-10-05")
+ANALYSIS_END = pd.Timestamp(f"{KPI_YEAR}-10-07")
 TOL_MBPS = 4.0
 TOL_FRAC = 0.015
 # Hard ceiling. A few hours may sit a little above the crowded level.
@@ -79,7 +79,7 @@ STD_MBPS = 2.5
 STD_FRAC = 0.01
 MIN_CENTER_MBPS = 20.0
 
-# Severity is hours on the cap as a share of the 2–4 Oct window.
+# Severity is hours on the cap as a share of the 5–7 Oct window.
 # RAN-side Tx Total BW is shown as a column only; it is not used to judge.
 SEV_SEVERE_PCT = 50.0
 SEV_HIGH_PCT = 25.0
@@ -857,7 +857,7 @@ def resolve_oss(path: Path) -> Path:
 
 
 def load_oss_kpi(path: Path) -> pd.DataFrame:
-    """Hourly OSS radio KPI for 2–4 Oct. Throughput is N/D, not the file’s Mbps column."""
+    """Hourly OSS radio KPI for the analysis window. Throughput is N/D, not the file’s Mbps column."""
     raw = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
     need = {
         "Date",
@@ -881,7 +881,9 @@ def load_oss_kpi(path: Path) -> pd.DataFrame:
     work["tp_d"] = pd.to_numeric(work[OSS_TP_D_COL], errors="coerce")
     work = work[(work["Date"] >= ANALYSIS_START) & (work["Date"] <= ANALYSIS_END)].copy()
     if work.empty:
-        raise SystemExit("OSS KPI has no rows in the 2–4 Oct window")
+        raise SystemExit(
+            f"OSS KPI has no rows in {ANALYSIS_START.date()} – {ANALYSIS_END.date()}"
+        )
     return work
 
 
@@ -977,7 +979,7 @@ def _attach_window_filter_flags(rows: list[dict]) -> list[dict]:
 
 
 def _fege_oncap_lookup(work: pd.DataFrame) -> dict[tuple[str, pd.Timestamp, int], bool]:
-    """(site, date, hour) → FEGE OnCap for the 2–4 Oct window."""
+    """(site, date, hour) → FEGE OnCap for the analysis window."""
     lookup: dict[tuple[str, pd.Timestamp, int], bool] = {}
     sites = work["eNodeB Name"].astype(str).str.strip()
     for site, date, hour, on in zip(sites, work["Date"], work["Hour"], work["OnCap"]):
@@ -1079,8 +1081,8 @@ def analyse_urgent_busy_hours(
     """Scan every OSS site independently of UrgentTxBWInc.
 
     Listing is OSS-only: DataBusyHour and UserBusyHour can be filled for any
-    day in 2–4 Oct, or for the last day. 7, 4, and 1 BusyHour are scored
-    the same way. Hours matched still uses FEGE OnCap.
+    day in the analysis window, or for the last day. 7, 4, and 1 BusyHour
+    are scored the same way. Hours matched still uses FEGE OnCap.
     """
     if oss is None or oss.empty:
         return []
@@ -1781,7 +1783,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
         (
             "Who is listed",
             "Every OSS site where both DataBusyHour and UserBusyHour can be "
-            "filled for any day in 2–4 Oct, or for the last day (4 Oct), on "
+            f"filled for any day in {ANALYSIS_START.strftime('%-d %b')}–"
+            f"{ANALYSIS_END.strftime('%-d %b')}, or for the last day "
+            f"({ANALYSIS_END.strftime('%-d %b')}), on "
             "the 7, 4, or 1 BusyHour set. Not limited to UrgentTxBWInc.",
         ),
         (
@@ -2314,13 +2318,13 @@ def main() -> None:
     parser.add_argument(
         "source",
         nargs="?",
-        default="FEG_KPI_DHAKA_5Oct.part1.rar",
-        help="FEGE KPI source (.csv, .xlsb, .xlsx, or split .part1.rar)",
+        default="FEG_KPI_DHAKA_5Oct.rar",
+        help="FEGE KPI source (.csv, .xlsb, .xlsx, or .rar)",
     )
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v78.xlsx",
+        default="FEGE_Choked_Flat_Sites_v79.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
