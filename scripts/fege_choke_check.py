@@ -120,6 +120,22 @@ OSS_BAND_COVERAGE = "L900"
 OSS_BAND_L21 = "L2100"
 OSS_BAND_L26 = "L2600"
 OSS_BAND_CAPACITY_DEFAULT = "L1800"
+OSS_MEAN_USER_COL = "Mean User"
+OSS_TP_MBPS_COL = "DL User Throughput,Mbps"
+OSS_PRB_PCT_COL = "DL PRB Utilization"
+# Cell → site (capacity cells only). Sum counters; avg already-computed %.
+# Throughput Mbps is optional — BusyHour still uses N/D, not that column.
+OSS_CELL_SUM_COLS = (
+    OSS_VOL_COL,
+    OSS_TP_N_COL,
+    OSS_TP_D_COL,
+    OSS_MEAN_USER_COL,
+    OSS_USER_COL,
+    OSS_PRB_N_COL,
+    OSS_PRB_D_COL,
+)
+OSS_CELL_AVG_COLS = (OSS_PRB_PCT_COL,)
+OSS_CELL_AVG_OPTIONAL_COLS = (OSS_TP_MBPS_COL,)
 GEO_SHEET = "5. GeoPlot"
 GEO_TITLE = "Transmission Link Health Monitoring"
 GEO_DATA_SHEET = "_GeoData"
@@ -1003,6 +1019,34 @@ def oss_cell_band(cell_name: str) -> str:
 def oss_cell_is_capacity(cell_name: str) -> bool:
     """Keep L1800 / L2100 / L2600. Drop L900 coverage."""
     return oss_cell_band(cell_name) != OSS_BAND_COVERAGE
+
+
+def aggregate_capacity_cells_to_site(cell_df: pd.DataFrame) -> pd.DataFrame:
+    """Drop L900 cells, then one row per site-hour.
+
+    Sum: Data Volume, Throughput N/D, Mean User, Max User, PRB N/D.
+    Avg (main): DL PRB Utilization. Avg (optional, skipped): Throughput Mbps.
+    BusyHour DL Throughput / DLPRBUtilization,% still use N/D after this rollup.
+    """
+    work = cell_df.copy()
+    if OSS_CELL_COL not in work.columns:
+        raise SystemExit(f"Cell-level OSS missing column: {OSS_CELL_COL}")
+    work = work[work[OSS_CELL_COL].map(oss_cell_is_capacity)].copy()
+    keys = [c for c in ("Date", "Time", "eNodeB Name") if c in work.columns]
+    if len(keys) < 3:
+        raise SystemExit("Cell-level OSS needs Date, Time, and eNodeB Name")
+    agg: dict[str, str] = {}
+    for col in OSS_CELL_SUM_COLS:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+            agg[col] = "sum"
+    for col in OSS_CELL_AVG_COLS:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+            agg[col] = "mean"
+    if not agg:
+        raise SystemExit("Cell-level OSS has none of the expected KPI columns")
+    return work.groupby(keys, as_index=False, sort=False).agg(agg)
 
 
 def load_oss_kpi(path: Path) -> pd.DataFrame:
