@@ -306,6 +306,10 @@ def _build_bw_comparison(
     """All-site previous vs current RxMaxSpeed ceiling."""
     old_work = _load_previous_fege()
     if old_work is None or old_work.empty:
+        cached = Path("/tmp/fege_compare_rows.pkl")
+        if cached.exists():
+            print(f"Comparison loaded from {cached} ({COMPARE_OLD_FILE} not present)")
+            return pickle.loads(cached.read_bytes())
         print(f"Comparison skipped: {COMPARE_OLD_FILE} not found")
         return []
     old_lv = _site_busy_levels(old_work)
@@ -1618,14 +1622,10 @@ def _write_snapshots(
             + ("    ·    sample snap" if rec["reference"] else "")
         )
         ws.merge_range(top, 0, top, 7, banner, styles["banner"])
-        ws.merge_range(
-            top,
-            8,
-            top,
-            23,
-            "New Add    ·    DataBusyHour / UserBusyHour 4H & 1H from 1. Site List",
-            hdr_new,
-        )
+        ws.merge_range(top, 8, top, 11, "New Add · DataBusyHour (4H)", hdr_new)
+        ws.merge_range(top, 12, top, 15, "New Add · UserBusyHour (4H)", hdr_new)
+        ws.merge_range(top, 16, top, 19, "New Add · DataBusyHour (1H)", hdr_new)
+        ws.merge_range(top, 20, top, 23, "New Add · UserBusyHour (1H)", hdr_new)
 
         labels = [
             (0, "Tx Total BW (Mbit/s)", f"{rec['bw']:.2f}"),
@@ -2843,6 +2843,8 @@ def main() -> None:
         print("Fast mode: skipping snapshot charts, hourly KPI, and GeoPlot")
     print("Building Comparison (previous 2–4 Oct vs current 5–7 Oct)...", flush=True)
     compare_rows = _build_bw_comparison(work, records, tech_by_site, geo)
+    if compare_rows:
+        Path("/tmp/fege_compare_rows.pkl").write_bytes(pickle.dumps(compare_rows))
     t_write = pytime.perf_counter()
     _write_workbook(
         output,
