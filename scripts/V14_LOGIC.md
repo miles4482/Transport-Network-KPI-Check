@@ -130,6 +130,7 @@ Keep this **detection rule** as the baseline. Presentation changed in **v15** (s
 - v82 adds **DLPRBUtilization,%** to every 7H / 4H / 1H DataBusyHour and UserBusyHour block: `(DL PRB Utilization_N / DL PRB Utilization_D) × 100` over that block’s own busy hours. Not added to BH Flag. File: `FEGE_Choked_Flat_Sites_v82.xlsx`.
 - v83 copies DataBusyHour / UserBusyHour **4H and 1H** DL Throughput, DLPRBUtilization,%, Data Volume, and Max User onto **1. Site List**, as a separate block immediately after Site Type. File: `FEGE_Choked_Flat_Sites_v83.xlsx`.
 - v84 **stops using** `OSS KPI Hourly site  level.rar`. Cell-level parts (`OSS KPI Hourly Cel Level_05/06/07Oct.part1–3.rar`) are combined, **L900 (MID 8,3 = L09) is dropped**, remaining L1800/L2100/L2600 cells are rolled to site-hour (`OSS KPI Hourly site  level_capacity.csv`). BusyHour / Site List OSS KPIs use that file. Other sheets unchanged. File: `FEGE_Choked_Flat_Sites_v84.xlsx`.
+- v85 copies the Site List **4H / 1H Data/User** OSS KPIs (DL Throughput, DLPRBUtilization,%, Data Volume, Max User) onto **2. HourlyChartOfIssueSites** in a yellow New Add strip beside the FEGE banner. File: `FEGE_Choked_Flat_Sites_v85.xlsx`.
 
 ## Jupyter (for local Windows use)
 

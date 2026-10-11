@@ -1472,7 +1472,16 @@ def _attach_chart_peaks(work: pd.DataFrame, records: list[dict], chart_start, ch
         rec["double_check"] = _needs_double_check(peak_72, avg_peak)
 
 
-def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end) -> dict[str, int]:
+def _write_snapshots(
+    book,
+    styles,
+    work,
+    records,
+    period_txt,
+    chart_start,
+    chart_end,
+    busy_rows: list[dict] | None = None,
+) -> dict[str, int]:
     ws = book.add_worksheet(SNAP_SHEET)
     _page(ws, "Hourly chart of issue sites", fit_width=False)
     ws.set_zoom(100)
@@ -1484,7 +1493,51 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
     # The chart is about one screen wide, so it does not need a long sheet.
     for col, width in enumerate([18, 16, 18, 16, 18, 16, 18, 16]):
         ws.set_column(col, col, width)
-    ws.set_column(8, 16, 11)
+    ws.set_column(8, 23, 12)
+
+    busy_by_site = {row["site"]: row for row in (busy_rows or [])}
+    oss_headers = (
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+    )
+    oss_keys = (
+        "tp_data_4h",
+        "prb_data_4h",
+        "vol_data_4h",
+        "users_data_4h",
+        "tp_user_4h",
+        "prb_user_4h",
+        "vol_user_4h",
+        "users_user_4h",
+        "tp_data_1h",
+        "prb_data_1h",
+        "vol_data_1h",
+        "users_data_1h",
+        "tp_user_1h",
+        "prb_user_1h",
+        "vol_user_1h",
+        "users_user_1h",
+    )
+    hdr_new = _busy_section_header(book, "#FFFF00", "#1F4E79")
+    hdr_data4 = _busy_section_header(book, "#C65911", "white")
+    hdr_user4 = _busy_section_header(book, "#B7950B", "white")
+    hdr_data1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_user1 = _busy_section_header(book, "#1A5276", "white")
+    oss_col_fmt = [hdr_data4] * 4 + [hdr_user4] * 4 + [hdr_data1] * 4 + [hdr_user1] * 4
 
     anchors: dict[str, int] = {}
     # Fixed stride so the site list can link to row i * BLOCK_ROWS + 1.
@@ -1565,6 +1618,14 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             + ("    ·    sample snap" if rec["reference"] else "")
         )
         ws.merge_range(top, 0, top, 7, banner, styles["banner"])
+        ws.merge_range(
+            top,
+            8,
+            top,
+            23,
+            "New Add    ·    DataBusyHour / UserBusyHour 4H & 1H from 1. Site List",
+            hdr_new,
+        )
 
         labels = [
             (0, "Tx Total BW (Mbit/s)", f"{rec['bw']:.2f}"),
@@ -1572,12 +1633,21 @@ def _write_snapshots(book, styles, work, records, period_txt, chart_start, chart
             (4, "Hours on cap (all 24h)", f"{rec['hours_on']} / {rec['hours_n']}  ({rec['hours_pct']:.1f}%)"),
             (6, "Days on cap (≥3h)", f"{rec['days_on_cap']} / {rec['days_total']}"),
         ]
-        ws.set_row(top + 1, 16)
+        ws.set_row(top + 1, 28)
         ws.set_row(top + 2, 20)
         for col, label, _value in labels:
             ws.merge_range(top + 1, col, top + 1, col + 1, label, styles["kpi_label"])
         for col, _label, value in labels:
             ws.merge_range(top + 2, col, top + 2, col + 1, value, styles["kpi_value"])
+        for offset, text in enumerate(oss_headers):
+            ws.write(top + 1, 8 + offset, text, oss_col_fmt[offset])
+        busy = busy_by_site.get(site, {})
+        for offset, key in enumerate(oss_keys):
+            value = busy.get(key, float("nan"))
+            if value is None or not np.isfinite(value):
+                ws.write_blank(top + 2, 8 + offset, None, styles["kpi_value"])
+            else:
+                ws.write_number(top + 2, 8 + offset, value, styles["kpi_value"])
 
         ws.set_row(top + 3, 8)
 
@@ -2021,6 +2091,13 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "and UserBusyHour 4h / 1h values from URGENTBWINC_BusyHour: "
             "DL Throughput, DLPRBUtilization,%, Data Volume, and Max User. "
             "Blank means the issue site is not in the OSS BusyHour scan.",
+        ),
+        (
+            "HourlyChart New Add OSS KPIs",
+            "2. HourlyChartOfIssueSites copies the same 4H / 1H DataBusyHour "
+            "and UserBusyHour values as 1. Site List (DL Throughput, "
+            "DLPRBUtilization,%, Data Volume, Max User) into the yellow New Add "
+            "strip to the right of the FEGE KPI banner. Capacity layer only.",
         ),
     ]
     for i, (key, val) in enumerate(kept):
@@ -2679,7 +2756,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v84.xlsx",
+        default="FEGE_Choked_Flat_Sites_v85.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -3277,7 +3354,9 @@ def _write_workbook(
     _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
     _write_comparison(book, styles, compare_rows or [])
     if not skip_heavy:
-        _write_snapshots(book, styles, work, records, period_txt, chart_start, chart_end)
+        _write_snapshots(
+            book, styles, work, records, period_txt, chart_start, chart_end, busy_rows or []
+        )
         print("Writing hourly KPI...", flush=True)
         _write_hourly(book, styles, work, records)
     _write_method(book, styles, source_name, period_txt, n_sites, records)
