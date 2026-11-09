@@ -1,0 +1,5125 @@
+#!/usr/bin/env python3
+"""Find FEGE ports whose RxMaxSpeed trace is choked (stuck flat).
+
+Counters
+--------
+RxMaxSpeed (Mbit/s) = VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000
+Tx Total BW (Mbit/s) = VS.FEGE.TxTotalBW(kbit/s) / 1000
+
+A site is listed only when RxMaxSpeed is pinned to one hard ceiling the way
+the sample charts show for DHAPT35 and DHAPT48: after the night dip the line
+sits flat, and it cannot climb above that level.
+
+Two shapes are accepted. "Crowded level": most hours sit on one flat level
+and nothing climbs far above it (DHAPT35 / DHAPT48). "Hard ceiling": the
+trace moves up and down during the day but every rise stops at the same
+top value and never goes above it (the clipped ~500 Mbit/s sites such as
+DHSVRS5 / GPSDR01). Jagged traces whose peaks keep changing are not listed.
+
+The rule is applied to every site over 5–7 Oct 2026 only (the window
+in FEG_KPI_DHAKA_5Oct.rar). Earlier days in a combined Dhaka file are
+ignored. Every hour is scored, including night and other off-peak hours.
+A site is listed when at least three of those days have three hours on
+the cap, or when the last day has two hours on the cap.
+
+comparison_v1 compares that window with FEG_KPI_DHAKA_08Nov.rar
+(6–8 Nov 2026). A Tx BW increase is a step-up in the busy-hour
+RxMaxSpeed ceiling. Sites that are solved, or choked again after that
+step-up, are listed there with previous vs latest 1-hour OSS KPIs.
+Each hourly chart draws both FEGE windows.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pickle
+import subprocess
+import time as pytime
+from collections import defaultdict
+from datetime import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from xlsxwriter.utility import xl_rowcol_to_cell
+
+# Busy window used by the sample snaps: the line is flat through the day
+# and only leaves the cap in the night valley.
+BUSY_START = 8
+BUSY_END = 22  # inclusive
+NIGHT_START = 2
+NIGHT_END = 6  # inclusive, the valley on the sample charts
+
+# Flat-cap test on 5–7 Oct 2026 only (FEG_KPI_DHAKA_5Oct.rar source).
+# A day is on-cap when at least 3 hours (busy or off-peak) sit on the ceiling.
+# A site is listed when that happens on at least 3 of those days.
+# Separately, the last day is flagged when at least 2 hours sit on the ceiling.
+KPI_YEAR = 2026
+ANALYSIS_START = pd.Timestamp(f"{KPI_YEAR}-10-05")
+ANALYSIS_END = pd.Timestamp(f"{KPI_YEAR}-10-07")
+COMPARE_OLD_START = pd.Timestamp(f"{KPI_YEAR}-10-02")
+COMPARE_OLD_END = pd.Timestamp(f"{KPI_YEAR}-10-04")
+COMPARE_OLD_FILE = "FEG_KPI_DHAKA_5Oct.part1.rar"
+COMPARE_SHEET = "Comparison"
+COMPARE_V1_SHEET = "comparison_v1"
+LATEST_START = pd.Timestamp(f"{KPI_YEAR}-11-06")
+LATEST_END = pd.Timestamp(f"{KPI_YEAR}-11-08")
+LATEST_FEG_FILE = "FEG_KPI_DHAKA_08Nov.rar"
+PREV_FEG_FILE = "FEG_KPI_DHAKA_5Oct.rar"
+FINDING_AGAIN = "Choked again"
+FINDING_SOLVED_UP = "Solved — Tx BW increased"
+FINDING_SOLVED = "Solved"
+FINDING_UP_CHOKED = "Tx BW increased — choked on latest"
+FINDING_UP = "Tx BW increased"
+FINDING_RANK = {
+    FINDING_AGAIN: 0,
+    FINDING_UP_CHOKED: 1,
+    FINDING_SOLVED_UP: 2,
+    FINDING_SOLVED: 3,
+    FINDING_UP: 4,
+}
+BW_UP_MBPS = 40.0
+BW_UP_FRAC = 0.12
+TOL_MBPS = 4.0
+TOL_FRAC = 0.015
+# Hard ceiling. A few hours may sit a little above the crowded level.
+# 40 Mbit/s (or 12% of the level) still reads as a cap. If the 99th
+# percentile climbs past that, the crowded level is a busy cluster with
+# spikes (the DHGULN2 / DHDHN40 / DHBDD32 / DHDHN09 shape), not a choke.
+OVERSHOOT_MBPS = 40.0
+OVERSHOOT_FRAC = 0.12
+# Second shape: the ceiling is the top of the trace. The level is searched
+# only in the top 10% of the samples, and the line may not go above it at
+# all (one glitch hour excepted). A trace that keeps climbing to new peaks
+# has no ceiling and fails here even if a busy cluster exists lower down.
+CEIL_TOP_Q = 0.90
+CEIL_OVER_MBPS = 8.0
+CEIL_OVER_FRAC = 0.03
+CEIL_MAX_ABOVE = 1
+CAP_CROWDED = "Crowded level"
+CAP_CEILING = "Hard ceiling"
+MIN_RUN_HOURS = 3
+STUCK_DAY_HOURS = 3
+MIN_DAYS_ON_CAP = 3
+LAST_DAY_HOURS = 2
+ANALYSIS_DAYS = int((ANALYSIS_END - ANALYSIS_START).days) + 1
+STD_MBPS = 2.5
+STD_FRAC = 0.01
+MIN_CENTER_MBPS = 20.0
+
+# Severity is hours on the cap as a share of the 5–7 Oct window.
+# RAN-side Tx Total BW is shown as a column only; it is not used to judge.
+SEV_SEVERE_PCT = 50.0
+SEV_HIGH_PCT = 25.0
+SEV_MODERATE_PCT = 10.0
+SEV_SEVERE = "Severe"
+SEV_HIGH = "High"
+SEV_MODERATE = "Moderate"
+SEV_LOW = "Low"
+REPORT_TITLE = "Transmission Link Health Review"
+SNAP_SHEET = "2. HourlyChartOfIssueSites"
+ACTION_SHEET = "UrgentTxBWInc"
+BUSY_SHEET = "URGENTBWINC_BusyHour"
+OSS_FILE = "OSS KPI Hourly site  level_capacity.csv"
+OSS_CELL_PART1_GLOB = "OSS KPI Hourly Cel Level_*.part1.rar"
+OSS_CELL_COMBINED = Path("/tmp/oss_cell_combined.csv")
+OSS_BUSY_HOURS = 7
+OSS_BUSY_HOURS_4 = 4
+OSS_BUSY_HOURS_1 = 1
+OSS_POOR_TP_MBPS = 7.0
+OSS_CHOKE_MATCH_PCT = 30.0
+REPORT_CACHE = Path("/tmp/fege_report_cache.pkl")
+OSS_VOL_COL = "Data Volume,GB"
+OSS_USER_COL = "Max User"
+OSS_TP_N_COL = "DL User Throughput_N"
+OSS_TP_D_COL = "DL User Throughput_D"
+OSS_PRB_N_COL = "DL PRB Utilization_N"
+OSS_PRB_D_COL = "DL PRB Utilization_D"
+# Cell-level OSS (pending upload): Layer = MID(Cell Name, 8, 3).
+# L09 = L900 coverage (drop). L21 = L2100, L26 = L2600, else = L1800 capacity (keep).
+OSS_CELL_COL = "Cell Name"
+OSS_LAYER_START = 7  # Excel MID is 1-based start 8
+OSS_LAYER_LEN = 3
+OSS_BAND_COVERAGE = "L900"
+OSS_BAND_L21 = "L2100"
+OSS_BAND_L26 = "L2600"
+OSS_BAND_CAPACITY_DEFAULT = "L1800"
+OSS_MEAN_USER_COL = "Mean User"
+OSS_TP_MBPS_COL = "DL User Throughput,Mbps"
+OSS_PRB_PCT_COL = "DL PRB Utilization"
+# Cell → site-hour, same columns as previous "OSS KPI Hourly site  level" file.
+# Drop cell-only fields (Cell TDD Indication, Cell Name, LocalCell Id,
+# eNodeB Function Name, Integrity). Keep original KPI names, not "Sum of …".
+OSS_CELL_SKIP_COLS = (
+    "Cell TDD Indication",
+    OSS_CELL_COL,
+    "LocalCell Id",
+    "eNodeB Function Name",
+    "Integrity",
+)
+OSS_CELL_SUM_COLS = (
+    OSS_VOL_COL,
+    OSS_TP_N_COL,
+    OSS_TP_D_COL,
+    OSS_MEAN_USER_COL,
+    OSS_USER_COL,
+    OSS_PRB_N_COL,
+    OSS_PRB_D_COL,
+)
+OSS_CELL_AVG_COLS = (OSS_TP_MBPS_COL, OSS_PRB_PCT_COL)
+OSS_SITE_OUT_COLS = (
+    "Date",
+    "Time",
+    "eNodeB Name",
+    OSS_VOL_COL,
+    OSS_TP_N_COL,
+    OSS_TP_D_COL,
+    OSS_MEAN_USER_COL,
+    OSS_USER_COL,
+    OSS_PRB_N_COL,
+    OSS_PRB_D_COL,
+    OSS_TP_MBPS_COL,
+    OSS_PRB_PCT_COL,
+)
+GEO_SHEET = "5. GeoPlot"
+GEO_TITLE = "Transmission Link Health Monitoring"
+GEO_DATA_SHEET = "_GeoData"
+GEO_FILE = "Physical_Site_Database_24Sep26.xlsx"
+TOP_THANA_FILE = "Top Thana.xlsx"
+TECH_4G = "4G"
+TECH_4G5G = "4G+5G"
+DARK_RED = "#8B0000"
+GEO_ISSUE = "#FF1744"
+GEO_4G = "#00E5FF"
+GEO_5G = "#FFD600"
+
+# Sites on the two sample charts. The report must contain both.
+REFERENCE_SITES = ("DHAPT35", "DHAPT48")
+
+RX_COL = "VS.FEGE.RxMaxSpeed(bit/s)"
+TXBW_COL = "VS.FEGE.TxTotalBW(kbit/s)"
+
+NAVY = "#1F4E79"
+BLUE = "#2F5496"
+RED = "#C00000"
+GREY = "#595959"
+LINE = "#BFBFBF"
+ZEBRA = "#F7F9FB"
+AMBER = "#FFF2CC"
+AMBER_FONT = "#7F6000"
+ORANGE = "#FCE4D6"
+ORANGE_FONT = "#C65911"
+GREEN = "#E2EFDA"
+GREEN_FONT = "#375623"
+PALE = "#D6E3F0"
+
+
+def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, unit="D", origin="1899-12-30")
+
+
+def parse_kpi_date(series: pd.Series) -> pd.Series:
+    """Parse Excel serials or text dates such as 2-Oct / 02-Oct-26."""
+    if pd.api.types.is_numeric_dtype(series):
+        return excel_serial_to_datetime(series)
+    text = series.astype(str).str.strip()
+    numeric = pd.to_numeric(text, errors="coerce")
+    if numeric.notna().all():
+        return excel_serial_to_datetime(numeric)
+    parsed = pd.to_datetime(text + f"-{KPI_YEAR}", format="%d-%b-%Y", errors="coerce")
+    if parsed.isna().any():
+        parsed = parsed.fillna(pd.to_datetime(text, format="%d-%m-%y", errors="coerce"))
+    if parsed.isna().any():
+        parsed = parsed.fillna(pd.to_datetime(text, errors="coerce", dayfirst=True))
+    if parsed.isna().any():
+        raise SystemExit("Could not parse the Date column")
+    if (parsed.dt.year != KPI_YEAR).any():
+        parsed = parsed.map(lambda ts: ts.replace(year=KPI_YEAR))
+    return parsed
+
+
+def parse_hour(series: pd.Series) -> pd.Series:
+    """Parse 0:00 / 00:00 / 8:00 into an integer hour."""
+    text = series.astype(str).str.strip()
+    hour = text.str.split(":", n=1).str[0]
+    values = pd.to_numeric(hour, errors="coerce")
+    if values.isna().any():
+        raise SystemExit("Could not parse the Time column")
+    return values.astype(int)
+
+
+def resolve_source(path: Path) -> Path:
+    """Use a CSV, workbook, or the first volume of a split RAR as the KPI source."""
+    name = path.name.lower()
+    if name.endswith(".part2.rar"):
+        path = path.with_name(path.name.replace(".part2.rar", ".part1.rar"))
+    if path.suffix.lower() == ".rar":
+        dest = Path("/tmp/kpi_extract") / path.stem
+        dest.mkdir(parents=True, exist_ok=True)
+        csvs = sorted(p for p in dest.glob("*.csv") if p.stat().st_size > 0)
+        if not csvs:
+            csvs = _extract_rar_csvs(path, dest)
+        if not csvs:
+            raise SystemExit(f"No CSV extracted from {path.name}")
+        return csvs[0]
+    return path
+
+
+def _kpi_window(raw: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Hourly RxMaxSpeed / TxBW for one date window."""
+    work = raw.copy()
+    work["Date"] = parse_kpi_date(work["Date"])
+    work["Rx"] = work[RX_COL] / 1000.0 / 1000.0
+    work["TxBW"] = work[TXBW_COL] / 1000.0
+    work["Hour"] = parse_hour(work["Time"])
+    work["eNodeB Name"] = work["eNodeB Name"].astype(str).str.strip()
+    work = work[(work["Date"] >= start) & (work["Date"] <= end)].copy()
+    work = work.drop_duplicates(["eNodeB Name", "Date", "Hour"], keep="last")
+    return work
+
+
+def _site_busy_levels(work: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Busy-hour (08:00–22:00) RxMaxSpeed ceiling per site."""
+    busy = work[(work["Hour"] >= BUSY_START) & (work["Hour"] <= BUSY_END)]
+    out: dict[str, dict[str, float]] = {}
+    for site, g in busy.groupby("eNodeB Name", sort=False):
+        rx = g["Rx"].to_numpy(dtype=float)
+        rx = rx[np.isfinite(rx)]
+        if rx.size < 6:
+            continue
+        out[str(site)] = {"rx_p90": float(np.quantile(rx, 0.90))}
+    return out
+
+
+def _bw_increased(old_rx: float, new_rx: float) -> bool:
+    """True when the busy-hour RxMaxSpeed ceiling steps up (DHKKTE2 / GPSDR01)."""
+    if not (np.isfinite(old_rx) and np.isfinite(new_rx)):
+        return False
+    need = max(BW_UP_MBPS, BW_UP_FRAC * float(old_rx))
+    return (float(new_rx) - float(old_rx)) >= need
+
+
+def _load_previous_fege() -> pd.DataFrame | None:
+    """Load the part1/part2 Dhaka dump for the previous 2–4 Oct window."""
+    path = _find_input(COMPARE_OLD_FILE)
+    if path is None:
+        return None
+    dest = Path("/tmp/dhaka_kpi_old")
+    dest.mkdir(parents=True, exist_ok=True)
+    csvs = sorted(dest.glob("*.csv"))
+    if not csvs:
+        if path.suffix.lower() == ".rar":
+            subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+            csvs = sorted(dest.glob("*.csv"))
+        else:
+            return _kpi_window(load_kpi(path), COMPARE_OLD_START, COMPARE_OLD_END)
+    if not csvs:
+        return None
+    return _kpi_window(load_kpi(csvs[0]), COMPARE_OLD_START, COMPARE_OLD_END)
+
+
+def _build_bw_comparison(
+    new_work: pd.DataFrame,
+    records: list[dict],
+    tech_by_site: dict[str, str] | None,
+    geo: pd.DataFrame | None,
+) -> list[dict]:
+    """All-site previous vs current RxMaxSpeed ceiling."""
+    old_work = _load_previous_fege()
+    if old_work is None or old_work.empty:
+        cached = Path("/tmp/fege_compare_rows.pkl")
+        if cached.exists():
+            print(f"Comparison loaded from {cached} ({COMPARE_OLD_FILE} not present)")
+            return pickle.loads(cached.read_bytes())
+        print(f"Comparison skipped: {COMPARE_OLD_FILE} not found")
+        return []
+    old_lv = _site_busy_levels(old_work)
+    new_lv = _site_busy_levels(new_work)
+    types = site_type_by_site_from_geo(geo) if geo is not None else {}
+    tech_by_site = tech_by_site or {}
+    sev_by_site = {rec["site"]: rec["severity"] for rec in records}
+    sites = sorted(set(old_lv) | set(new_lv))
+    rows: list[dict] = []
+    for site in sites:
+        old = old_lv.get(site, {})
+        new = new_lv.get(site, {})
+        old_rx = old.get("rx_p90", float("nan"))
+        new_rx = new.get("rx_p90", float("nan"))
+        delta = (
+            float(new_rx) - float(old_rx)
+            if np.isfinite(old_rx) and np.isfinite(new_rx)
+            else float("nan")
+        )
+        pct = (
+            100.0 * delta / old_rx
+            if np.isfinite(delta) and old_rx
+            else float("nan")
+        )
+        rows.append(
+            {
+                "site": site,
+                "tech": tech_by_site.get(site, TECH_4G),
+                "site_type": types.get(site) or "Not found",
+                "severity": sev_by_site.get(site, "—"),
+                "old_rx": old_rx,
+                "new_rx": new_rx,
+                "delta_rx": delta,
+                "delta_pct": pct,
+                "bw_up": _bw_increased(old_rx, new_rx),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            0 if r["bw_up"] else 1,
+            -float(r["delta_rx"]) if np.isfinite(r.get("delta_rx")) else 0,
+            r["site"],
+        )
+    )
+    return rows
+
+
+def _window_stats(work: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Busy-hour RxMaxSpeed p90 and median Tx Total BW for every site."""
+    out: dict[str, dict[str, float]] = {}
+    for site, g in work.groupby("eNodeB Name", sort=False):
+        stats: dict[str, float] = {}
+        busy = g[(g["Hour"] >= BUSY_START) & (g["Hour"] <= BUSY_END)]
+        rx = busy["Rx"].to_numpy(dtype=float)
+        rx = rx[np.isfinite(rx)]
+        if rx.size >= 6:
+            stats["rx_p90"] = float(np.quantile(rx, 0.90))
+        tx = g["TxBW"].to_numpy(dtype=float)
+        tx = tx[np.isfinite(tx)]
+        if tx.size:
+            stats["tx_median"] = float(np.median(tx))
+        if stats:
+            out[str(site)] = stats
+    return out
+
+
+def _comparison_finding(
+    prev_choked: bool, latest_choked: bool, bw_up: bool, has_latest: bool
+) -> str:
+    """Label used on comparison_v1. Blank means the site is not a finding."""
+    if prev_choked and latest_choked and bw_up:
+        return FINDING_AGAIN
+    if bw_up and latest_choked and not prev_choked:
+        return FINDING_UP_CHOKED
+    if prev_choked and has_latest and not latest_choked and bw_up:
+        return FINDING_SOLVED_UP
+    if prev_choked and has_latest and not latest_choked:
+        return FINDING_SOLVED
+    if bw_up:
+        return FINDING_UP
+    return ""
+
+
+def _extract_rar_csvs(archive: Path, dest: Path) -> list[Path]:
+    """Extract a RAR and return the CSV paths.
+
+    unrar-free reads these single-volume archives. Split volumes fall through
+    to 7z, which unrar-free rejects as truncated.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    found = sorted(p for p in dest.glob("*.csv") if p.stat().st_size > 0)
+    if found:
+        return found
+    subprocess.run(
+        ["unrar", "x", "-o+", str(archive), f"{dest}/"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    found = sorted(p for p in dest.glob("*.csv") if p.stat().st_size > 0)
+    if found:
+        return found
+    subprocess.check_call(
+        ["7z", "x", "-y", f"-o{dest}", str(archive)],
+        stdout=subprocess.DEVNULL,
+    )
+    found = sorted(p for p in dest.glob("*.csv") if p.stat().st_size > 0)
+    if not found:
+        raise SystemExit(f"No CSV extracted from {archive.name}")
+    return found
+
+
+def _latest_oss_archives() -> list[Path]:
+    by_name: dict[str, Path] = {}
+    for folder in (Path("."), Path("/workspace")):
+        for path in folder.glob("OSS KPI Hourly Cel Level_*Nov_V*.rar"):
+            by_name[path.name] = path
+    if not by_name:
+        raise SystemExit("No 6–8 Nov cell-level OSS archives found")
+    return [by_name[name] for name in sorted(by_name)]
+
+
+def _aggregate_capacity_csvs(csv_paths: list[Path]) -> pd.DataFrame:
+    """L900 cells dropped, remaining cells summed to one row per site-hour."""
+    sum_cols = list(OSS_CELL_SUM_COLS)
+    wanted = {"Date", "Time", "eNodeB Name", OSS_CELL_COL, *sum_cols}
+    parts: list[pd.DataFrame] = []
+    for path in csv_paths:
+        print(f"  capacity roll-up {path.name}", flush=True)
+        reader = pd.read_csv(
+            path, usecols=lambda col: col in wanted, chunksize=300_000
+        )
+        for chunk in reader:
+            if OSS_CELL_COL not in chunk.columns:
+                raise SystemExit(f"{path.name} is missing {OSS_CELL_COL}")
+            chunk = chunk.loc[_capacity_mask(chunk[OSS_CELL_COL])]
+            if chunk.empty:
+                continue
+            for col in sum_cols:
+                if col in chunk.columns:
+                    chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
+            chunk["eNodeB Name"] = chunk["eNodeB Name"].astype(str).str.strip()
+            grouped = chunk.groupby(
+                ["Date", "Time", "eNodeB Name"], as_index=False, sort=False
+            )[sum_cols].sum()
+            parts.append(grouped)
+    if not parts:
+        return pd.DataFrame()
+    combined = pd.concat(parts, ignore_index=True)
+    return combined.groupby(
+        ["Date", "Time", "eNodeB Name"], as_index=False, sort=False
+    )[sum_cols].sum()
+
+
+def _oss_work(raw: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Site-hour OSS limited to one date window. Throughput stays N/D."""
+    need = {
+        "Date",
+        "Time",
+        "eNodeB Name",
+        OSS_VOL_COL,
+        OSS_USER_COL,
+        OSS_TP_N_COL,
+        OSS_TP_D_COL,
+        OSS_PRB_N_COL,
+        OSS_PRB_D_COL,
+    }
+    missing = need - set(raw.columns)
+    if missing:
+        raise SystemExit(f"OSS KPI missing columns: {', '.join(sorted(missing))}")
+    work = raw.copy()
+    work["Date"] = parse_kpi_date(work["Date"])
+    work["Hour"] = parse_hour(work["Time"])
+    work["site"] = work["eNodeB Name"].astype(str).str.strip()
+    work["vol"] = pd.to_numeric(work[OSS_VOL_COL], errors="coerce")
+    work["users"] = pd.to_numeric(work[OSS_USER_COL], errors="coerce")
+    work["tp_n"] = pd.to_numeric(work[OSS_TP_N_COL], errors="coerce")
+    work["tp_d"] = pd.to_numeric(work[OSS_TP_D_COL], errors="coerce")
+    work["prb_n"] = pd.to_numeric(work[OSS_PRB_N_COL], errors="coerce")
+    work["prb_d"] = pd.to_numeric(work[OSS_PRB_D_COL], errors="coerce")
+    work = work[(work["Date"] >= start) & (work["Date"] <= end)].copy()
+    if work.empty:
+        raise SystemExit(f"OSS KPI has no rows in {start.date()} – {end.date()}")
+    return work
+
+
+def _previous_capacity_path() -> Path:
+    """Capacity-only site-hour OSS already used for the 5–7 Oct report."""
+    found = _find_input(OSS_FILE)
+    if found is not None:
+        return found
+    dest = Path("/tmp") / OSS_FILE
+    if dest.exists() and dest.stat().st_size > 1_000_000:
+        return dest
+    print("Loading previous capacity OSS from the v85 branch...", flush=True)
+    data = subprocess.check_output(
+        ["git", "show", f"origin/cursor/fege-choked-sites-86b3:{OSS_FILE}"]
+    )
+    dest.write_bytes(data)
+    return dest
+
+
+def _load_previous_oss() -> pd.DataFrame:
+    path = _previous_capacity_path()
+    print(f"Previous OSS (5–7 Oct, 1H): {path.name}", flush=True)
+    return _oss_work(pd.read_csv(path), ANALYSIS_START, ANALYSIS_END)
+
+
+def _load_latest_oss() -> pd.DataFrame:
+    """6–8 Nov cell files (V1 = 00–11h, V2 = 12–23h) rolled up without L900."""
+    cache = Path("/tmp/oss_nov_capacity.csv")
+    if cache.exists() and cache.stat().st_size > 1_000_000:
+        print(f"Latest OSS cache {cache}", flush=True)
+        raw = pd.read_csv(cache)
+    else:
+        frames: list[pd.DataFrame] = []
+        for archive in _latest_oss_archives():
+            dest = Path("/tmp/oss_nov_extract") / archive.stem
+            csvs = _extract_rar_csvs(archive, dest)
+            frames.append(_aggregate_capacity_csvs(csvs))
+        raw = pd.concat(frames, ignore_index=True)
+        raw = raw.groupby(
+            ["Date", "Time", "eNodeB Name"], as_index=False, sort=False
+        )[list(OSS_CELL_SUM_COLS)].sum()
+        raw.to_csv(cache, index=False)
+        print(f"Wrote latest capacity OSS {len(raw):,} rows → {cache}", flush=True)
+    return _oss_work(raw, LATEST_START, LATEST_END)
+
+
+def _score_1h(
+    oss: pd.DataFrame,
+    sites: set[str],
+    oncap: dict[tuple[str, pd.Timestamp, int], bool],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> dict[str, dict]:
+    """1 BusyHour Data and User KPIs for the comparison sites only."""
+    days = list(pd.date_range(start, end, freq="D"))
+    last_day = days[-1]
+    sub = oss.loc[oss["site"].isin(sites)]
+    out: dict[str, dict] = {}
+    for site, frame in sub.groupby("site", sort=False):
+        data = _score_oss_busy(
+            frame, days, last_day, oncap, str(site), "vol", OSS_BUSY_HOURS_1
+        )
+        user = _score_oss_busy(
+            frame, days, last_day, oncap, str(site), "users", OSS_BUSY_HOURS_1
+        )
+        out[str(site)] = {
+            **_block_fields(
+                "data1", data, "tp_data_1h", "vol_data_1h", "users_data_1h", "prb_data_1h"
+            ),
+            **_block_fields(
+                "user1", user, "tp_user_1h", "vol_user_1h", "users_user_1h", "prb_user_1h"
+            ),
+        }
+    return out
+
+
+def _build_comparison_v1(
+    prev_work: pd.DataFrame,
+    prev_records: list[dict],
+    latest_work: pd.DataFrame,
+    latest_records: list[dict],
+    tech_by_site: dict[str, str] | None,
+    geo: pd.DataFrame | None,
+) -> list[dict]:
+    """Sites whose Tx ceiling stepped up, or that are solved / choked again."""
+    prev_stats = _window_stats(prev_work)
+    latest_stats = _window_stats(latest_work)
+    latest_sites = set(latest_work["eNodeB Name"].astype(str).str.strip())
+    prev_by = {rec["site"]: rec for rec in prev_records}
+    latest_by = {rec["site"]: rec for rec in latest_records}
+    types = site_type_by_site_from_geo(geo) if geo is not None else {}
+    tech_by_site = tech_by_site or {}
+    sites = sorted(set(prev_stats) | set(latest_stats))
+    rows: list[dict] = []
+    for site in sites:
+        old = prev_stats.get(site, {})
+        new = latest_stats.get(site, {})
+        old_rx = old.get("rx_p90", float("nan"))
+        new_rx = new.get("rx_p90", float("nan"))
+        delta = (
+            float(new_rx) - float(old_rx)
+            if np.isfinite(old_rx) and np.isfinite(new_rx)
+            else float("nan")
+        )
+        pct = 100.0 * delta / old_rx if np.isfinite(delta) and old_rx else float("nan")
+        bw_up = _bw_increased(old_rx, new_rx)
+        prev_choked = site in prev_by
+        latest_choked = site in latest_by
+        has_latest = site in latest_sites
+        finding = _comparison_finding(prev_choked, latest_choked, bw_up, has_latest)
+        if not finding:
+            continue
+        prev_rec = prev_by.get(site, {})
+        latest_rec = latest_by.get(site, {})
+        rows.append(
+            {
+                "site": site,
+                "tech": tech_by_site.get(site, TECH_4G),
+                "site_type": types.get(site) or "Not found",
+                "severity": prev_rec.get("severity") or latest_rec.get("severity") or "—",
+                "latest_severity": latest_rec.get("severity") or "—",
+                "finding": finding,
+                "prev_choked": prev_choked,
+                "latest_choked": latest_choked,
+                "old_rx": old_rx,
+                "new_rx": new_rx,
+                "delta_rx": delta,
+                "delta_pct": pct,
+                "bw_up": bw_up,
+                "prev_tx": old.get("tx_median", prev_rec.get("bw", float("nan"))),
+                "latest_tx": new.get("tx_median", latest_rec.get("bw", float("nan"))),
+                "prev_center": prev_rec.get("center", float("nan")),
+                "latest_center": latest_rec.get("center", float("nan")),
+                "prev_hours_on": prev_rec.get("hours_on", 0),
+                "prev_hours_n": prev_rec.get("hours_n", 0),
+                "prev_hours_pct": prev_rec.get("hours_pct", float("nan")),
+                "latest_hours_on": latest_rec.get("hours_on", 0),
+                "latest_hours_n": latest_rec.get("hours_n", 0),
+                "latest_hours_pct": latest_rec.get("hours_pct", float("nan")),
+                "prev_days_on_cap": prev_rec.get("days_on_cap", 0),
+                "prev_days_total": prev_rec.get("days_total", ANALYSIS_DAYS),
+                "latest_days_on_cap": latest_rec.get("days_on_cap", 0),
+                "latest_days_total": latest_rec.get("days_total", 3),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            FINDING_RANK.get(row["finding"], 9),
+            -float(row["delta_rx"]) if np.isfinite(row.get("delta_rx")) else 0,
+            row["site"],
+        )
+    )
+    return rows
+
+
+def _attach_comparison_oss(rows: list[dict], prev_work: pd.DataFrame, latest_work: pd.DataFrame) -> None:
+    """Previous vs latest 1 BusyHour OSS, for comparison_v1 sites only."""
+    if not rows:
+        return
+    sites = {row["site"] for row in rows}
+    print("Scoring previous OSS 1H...", flush=True)
+    prev_oss = _score_1h(
+        _load_previous_oss(),
+        sites,
+        _fege_oncap_lookup(prev_work),
+        ANALYSIS_START,
+        ANALYSIS_END,
+    )
+    print("Scoring latest OSS 1H (6–8 Nov, capacity layer)...", flush=True)
+    latest_oss = _score_1h(
+        _load_latest_oss(),
+        sites,
+        _fege_oncap_lookup(latest_work),
+        LATEST_START,
+        LATEST_END,
+    )
+    for row in rows:
+        row["prev_oss"] = prev_oss.get(row["site"], {})
+        row["latest_oss"] = latest_oss.get(row["site"], {})
+
+
+def _chart_records_for(records: list[dict], compare_rows: list[dict]) -> list[dict]:
+    """Issue-site charts first (links stay put), then any extra comparison sites."""
+    chart = [dict(rec) for rec in records]
+    finding_by = {row["site"]: row["finding"] for row in compare_rows}
+    for rec in chart:
+        rec["finding"] = finding_by.get(rec["site"], "")
+    seen = {rec["site"] for rec in chart}
+    for row in compare_rows:
+        site = row["site"]
+        if site in seen:
+            continue
+        chart.append(
+            {
+                "site": site,
+                "severity": row.get("latest_severity") or "—",
+                "reference": False,
+                "center": float("nan"),
+                "bw": row.get("prev_tx", float("nan")),
+                "hours_on": 0,
+                "hours_n": 0,
+                "hours_pct": 0.0,
+                "days_on_cap": 0,
+                "days_total": 3,
+                "finding": row["finding"],
+                "latest_center": row.get("latest_center", float("nan")),
+                "latest_bw": row.get("latest_tx", float("nan")),
+                "latest_hours_on": row.get("latest_hours_on", 0),
+                "latest_hours_n": row.get("latest_hours_n", 0),
+                "latest_hours_pct": row.get("latest_hours_pct", float("nan")),
+                "latest_days_on_cap": row.get("latest_days_on_cap", 0),
+                "latest_days_total": row.get("latest_days_total", 3),
+            }
+        )
+        seen.add(site)
+    return chart
+
+
+def _stamp_latest_on_charts(
+    chart_records: list[dict],
+    compare_rows: list[dict],
+    latest_records: list[dict],
+    latest_work: pd.DataFrame,
+) -> None:
+    """Copy 6–8 Nov Tx BW, stuck level, and hours-on-cap onto every chart."""
+    by_row = {row["site"]: row for row in compare_rows}
+    by_latest = {rec["site"]: rec for rec in latest_records}
+    stats = _window_stats(latest_work)
+    for rec in chart_records:
+        site = rec["site"]
+        row = by_row.get(site, {})
+        lat = by_latest.get(site, {})
+        tx = stats.get(site, {}).get("tx_median", float("nan"))
+        rec["latest_bw"] = row.get("latest_tx", tx if np.isfinite(tx) else lat.get("bw", float("nan")))
+        rec["latest_center"] = lat.get("center", row.get("latest_center", float("nan")))
+        rec["latest_hours_on"] = lat.get("hours_on", 0)
+        rec["latest_hours_n"] = lat.get("hours_n", 0)
+        rec["latest_hours_pct"] = lat.get("hours_pct", float("nan"))
+        rec["latest_listed"] = bool(lat)
+
+
+def load_kpi(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix == ".xlsb":
+        return pd.read_excel(path, engine="pyxlsb")
+    return pd.read_excel(path)
+
+
+def find_plateau(rx: np.ndarray) -> tuple[float, float, np.ndarray]:
+    """Return (center Mbit/s, tolerance Mbit/s, boolean mask on the cap).
+
+    The center is the level in the upper half of the trace that captures
+    the most samples inside the tolerance. It is then recentered on the
+    median of those samples so a slightly off grid point does not split
+    a flat top.
+    """
+    p95 = float(np.quantile(rx, 0.95))
+    tol = max(TOL_MBPS, TOL_FRAC * p95)
+    hi = float(np.max(rx))
+    lo = float(np.quantile(rx, 0.55))
+    if not np.isfinite(hi) or hi <= lo:
+        band = np.ones(len(rx), dtype=bool)
+        return hi, tol, band
+
+    grid = np.arange(lo, hi + 1e-6, 0.5)
+    diff = np.abs(rx[None, :] - grid[:, None])
+    counts = np.count_nonzero(diff <= tol, axis=1)
+    center0 = float(grid[int(np.argmax(counts))])
+    band = np.abs(rx - center0) <= tol
+    center = float(np.median(rx[band]))
+    band = np.abs(rx - center) <= tol
+    return center, tol, band
+
+
+def find_ceiling(rx: np.ndarray) -> tuple[float, float, np.ndarray, int]:
+    """Return (ceiling Mbit/s, tolerance, mask on the ceiling, hours above it).
+
+    Same grid search as find_plateau, but only over the top 10% of the
+    samples, so the level is the top the trace keeps returning to. The
+    last value counts the hours that climb clearly above that top; a
+    choked port has none.
+    """
+    p95 = float(np.quantile(rx, 0.95))
+    tol = max(TOL_MBPS, TOL_FRAC * p95)
+    hi = float(np.max(rx))
+    lo = float(np.quantile(rx, CEIL_TOP_Q))
+    if not np.isfinite(hi) or hi <= lo:
+        center = hi
+    else:
+        grid = np.arange(lo, hi + 1e-6, 0.5)
+        diff = np.abs(rx[None, :] - grid[:, None])
+        counts = np.count_nonzero(diff <= tol, axis=1)
+        center0 = float(grid[int(np.argmax(counts))])
+        band = np.abs(rx - center0) <= tol
+        center = float(np.median(rx[band]))
+    band = np.abs(rx - center) <= tol
+    over = max(CEIL_OVER_MBPS, CEIL_OVER_FRAC * center)
+    above = int(np.count_nonzero(rx > center + over))
+    return center, tol, band, above
+
+
+def longest_run(ts: np.ndarray, band: np.ndarray) -> int:
+    """Longest run of hourly samples that stay on the cap without a gap."""
+    longest = 0
+    current = 0
+    previous = None
+    for flag, stamp in zip(band, ts):
+        if flag and previous is not None:
+            gap = (stamp - previous) / np.timedelta64(1, "m")
+            current = current + 1 if gap <= 90 else 1
+        elif flag:
+            current = 1
+        else:
+            current = 0
+        if current > longest:
+            longest = current
+        previous = stamp if flag else None
+    return int(longest)
+
+
+def severity(hours_pct: float) -> str:
+    """How hard the port is sitting on the cap, from hours-on-cap share."""
+    if hours_pct >= SEV_SEVERE_PCT:
+        return SEV_SEVERE
+    if hours_pct >= SEV_HIGH_PCT:
+        return SEV_HIGH
+    if hours_pct >= SEV_MODERATE_PCT:
+        return SEV_MODERATE
+    return SEV_LOW
+
+
+SEVERITY_ORDER = {SEV_SEVERE: 0, SEV_HIGH: 1, SEV_MODERATE: 2, SEV_LOW: 3}
+SEVERITY_NOTES = (
+    (
+        SEV_SEVERE,
+        f"Severe: the port sat on the cap at least {SEV_SEVERE_PCT:.0f}% of hours "
+        f"in the {ANALYSIS_DAYS}-day window.",
+    ),
+    (
+        SEV_HIGH,
+        f"High: {SEV_HIGH_PCT:.0f}% to {SEV_SEVERE_PCT:.0f}% of hours on the cap. "
+        "The choke is clear on several days, but the port is not locked all window.",
+    ),
+    (
+        SEV_MODERATE,
+        f"Moderate: {SEV_MODERATE_PCT:.0f}% to {SEV_HIGH_PCT:.0f}% of hours on the cap. "
+        "Enough repeating hours to list the site, but the wall is not all-day.",
+    ),
+    (
+        SEV_LOW,
+        f"Low: under {SEV_MODERATE_PCT:.0f}% of hours on the cap. Usually a hard "
+        "ceiling (clipped top) or a last-day flag. Still choked — just fewer hours.",
+    ),
+)
+SNAP_DAYS = 3
+# Tx review flag: (Peak − Avg peak) / Peak ≥ 30% (DHGULAP-type traces).
+DOUBLE_CHECK_PEAK_GAP = 0.30
+# Action plan: Severe/High with a heavy busy-hour cap (budgeted Tx BW increase).
+ACTION_BUSY_PCT = 50.0
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def cap_window(busy_on: int, off_on: int) -> str:
+    """Where the flat ceiling sits across the day."""
+    if busy_on > 0 and off_on > 0:
+        return "Busy + off-peak"
+    if busy_on > 0:
+        return "Busy hours"
+    if off_on > 0:
+        return "Off-peak"
+    return "Partial"
+
+
+def last_day_text(rec: dict) -> str:
+    """Label for the last-day flag column. Always includes the date when flagged."""
+    if not rec.get("last_flag"):
+        return "—"
+    return (
+        f"{rec['last_day_label']} · {rec['last_on']}h "
+        f"(busy {rec['last_busy']}, off-peak {rec['last_off']})"
+    )
+
+
+def listed_by_text(week_flag: bool, last_flag: bool) -> str:
+    if week_flag and last_flag:
+        return "≥3 days + last day"
+    if week_flag:
+        return "≥3 days"
+    return "Last day"
+
+
+def analyse(
+    df: pd.DataFrame,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Return the hourly frame (with KPI columns) and the choked-site records."""
+    start = ANALYSIS_START if start is None else pd.Timestamp(start)
+    end = ANALYSIS_END if end is None else pd.Timestamp(end)
+    work = df.copy()
+    work["Date"] = parse_kpi_date(work["Date"])
+    work["Rx"] = work[RX_COL] / 1000.0 / 1000.0
+    work["TxBW"] = work[TXBW_COL] / 1000.0
+    work["Hour"] = parse_hour(work["Time"])
+    work["ts"] = work["Date"] + pd.to_timedelta(work["Hour"], unit="h")
+    work = work.sort_values(["eNodeB Name", "ts"])
+    work = work.drop_duplicates(["eNodeB Name", "ts"], keep="last")
+
+    work = work[(work["Date"] >= start) & (work["Date"] <= end)].copy()
+    if work.empty:
+        raise SystemExit(
+            f"No rows in the requested window {start.date()} – {end.date()}"
+        )
+    work = work.reset_index(drop=True)
+    period_end = end.normalize()
+    last_day = period_end.date()
+    last_day_label = period_end.strftime("%-d-%b-%y")
+
+    records: list[dict] = []
+    on_cap = np.zeros(len(work), dtype=bool)
+    stuck_level = np.full(len(work), np.nan)
+
+    for site, idx in work.groupby("eNodeB Name", sort=False).groups.items():
+        s = work.loc[idx]
+        rx = s["Rx"].to_numpy(dtype=float)
+        if len(rx) < 24 or float(np.nanmax(rx)) < MIN_CENTER_MBPS:
+            continue
+        hours = s["Hour"].to_numpy()
+        busy = (hours >= BUSY_START) & (hours <= BUSY_END)
+        offpeak = ~busy
+        night = (hours >= NIGHT_START) & (hours <= NIGHT_END)
+        days = s["Date"].dt.date.to_numpy()
+
+        # Two ways to find the cap. The crowded level (sample-snap shape) is
+        # tried first; if the trace is not crowded on one level, the top of
+        # the trace is tried as a hard ceiling. The first one that passes
+        # every test decides the site.
+        candidates = []
+        center, tol, band = find_plateau(rx)
+        overshoot = float(np.quantile(rx, 0.99) - center)
+        if center >= MIN_CENTER_MBPS and overshoot <= max(
+            OVERSHOOT_MBPS, OVERSHOOT_FRAC * center
+        ):
+            candidates.append((CAP_CROWDED, center, tol, band))
+        c_center, c_tol, c_band, c_above = find_ceiling(rx)
+        if c_center >= MIN_CENTER_MBPS and c_above <= CEIL_MAX_ABOVE:
+            candidates.append((CAP_CEILING, c_center, c_tol, c_band))
+
+        chosen = None
+        for cap_type, center, tol, band in candidates:
+            in_band_std = float(np.std(rx[band])) if band.any() else 999.0
+            if in_band_std > max(STD_MBPS, STD_FRAC * center):
+                continue
+            day_on: dict = defaultdict(int)
+            day_busy: dict = defaultdict(int)
+            day_off: dict = defaultdict(int)
+            for day, flag, is_busy in zip(days, band, busy):
+                if not flag:
+                    continue
+                day_on[day] += 1
+                if is_busy:
+                    day_busy[day] += 1
+                else:
+                    day_off[day] += 1
+            days_on_cap = sum(v >= STUCK_DAY_HOURS for v in day_on.values())
+            week_flag = days_on_cap >= MIN_DAYS_ON_CAP
+            last_on = int(day_on.get(last_day, 0))
+            last_flag = last_on >= LAST_DAY_HOURS
+            if week_flag or last_flag:
+                chosen = (cap_type, center, tol, band, in_band_std)
+                break
+        if chosen is None:
+            continue
+        cap_type, center, tol, band, in_band_std = chosen
+        overshoot = float(np.quantile(rx, 0.99) - center)
+        last_busy = int(day_busy.get(last_day, 0))
+        last_off = int(day_off.get(last_day, 0))
+        days_total = int(s["Date"].dt.normalize().nunique())
+
+        hours_pct = 100.0 * float(band.mean())
+        run = longest_run(s["ts"].to_numpy(), band)
+
+        bw = float(np.median(s["TxBW"].to_numpy()))
+        if bw <= 0:
+            continue
+        util = center / bw
+        night_rx = float(np.median(rx[night])) if night.any() else float("nan")
+        busy_on = int(band[busy].sum()) if busy.any() else 0
+        off_on = int(band[offpeak].sum()) if offpeak.any() else 0
+        busy_n = int(busy.sum())
+        off_n = int(offpeak.sum())
+        pos = work.index.get_indexer(s.index)
+        on_cap[pos] = band
+        stuck_level[pos] = center
+
+        records.append(
+            {
+                "site": site,
+                "severity": severity(hours_pct),
+                "cap_type": cap_type,
+                "bw": bw,
+                "center": center,
+                "tol": tol,
+                "max_rx": float(rx.max()),
+                "overshoot": overshoot,
+                "in_band_std": in_band_std,
+                "util": 100.0 * util,
+                "hours_on": int(band.sum()),
+                "hours_n": int(len(band)),
+                "hours_pct": hours_pct,
+                "busy_on": busy_on,
+                "busy_n": busy_n,
+                "busy_pct": 100.0 * busy_on / busy_n if busy_n else 0.0,
+                "off_on": off_on,
+                "off_n": off_n,
+                "off_pct": 100.0 * off_on / off_n if off_n else 0.0,
+                "cap_when": cap_window(busy_on, off_on),
+                "all_pct": hours_pct,
+                "days_on_cap": days_on_cap,
+                "days_total": days_total,
+                "week_flag": week_flag,
+                "last_flag": last_flag,
+                "last_day": last_day,
+                "last_day_label": last_day_label,
+                "last_on": last_on,
+                "last_busy": last_busy,
+                "last_off": last_off,
+                "listed_by": listed_by_text(week_flag, last_flag),
+                "longest": run,
+                "night_rx": night_rx,
+                "reference": site in REFERENCE_SITES,
+                "n": int(len(rx)),
+                "start": s["Date"].min(),
+                "end": s["Date"].max(),
+            }
+        )
+
+    work["OnCap"] = on_cap
+    work["StuckLevel"] = stuck_level
+    listed_order = {"≥3 days + last day": 0, "≥3 days": 1, "Last day": 2}
+    records.sort(
+        key=lambda r: (
+            SEVERITY_ORDER[r["severity"]],
+            listed_order[r["listed_by"]],
+            -r["hours_pct"],
+            r["site"],
+        )
+    )
+    return work, records
+
+
+def _require_references(records: list[dict]) -> None:
+    found = {r["site"] for r in records}
+    missing = [site for site in REFERENCE_SITES if site not in found]
+    if missing:
+        print(
+            "Note: sample snap sites were not classified as choked: "
+            + ", ".join(missing)
+        )
+
+
+def _styles(book):
+    def fmt(**kwargs):
+        base = {"font_name": "Calibri", "font_size": 10, "valign": "vcenter"}
+        base.update(kwargs)
+        return book.add_format(base)
+
+    return {
+        "title": fmt(font_size=20, bold=True, font_color=NAVY),
+        "subtitle": fmt(font_size=11, font_color=GREY),
+        "section": fmt(
+            bold=True, font_size=12, font_color="white", bg_color=NAVY, text_wrap=True
+        ),
+        "body": fmt(font_size=11, text_wrap=True, valign="top"),
+        "label": fmt(bold=True, font_color=NAVY, font_size=10),
+        "meta": fmt(font_size=10, font_color="black"),
+        "header": fmt(
+            bold=True,
+            font_size=10,
+            font_color="white",
+            bg_color=NAVY,
+            align="center",
+            text_wrap=True,
+            border=1,
+            border_color=NAVY,
+        ),
+        "text": fmt(border=1, border_color=LINE),
+        "text_z": fmt(border=1, border_color=LINE, bg_color=ZEBRA),
+        "int": fmt(border=1, border_color=LINE, align="center", num_format="0"),
+        "int_z": fmt(
+            border=1, border_color=LINE, align="center", num_format="0", bg_color=ZEBRA
+        ),
+        "num": fmt(border=1, border_color=LINE, align="center", num_format="0.00"),
+        "num_z": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            num_format="0.00",
+            bg_color=ZEBRA,
+        ),
+        "pct": fmt(border=1, border_color=LINE, align="center", num_format="0.0"),
+        "pct_z": fmt(
+            border=1, border_color=LINE, align="center", num_format="0.0", bg_color=ZEBRA
+        ),
+        "center": fmt(border=1, border_color=LINE, align="center"),
+        "center_z": fmt(border=1, border_color=LINE, align="center", bg_color=ZEBRA),
+        "link": fmt(
+            border=1, border_color=LINE, font_color=BLUE, underline=1, bold=True
+        ),
+        "link_z": fmt(
+            border=1,
+            border_color=LINE,
+            font_color=BLUE,
+            underline=1,
+            bold=True,
+            bg_color=ZEBRA,
+        ),
+        "at": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=ORANGE,
+            font_color=ORANGE_FONT,
+        ),
+        "at_z": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=ORANGE,
+            font_color=ORANGE_FONT,
+        ),
+        "severe": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color="#F4CCCC",
+            font_color="#990000",
+        ),
+        "high": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=ORANGE,
+            font_color=ORANGE_FONT,
+        ),
+        "moderate": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=AMBER,
+            font_color=AMBER_FONT,
+        ),
+        "low": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=GREEN,
+            font_color=GREEN_FONT,
+        ),
+        "above": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color="#F8CBAD",
+            font_color="#843C0C",
+        ),
+        "below": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=AMBER,
+            font_color=AMBER_FONT,
+        ),
+        "yes": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=GREEN,
+            font_color=GREEN_FONT,
+        ),
+        "yes_z": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            bold=True,
+            bg_color=GREEN,
+            font_color=GREEN_FONT,
+        ),
+        "banner": fmt(
+            bold=True, font_size=16, font_color="white", bg_color=NAVY, valign="vcenter"
+        ),
+        "kpi_label": fmt(bold=True, font_size=9, font_color=GREY, bg_color=PALE),
+        "kpi_value": fmt(bold=True, font_size=12, font_color=NAVY, bg_color=PALE),
+        "note": fmt(font_size=9, font_color=GREY, italic=True, text_wrap=True),
+        "method_head": fmt(
+            bold=True, font_color="white", bg_color=NAVY, border=1, border_color=NAVY
+        ),
+        "method_key": fmt(bold=True, border=1, border_color=LINE, valign="top"),
+        "method_val": fmt(border=1, border_color=LINE, valign="top", text_wrap=True),
+        "date": fmt(border=1, border_color=LINE, num_format="dd-mmm-yyyy", align="center"),
+        "date_z": fmt(
+            border=1,
+            border_color=LINE,
+            num_format="dd-mmm-yyyy",
+            align="center",
+            bg_color=ZEBRA,
+        ),
+        "time": fmt(border=1, border_color=LINE, num_format="hh:mm", align="center"),
+        "time_z": fmt(
+            border=1,
+            border_color=LINE,
+            num_format="hh:mm",
+            align="center",
+            bg_color=ZEBRA,
+        ),
+        "formula": fmt(border=1, border_color=LINE, align="center", num_format="0.00"),
+        "formula_z": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            num_format="0.00",
+            bg_color=ZEBRA,
+        ),
+        "raw": fmt(border=1, border_color=LINE, align="center", num_format="#,##0"),
+        "raw_z": fmt(
+            border=1,
+            border_color=LINE,
+            align="center",
+            num_format="#,##0",
+            bg_color=ZEBRA,
+        ),
+    }
+
+
+def _severity_format(styles, level: str, zebra: bool):
+    if level == SEV_SEVERE:
+        return styles["severe"]
+    if level == SEV_HIGH:
+        return styles["high"]
+    if level == SEV_MODERATE:
+        return styles["moderate"]
+    if level == SEV_LOW:
+        return styles["low"]
+    return styles["center_z"] if zebra else styles["center"]
+
+
+def _page(ws, title: str, *, fit_width: bool = True):
+    ws.set_landscape()
+    ws.set_paper(9)  # A4
+    ws.set_margins(left=0.45, right=0.45, top=0.6, bottom=0.5)
+    # Snapshots must not be scaled onto the page width: that crushes the
+    # two-row date/time axis into one overlapping band.
+    if fit_width:
+        ws.fit_to_pages(1, 0)
+    ws.set_header(f"&L&8&K1F4E79{title}&R&8{REPORT_TITLE}  |  DHK")
+    ws.set_footer("&L&8Choked = RxMaxSpeed stuck flat&R&8Page &P of &N")
+    ws.hide_gridlines(2)
+    ws.set_tab_color(NAVY)
+
+
+
+def _chart_y_scale(values: list[float]) -> tuple[int, int]:
+    """Pick Y max and tick size so a low stuck level is not lost on a 0–100 axis.
+
+    Example: DHDRS99 at 33.31 Mbit/s uses 0–50 with ticks of 10, not 0–100 / 50.
+    """
+    finite = [float(v) for v in values if np.isfinite(v)]
+    peak = max(finite) if finite else 50.0
+    target = max(peak * 1.15, peak + 4.0)
+    brackets = (
+        (25, 5),
+        (50, 10),
+        (75, 25),
+        (100, 25),
+        (125, 25),
+        (150, 25),
+        (200, 50),
+        (250, 50),
+        (300, 50),
+        (350, 50),
+        (400, 50),
+        (500, 100),
+        (600, 100),
+        (800, 100),
+        (1000, 200),
+        (1500, 250),
+        (2000, 250),
+    )
+    for y_max, unit in brackets:
+        if target <= y_max:
+            return y_max, unit
+    y_max = int(np.ceil(target / 200.0) * 200)
+    return max(y_max, 200), 200
+
+
+def _avg_wall_peak(
+    rx_by_key: dict[tuple, float],
+    on_cap_by_key: dict[tuple, bool],
+    center: float,
+    chart_start,
+    chart_end,
+) -> float:
+    """Average of every chart-window hour that hits the wall.
+
+    For each day, collect Rx values that sit on the cap, reach that day's
+    highest value, or sit at/above the stuck wall (including after a cross).
+    The Avg peak line is the mean of those collected values across all days.
+    """
+    collected: list[float] = []
+    for day in pd.date_range(chart_start, chart_end, freq="D"):
+        day_n = day.normalize()
+        day_vals = [
+            rx_by_key[(day_n, hour)]
+            for hour in range(24)
+            if (day_n, hour) in rx_by_key and np.isfinite(rx_by_key[(day_n, hour)])
+        ]
+        if not day_vals:
+            continue
+        day_max = max(day_vals)
+        for hour in range(24):
+            key = (day_n, hour)
+            if key not in rx_by_key:
+                continue
+            rx = rx_by_key[key]
+            if not np.isfinite(rx):
+                continue
+            hit_wall = bool(on_cap_by_key.get(key, False))
+            hit_highest = rx >= day_max
+            hit_or_cross = np.isfinite(center) and rx >= center
+            if hit_wall or hit_highest or hit_or_cross:
+                collected.append(rx)
+    if not collected:
+        return float("nan")
+    return float(sum(collected) / len(collected))
+
+
+def _site_chart_peaks(work: pd.DataFrame, rec: dict, chart_start, chart_end) -> tuple[float, float]:
+    s = work.loc[work["eNodeB Name"] == rec["site"]]
+    s = s[(s["Date"] >= chart_start) & (s["Date"] <= chart_end)]
+    rx_by_key = {
+        (row["Date"].normalize(), int(row["Hour"])): float(row["Rx"])
+        for _, row in s.iterrows()
+    }
+    on_cap_by_key = {
+        (row["Date"].normalize(), int(row["Hour"])): bool(row.get("OnCap", False))
+        for _, row in s.iterrows()
+    }
+    chart_rx = [v for v in rx_by_key.values() if np.isfinite(v)]
+    peak_72 = float(max(chart_rx)) if chart_rx else float("nan")
+    avg_peak = _avg_wall_peak(
+        rx_by_key, on_cap_by_key, float(rec["center"]), chart_start, chart_end
+    )
+    return peak_72, avg_peak, rx_by_key, on_cap_by_key, s
+
+
+def _needs_double_check(peak_72: float, avg_peak: float) -> bool:
+    """True when Peak sits ~30% or more above Avg peak (radio demand, not a hard Tx wall)."""
+    if not (np.isfinite(peak_72) and np.isfinite(avg_peak) and peak_72 > 0):
+        return False
+    return (peak_72 - avg_peak) / peak_72 >= DOUBLE_CHECK_PEAK_GAP
+
+
+def _on_action_plan(rec: dict) -> bool:
+    """Urgent Tx BW increase: Severe/High, high hours-on-cap, heavy busy-hour cap."""
+    if rec.get("severity") not in (SEV_SEVERE, SEV_HIGH):
+        return False
+    if rec.get("double_check"):
+        return False
+    if float(rec.get("hours_pct") or 0) < SEV_HIGH_PCT:
+        return False
+    if float(rec.get("busy_pct") or 0) < ACTION_BUSY_PCT:
+        return False
+    return True
+
+
+def _action_plan_records(records: list[dict]) -> list[dict]:
+    selected = [rec for rec in records if _on_action_plan(rec)]
+    selected.sort(
+        key=lambda rec: (
+            SEVERITY_ORDER[rec["severity"]],
+            -rec["hours_pct"],
+            -rec["busy_pct"],
+            rec["site"],
+        )
+    )
+    return selected
+
+
+def resolve_oss(path: Path) -> Path:
+    """Extract the OSS hourly CSV from the uploaded RAR, or use a CSV/xlsx as-is."""
+    if path.suffix.lower() == ".rar":
+        dest = Path("/tmp/oss_kpi")
+        dest.mkdir(parents=True, exist_ok=True)
+        csvs = sorted(dest.glob("*.csv"))
+        if not csvs:
+            subprocess.check_call(["unrar", "x", "-o+", str(path), f"{dest}/"])
+            csvs = sorted(dest.glob("*.csv"))
+        if not csvs:
+            raise SystemExit(f"No CSV extracted from {path.name}")
+        return csvs[0]
+    return path
+
+
+def oss_cell_layer_token(cell_name: str) -> str:
+    """Excel MID(Cell Name, 8, 3): L09 / L21 / L26 / LA."""
+    name = str(cell_name or "").strip().upper()
+    return name[OSS_LAYER_START : OSS_LAYER_START + OSS_LAYER_LEN]
+
+
+def oss_cell_band(cell_name: str) -> str:
+    """Map Cell Name layer token to L900 / L1800 / L2100 / L2600."""
+    token = oss_cell_layer_token(cell_name)
+    if token.startswith("L09"):
+        return OSS_BAND_COVERAGE
+    if token.startswith("L21"):
+        return OSS_BAND_L21
+    if token.startswith("L26"):
+        return OSS_BAND_L26
+    return OSS_BAND_CAPACITY_DEFAULT
+
+
+def oss_cell_is_capacity(cell_name: str) -> bool:
+    """Keep L1800 / L2100 / L2600. Drop L900 coverage."""
+    return oss_cell_band(cell_name) != OSS_BAND_COVERAGE
+
+
+def _capacity_mask(names: pd.Series) -> pd.Series:
+    """True for L1800 / L2100 / L2600. False for L900 (MID 8,3 = L09)."""
+    token = (
+        names.astype(str)
+        .str.strip()
+        .str.upper()
+        .str.slice(OSS_LAYER_START, OSS_LAYER_START + OSS_LAYER_LEN)
+    )
+    return ~token.str.startswith("L09", na=False)
+
+
+def aggregate_capacity_cells_to_site(cell_df: pd.DataFrame) -> pd.DataFrame:
+    """Capacity cells only → one row per site-hour, like the previous OSS site file.
+
+    Skip: Cell TDD Indication / Cell FDD TDD Indication, Cell Name, LocalCell Id,
+    eNodeB Function Name, Integrity. Sum volume / N / D / Mean User / Max User /
+    PRB N/D. Average DL User Throughput,Mbps and DL PRB Utilization.
+    BusyHour still scores Throughput and DLPRBUtilization,% from N/D.
+    """
+    if OSS_CELL_COL not in cell_df.columns:
+        raise SystemExit(f"Cell-level OSS missing column: {OSS_CELL_COL}")
+    work = cell_df.loc[_capacity_mask(cell_df[OSS_CELL_COL])].copy()
+    keys = [c for c in ("Date", "Time", "eNodeB Name") if c in work.columns]
+    if len(keys) < 3:
+        raise SystemExit("Cell-level OSS needs Date, Time, and eNodeB Name")
+    agg: dict[str, str] = {}
+    for col in OSS_CELL_SUM_COLS:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+            agg[col] = "sum"
+    for col in OSS_CELL_AVG_COLS:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+            agg[col] = "mean"
+    if not agg:
+        raise SystemExit("Cell-level OSS has none of the expected KPI columns")
+    out = work.groupby(keys, as_index=False, sort=False).agg(agg)
+    ordered = [c for c in OSS_SITE_OUT_COLS if c in out.columns]
+    return out[ordered]
+
+
+def _cell_part1_files() -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for folder in (Path("/workspace"), Path(".")):
+        for path in sorted(folder.glob(OSS_CELL_PART1_GLOB)):
+            key = path.resolve()
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+    return out
+
+
+def _extract_split_rar(part1: Path, dest: Path) -> Path:
+    return _extract_rar_csvs(part1, dest)[0]
+
+
+def combine_cell_level_oss() -> pd.DataFrame:
+    """Unrar each day’s split parts and concatenate into one cell-level table."""
+    parts = _cell_part1_files()
+    if not parts:
+        raise SystemExit(f"No cell-level OSS parts matching {OSS_CELL_PART1_GLOB}")
+    frames: list[pd.DataFrame] = []
+    for part1 in parts:
+        dest = Path("/tmp/oss_cell_extract") / part1.name.replace(".part1.rar", "")
+        csv_path = _extract_split_rar(part1, dest)
+        print(f"Loaded cell-level {csv_path.name}", flush=True)
+        frames.append(pd.read_csv(csv_path))
+    combined = pd.concat(frames, ignore_index=True)
+    OSS_CELL_COMBINED.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(OSS_CELL_COMBINED, index=False)
+    print(
+        f"Combined cell-level: {len(combined):,} rows → {OSS_CELL_COMBINED}",
+        flush=True,
+    )
+    return combined
+
+
+def ensure_capacity_site_oss() -> Path:
+    """Build capacity-only site-hour OSS from cell-level parts if needed."""
+    out = _find_input(OSS_FILE) or Path("/workspace") / OSS_FILE
+    parts = _cell_part1_files()
+    if out.exists() and parts:
+        newest_part = max(p.stat().st_mtime for p in parts)
+        if out.stat().st_mtime >= newest_part:
+            print(f"Using existing capacity site OSS {out}", flush=True)
+            return out
+    print("Building capacity-only site-hour OSS (exclude L900)...", flush=True)
+    combined = combine_cell_level_oss()
+    n_cell = len(combined)
+    keep = int(_capacity_mask(combined[OSS_CELL_COL]).sum()) if OSS_CELL_COL in combined.columns else n_cell
+    print(f"L900 coverage dropped: {n_cell - keep:,} of {n_cell:,} cells", flush=True)
+    site = aggregate_capacity_cells_to_site(combined)
+    out = Path("/workspace") / OSS_FILE
+    site.to_csv(out, index=False)
+    print(f"Wrote capacity site-hour OSS: {len(site):,} rows → {out}", flush=True)
+    return out
+
+
+def load_oss_table(path: Path) -> pd.DataFrame:
+    """Read CSV/xlsx; if Cell Name is present, roll capacity cells up to site-hour."""
+    raw = pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    if OSS_CELL_COL in raw.columns:
+        raw = aggregate_capacity_cells_to_site(raw)
+    return raw
+
+
+def load_oss_kpi(path: Path) -> pd.DataFrame:
+    """Hourly OSS radio KPI for the analysis window. Throughput is N/D, not the file’s Mbps column."""
+    raw = load_oss_table(path)
+    need = {
+        "Date",
+        "Time",
+        "eNodeB Name",
+        OSS_VOL_COL,
+        OSS_USER_COL,
+        OSS_TP_N_COL,
+        OSS_TP_D_COL,
+        OSS_PRB_N_COL,
+        OSS_PRB_D_COL,
+    }
+    missing = need - set(raw.columns)
+    if missing:
+        raise SystemExit(f"OSS KPI missing columns: {', '.join(sorted(missing))}")
+    work = raw.copy()
+    work["Date"] = parse_kpi_date(work["Date"])
+    work["Hour"] = parse_hour(work["Time"])
+    work["site"] = work["eNodeB Name"].astype(str).str.strip()
+    work["vol"] = pd.to_numeric(work[OSS_VOL_COL], errors="coerce")
+    work["users"] = pd.to_numeric(work[OSS_USER_COL], errors="coerce")
+    work["tp_n"] = pd.to_numeric(work[OSS_TP_N_COL], errors="coerce")
+    work["tp_d"] = pd.to_numeric(work[OSS_TP_D_COL], errors="coerce")
+    work["prb_n"] = pd.to_numeric(work[OSS_PRB_N_COL], errors="coerce")
+    work["prb_d"] = pd.to_numeric(work[OSS_PRB_D_COL], errors="coerce")
+    work = work[(work["Date"] >= ANALYSIS_START) & (work["Date"] <= ANALYSIS_END)].copy()
+    if work.empty:
+        raise SystemExit(
+            f"OSS KPI has no rows in {ANALYSIS_START.date()} – {ANALYSIS_END.date()}"
+        )
+    return work
+
+
+def _format_busy_hours(hours: list[int]) -> str:
+    return ", ".join(f"{hour}:00" for hour in hours)
+
+
+def _top_n_hours(day: pd.DataFrame, col: str, n: int) -> list[int]:
+    """Largest-to-lowest values; keep the first n hours in that rank order."""
+    ranked = day.dropna(subset=[col]).sort_values(col, ascending=False, kind="mergesort")
+    return [int(hour) for hour in ranked["Hour"].head(n).tolist()]
+
+
+def _oss_ratio(num: float, den: float) -> float:
+    if not (np.isfinite(den) and den):
+        return float("nan")
+    return float(num / den)
+
+
+def _nanmean(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size else float("nan")
+
+
+def _poor_dl(*values: float) -> bool:
+    """True when any finite DL throughput is ≤ OSS_POOR_TP_MBPS."""
+    return any(np.isfinite(v) and float(v) <= OSS_POOR_TP_MBPS for v in values)
+
+
+def _high_choke(*pcts: float) -> bool:
+    """True when any Hours matched % is ≥ OSS_CHOKE_MATCH_PCT."""
+    return any(np.isfinite(v) and float(v) >= OSS_CHOKE_MATCH_PCT for v in pcts)
+
+
+def _busy_sort_key(row: dict):
+    return (
+        0 if row.get("flag_41h") else 1,
+        0 if row.get("flag_4h") else 1,
+        0 if row.get("flag_1h") else 1,
+        0 if row.get("data1_choke_high") else 1,
+        0 if row.get("user1_choke_high") else 1,
+        0 if row.get("data1_busy_poor") else 1,
+        0 if row.get("user1_busy_poor") else 1,
+        0 if row.get("data4_choke_high") else 1,
+        0 if row.get("user4_choke_high") else 1,
+        0 if row.get("data4_busy_poor") else 1,
+        0 if row.get("user4_busy_poor") else 1,
+        0 if row.get("data_choke_high") else 1,
+        0 if row.get("user_choke_high") else 1,
+        0 if row.get("data_busy_poor") else 1,
+        0 if row.get("user_busy_poor") else 1,
+        -float(row.get("data1_hours_matched_pct") or 0),
+        -float(row.get("user1_hours_matched_pct") or 0),
+        -float(row.get("data4_hours_matched_pct") or 0),
+        -float(row.get("user4_hours_matched_pct") or 0),
+        -float(row.get("data_hours_matched_pct") or 0),
+        -float(row.get("user_hours_matched_pct") or 0),
+        SEVERITY_ORDER.get(row.get("severity"), 99),
+        -float(row.get("hours_pct") or 0),
+        row["site"],
+    )
+
+
+def _attach_window_filter_flags(rows: list[dict]) -> list[dict]:
+    """Yes flags from the 1 BusyHour and 4 BusyHour sections only."""
+    for row in rows:
+        row["data1_choke_high"] = _high_choke(
+            row.get("data1_hours_matched_pct", float("nan"))
+        )
+        row["user1_choke_high"] = _high_choke(
+            row.get("user1_hours_matched_pct", float("nan"))
+        )
+        row["data1_busy_poor"] = _poor_dl(row.get("tp_data_1h", float("nan")))
+        row["user1_busy_poor"] = _poor_dl(row.get("tp_user_1h", float("nan")))
+        row["data4_choke_high"] = _high_choke(
+            row.get("data4_hours_matched_pct", float("nan"))
+        )
+        row["user4_choke_high"] = _high_choke(
+            row.get("user4_hours_matched_pct", float("nan"))
+        )
+        row["data4_busy_poor"] = _poor_dl(row.get("tp_data_4h", float("nan")))
+        row["user4_busy_poor"] = _poor_dl(row.get("tp_user_4h", float("nan")))
+        choke4 = row["data4_choke_high"] or row["user4_choke_high"]
+        tp4 = row["data4_busy_poor"] or row["user4_busy_poor"]
+        row["flag_4h"] = bool(choke4 and tp4)
+        choke1 = row["data1_choke_high"] or row["user1_choke_high"]
+        tp1 = row["data1_busy_poor"] or row["user1_busy_poor"]
+        row["flag_1h"] = bool(choke1 and tp1)
+        row["flag_41h"] = bool(row["flag_4h"] or row["flag_1h"])
+    rows.sort(key=_busy_sort_key)
+    return rows
+
+
+def _fege_oncap_lookup(work: pd.DataFrame) -> dict[tuple[str, pd.Timestamp, int], bool]:
+    """(site, date, hour) → FEGE OnCap for the analysis window."""
+    lookup: dict[tuple[str, pd.Timestamp, int], bool] = {}
+    sites = work["eNodeB Name"].astype(str).str.strip()
+    for site, date, hour, on in zip(sites, work["Date"], work["Hour"], work["OnCap"]):
+        lookup[(site, pd.Timestamp(date).normalize(), int(hour))] = bool(on)
+    return lookup
+
+
+def _count_choked_hours(
+    lookup: dict[tuple[str, pd.Timestamp, int], bool],
+    site: str,
+    day: pd.Timestamp,
+    hours: list[int],
+) -> int:
+    day = pd.Timestamp(day).normalize()
+    return sum(1 for hour in hours if lookup.get((site, day, hour), False))
+
+
+def _listed_because(any_day: bool, last_day_ok: bool) -> str:
+    if any_day and last_day_ok:
+        return "Any day + last day"
+    if last_day_ok:
+        return "Last day"
+    if any_day:
+        return "Any day"
+    return "—"
+
+
+def _score_oss_busy(
+    frame: pd.DataFrame,
+    days: list[pd.Timestamp],
+    last_day: pd.Timestamp,
+    oncap: dict[tuple[str, pd.Timestamp, int], bool],
+    site: str,
+    value_col: str,
+    n: int,
+) -> dict:
+    """Top-n busy hours, FEGE choke overlap, n-hour DL tp / PRB, avg volume/users."""
+    txt: dict[pd.Timestamp, str] = {}
+    any_day = last_ok = False
+    choked = last_choked = 0
+    n_tp = d_tp = 0.0
+    n_prb = d_prb = 0.0
+    vols: list[float] = []
+    users: list[float] = []
+    for day in days:
+        g = frame[frame["Date"] == day]
+        hours = _top_n_hours(g, value_col, n)
+        txt[day] = _format_busy_hours(hours)
+        if hours:
+            any_day = True
+            if day == last_day:
+                last_ok = True
+        choke = _count_choked_hours(oncap, site, day, hours)
+        choked += choke
+        if day == last_day:
+            last_choked = choke
+        if hours:
+            sub = g[g["Hour"].isin(hours)]
+            n_tp += float(sub["tp_n"].sum(skipna=True))
+            d_tp += float(sub["tp_d"].sum(skipna=True))
+            n_prb += float(sub["prb_n"].sum(skipna=True))
+            d_prb += float(sub["prb_d"].sum(skipna=True))
+            vols.extend(sub["vol"].tolist())
+            users.extend(sub["users"].tolist())
+    window = n * len(days)
+    prb = _oss_ratio(n_prb, d_prb)
+    return {
+        "hours": txt,
+        "any": any_day,
+        "last": last_ok,
+        "matched": choked,
+        "matched_n": window,
+        "matched_pct": 100.0 * choked / window if window else 0.0,
+        "last_text": f"{last_choked}h choked / {n}" if last_ok else "—",
+        "listed": _listed_because(any_day, last_ok),
+        "tp": _oss_ratio(n_tp, d_tp),
+        "prb": 100.0 * prb if np.isfinite(prb) else float("nan"),
+        "avg_vol": _nanmean(vols),
+        "avg_users": _nanmean(users),
+    }
+
+
+def _block_fields(
+    prefix: str, scored: dict, tp_key: str, vol_key: str, user_key: str, prb_key: str
+) -> dict:
+    return {
+        f"{prefix}_hours": scored["hours"],
+        f"{prefix}_hours_matched": scored["matched"],
+        f"{prefix}_hours_matched_n": scored["matched_n"],
+        f"{prefix}_hours_matched_pct": scored["matched_pct"],
+        f"{prefix}_last_match": scored["last"],
+        f"{prefix}_last_match_text": scored["last_text"],
+        f"{prefix}_listed": scored["listed"],
+        tp_key: scored["tp"],
+        vol_key: scored["avg_vol"],
+        user_key: scored["avg_users"],
+        prb_key: scored["prb"],
+    }
+
+
+def analyse_urgent_busy_hours(
+    oss: pd.DataFrame,
+    records: list[dict],
+    work: pd.DataFrame,
+    tech_by_site: dict[str, str] | None = None,
+) -> list[dict]:
+    """Scan every OSS site independently of UrgentTxBWInc.
+
+    Listing is OSS-only: DataBusyHour and UserBusyHour can be filled for any
+    day in the analysis window, or for the last day. 7, 4, and 1 BusyHour
+    are scored the same way. Hours matched still uses FEGE OnCap.
+    """
+    if oss is None or oss.empty:
+        return []
+    tech_by_site = tech_by_site or {}
+    issue_by_site = {rec["site"]: rec for rec in records}
+    days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
+    last_day = days[-1]
+    oncap = _fege_oncap_lookup(work)
+    out: list[dict] = []
+    for site, frame in oss.groupby("site", sort=False):
+        if frame is None or frame.empty:
+            continue
+        rec = issue_by_site.get(site) or {
+            "site": site,
+            "tech": tech_by_site.get(site, TECH_4G),
+            "severity": "—",
+            "hours_pct": 0.0,
+        }
+        d7 = _score_oss_busy(frame, days, last_day, oncap, site, "vol", OSS_BUSY_HOURS)
+        u7 = _score_oss_busy(frame, days, last_day, oncap, site, "users", OSS_BUSY_HOURS)
+        d4 = _score_oss_busy(frame, days, last_day, oncap, site, "vol", OSS_BUSY_HOURS_4)
+        u4 = _score_oss_busy(frame, days, last_day, oncap, site, "users", OSS_BUSY_HOURS_4)
+        d1 = _score_oss_busy(frame, days, last_day, oncap, site, "vol", OSS_BUSY_HOURS_1)
+        u1 = _score_oss_busy(frame, days, last_day, oncap, site, "users", OSS_BUSY_HOURS_1)
+        listed_7 = (d7["any"] and u7["any"]) or (d7["last"] and u7["last"])
+        listed_4 = (d4["any"] and u4["any"]) or (d4["last"] and u4["last"])
+        listed_1 = (d1["any"] and u1["any"]) or (d1["last"] and u1["last"])
+        if not (listed_7 or listed_4 or listed_1):
+            continue
+        out.append(
+            {
+                **rec,
+                "busy_days": days,
+                **_block_fields(
+                    "data", d7, "tp_data_7h", "vol_data_7h", "users_data_7h", "prb_data_7h"
+                ),
+                **_block_fields(
+                    "user", u7, "tp_user_7h", "vol_user_7h", "users_user_7h", "prb_user_7h"
+                ),
+                **_block_fields(
+                    "data4", d4, "tp_data_4h", "vol_data_4h", "users_data_4h", "prb_data_4h"
+                ),
+                **_block_fields(
+                    "user4", u4, "tp_user_4h", "vol_user_4h", "users_user_4h", "prb_user_4h"
+                ),
+                **_block_fields(
+                    "data1", d1, "tp_data_1h", "vol_data_1h", "users_data_1h", "prb_data_1h"
+                ),
+                **_block_fields(
+                    "user1", u1, "tp_user_1h", "vol_user_1h", "users_user_1h", "prb_user_1h"
+                ),
+                "data_busy_poor": _poor_dl(d7["tp"], d4["tp"], d1["tp"]),
+                "user_busy_poor": _poor_dl(u7["tp"], u4["tp"], u1["tp"]),
+                "data_choke_high": _high_choke(
+                    d7["matched_pct"], d4["matched_pct"], d1["matched_pct"]
+                ),
+                "user_choke_high": _high_choke(
+                    u7["matched_pct"], u4["matched_pct"], u1["matched_pct"]
+                ),
+            }
+        )
+    return _attach_window_filter_flags(out)
+
+
+def _attach_chart_peaks(work: pd.DataFrame, records: list[dict], chart_start, chart_end) -> None:
+    for rec in records:
+        peak_72, avg_peak, *_rest = _site_chart_peaks(work, rec, chart_start, chart_end)
+        rec["peak_72"] = peak_72
+        rec["avg_peak"] = avg_peak
+        rec["double_check"] = _needs_double_check(peak_72, avg_peak)
+
+
+def _rx_lookup(work: pd.DataFrame | None) -> dict[str, tuple[dict, dict]]:
+    """site → ({(date, hour): Rx}, {(date, hour): OnCap})."""
+    out: dict[str, tuple[dict, dict]] = {}
+    if work is None or work.empty:
+        return out
+    has_cap = "OnCap" in work.columns
+    for site, g in work.groupby(work["eNodeB Name"].astype(str).str.strip(), sort=False):
+        rx: dict[tuple, float] = {}
+        on_cap: dict[tuple, bool] = {}
+        dates = g["Date"]
+        hours = g["Hour"]
+        values = g["Rx"]
+        flags = g["OnCap"] if has_cap else None
+        for i in range(len(g)):
+            key = (pd.Timestamp(dates.iloc[i]).normalize(), int(hours.iloc[i]))
+            value = values.iloc[i]
+            if pd.notna(value):
+                rx[key] = float(value)
+            on_cap[key] = bool(flags.iloc[i]) if flags is not None else False
+        out[str(site)] = (rx, on_cap)
+    return out
+
+
+def _window_peaks(rx_map: dict, on_map: dict, center: float, start, end) -> tuple[float, float]:
+    chart_rx = []
+    for day in pd.date_range(start, end, freq="D"):
+        for hour in range(24):
+            value = rx_map.get((day.normalize(), hour))
+            if value is not None and np.isfinite(value):
+                chart_rx.append(value)
+    peak = float(max(chart_rx)) if chart_rx else float("nan")
+    avg_peak = _avg_wall_peak(rx_map, on_map, float(center) if np.isfinite(center) else float("nan"), start, end)
+    return peak, avg_peak
+
+
+def _kpi_text(value: float, digits: str = ".2f") -> str:
+    if value is None or not np.isfinite(value):
+        return "—"
+    return format(float(value), digits)
+
+
+def _write_snapshots(
+    book,
+    styles,
+    work,
+    records,
+    period_txt,
+    chart_start,
+    chart_end,
+    busy_rows: list[dict] | None = None,
+    latest_work: pd.DataFrame | None = None,
+    latest_start: pd.Timestamp | None = None,
+    latest_end: pd.Timestamp | None = None,
+) -> dict[str, int]:
+    ws = book.add_worksheet(SNAP_SHEET)
+    _page(ws, "Hourly chart of issue sites", fit_width=False)
+    ws.set_zoom(100)
+    ws.set_print_scale(100)
+    ws.set_tab_color(BLUE)
+    data = book.add_worksheet("_ChartData")
+    data.hide()
+
+    # The chart is about one screen wide, so it does not need a long sheet.
+    for col, width in enumerate([18, 16, 18, 16, 18, 16, 18, 16]):
+        ws.set_column(col, col, width)
+    ws.set_column(8, 23, 12)
+
+    busy_by_site = {row["site"]: row for row in (busy_rows or [])}
+    oss_headers = (
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+    )
+    oss_keys = (
+        "tp_data_4h",
+        "prb_data_4h",
+        "vol_data_4h",
+        "users_data_4h",
+        "tp_user_4h",
+        "prb_user_4h",
+        "vol_user_4h",
+        "users_user_4h",
+        "tp_data_1h",
+        "prb_data_1h",
+        "vol_data_1h",
+        "users_data_1h",
+        "tp_user_1h",
+        "prb_user_1h",
+        "vol_user_1h",
+        "users_user_1h",
+    )
+    hdr_new = _busy_section_header(book, "#FFFF00", "#1F4E79")
+    hdr_data4 = _busy_section_header(book, "#C65911", "white")
+    hdr_user4 = _busy_section_header(book, "#B7950B", "white")
+    hdr_data1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_user1 = _busy_section_header(book, "#1A5276", "white")
+    oss_col_fmt = [hdr_data4] * 4 + [hdr_user4] * 4 + [hdr_data1] * 4 + [hdr_user1] * 4
+
+    anchors: dict[str, int] = {}
+    # Fixed stride so the site list can link to row i * BLOCK_ROWS + 1.
+    block = BLOCK_ROWS
+
+    cat_fmt = book.add_format({"font_name": "Calibri", "font_size": 8, "align": "center"})
+
+    latest_start = LATEST_START if latest_start is None else pd.Timestamp(latest_start)
+    latest_end = LATEST_END if latest_end is None else pd.Timestamp(latest_end)
+    if records:
+        last_chart_col = (len(records) - 1) * 7 + 6
+        if last_chart_col > 16383:
+            raise SystemExit(
+                f"Hourly chart data needs {last_chart_col + 1} columns, past Excel's 16384 limit"
+            )
+    print("Indexing hourly Rx for both FEGE windows...", flush=True)
+    prev_maps = _rx_lookup(work)
+    latest_maps = _rx_lookup(latest_work)
+    prev_label = f"{chart_start.strftime('%-d %b')}–{chart_end.strftime('%-d %b')}"
+    latest_label = f"{latest_start.strftime('%-d %b')}–{latest_end.strftime('%-d %b')}"
+
+    def _hours_text(on, n, pct) -> str:
+        if not n:
+            return "not listed"
+        pct_txt = f"{pct:.1f}%" if pct is not None and np.isfinite(pct) else "—"
+        return f"{int(on)} / {int(n)}  ({pct_txt})"
+
+    print(f"Writing {len(records)} snapshot charts...")
+    for i, rec in enumerate(records):
+        if i and i % 200 == 0:
+            print(f"  snapshots {i}/{len(records)}", flush=True)
+        top = i * block
+        anchors[rec["site"]] = top
+        site = rec["site"]
+        prev_rx, prev_on = prev_maps.get(site, ({}, {}))
+        latest_rx, latest_on = latest_maps.get(site, ({}, {}))
+        prev_center = float(rec.get("center", float("nan")))
+        latest_center = float(rec.get("latest_center", float("nan")))
+        prev_peak, prev_avg = _window_peaks(prev_rx, prev_on, prev_center, chart_start, chart_end)
+        latest_peak, _latest_avg = _window_peaks(
+            latest_rx, latest_on, latest_center, latest_start, latest_end
+        )
+
+        # Two windows on one axis: 5–7 Oct, then 6–8 Nov.
+        # Date is written once per day so Excel groups the 24 hours under it.
+        c0 = i * 7
+        data.write(0, c0, "Date")
+        data.write(0, c0 + 1, "Time")
+        data.write(0, c0 + 2, "Rx prev")
+        data.write(0, c0 + 3, "Rx latest")
+        data.write(0, c0 + 4, "Peak prev")
+        data.write(0, c0 + 5, "AvgPeak prev")
+        data.write(0, c0 + 6, "Peak latest")
+        dates: list[str] = []
+        times: list[str] = []
+        plotted: list[float] = [
+            v for v in (prev_peak, prev_avg, latest_peak) if np.isfinite(v)
+        ]
+        r = 0
+        spans = (
+            (chart_start, chart_end, prev_rx, prev_peak, prev_avg, None),
+            (latest_start, latest_end, latest_rx, None, None, latest_peak),
+        )
+        for span_start, span_end, rx_map, peak_a, peak_b, peak_c in spans:
+            for day in pd.date_range(span_start, span_end, freq="D"):
+                date_label = f"{int(day.day)}/{MONTHS[int(day.month) - 1]}"
+                for hour in range(24):
+                    r += 1
+                    dates.append(date_label if hour == 0 else "")
+                    times.append(f"{hour:02d}:00")
+                    if hour == 0:
+                        data.write_string(r, c0, date_label, cat_fmt)
+                    else:
+                        data.write_blank(r, c0, None)
+                    data.write_string(r, c0 + 1, f"{hour:02d}:00", cat_fmt)
+                    value = rx_map.get((day.normalize(), hour))
+                    value_col = c0 + 2 if span_start == chart_start else c0 + 3
+                    if value is None or not np.isfinite(value):
+                        data.write_blank(r, value_col, None)
+                    else:
+                        data.write_number(r, value_col, value)
+                        plotted.append(value)
+                    for col, level in (
+                        (c0 + 4, peak_a),
+                        (c0 + 5, peak_b),
+                        (c0 + 6, peak_c),
+                    ):
+                        if level is not None and np.isfinite(level):
+                            data.write_number(r, col, level)
+        n = r
+
+        ws.set_row(top, 26)
+        finding = rec.get("finding") or ""
+        banner = f"{i + 1:04d}    {site}    ·    {rec.get('severity') or '—'}"
+        if finding:
+            banner += f"    ·    {finding}"
+        elif rec.get("reference"):
+            banner += "    ·    sample snap"
+        ws.merge_range(top, 0, top, 7, banner, styles["banner"])
+        ws.merge_range(top, 8, top, 11, "New Add · DataBusyHour (4H)", hdr_new)
+        ws.merge_range(top, 12, top, 15, "New Add · UserBusyHour (4H)", hdr_new)
+        ws.merge_range(top, 16, top, 19, "New Add · DataBusyHour (1H)", hdr_new)
+        ws.merge_range(top, 20, top, 23, "New Add · UserBusyHour (1H)", hdr_new)
+
+        labels = [
+            (
+                0,
+                "Tx BW prev → latest",
+                f"{_kpi_text(rec.get('bw', float('nan')))}  →  {_kpi_text(rec.get('latest_bw', float('nan')))}",
+            ),
+            (
+                2,
+                "Stuck Rx prev → latest",
+                f"{_kpi_text(prev_center)}  →  {_kpi_text(latest_center)}",
+            ),
+            (
+                4,
+                f"Hours on cap {prev_label}",
+                _hours_text(rec.get("hours_on", 0), rec.get("hours_n", 0), rec.get("hours_pct")),
+            ),
+            (
+                6,
+                f"Hours on cap {latest_label}",
+                _hours_text(
+                    rec.get("latest_hours_on", 0),
+                    rec.get("latest_hours_n", 0),
+                    rec.get("latest_hours_pct"),
+                ),
+            ),
+        ]
+        ws.set_row(top + 1, 28)
+        ws.set_row(top + 2, 20)
+        for col, label, _value in labels:
+            ws.merge_range(top + 1, col, top + 1, col + 1, label, styles["kpi_label"])
+        for col, _label, value in labels:
+            ws.merge_range(top + 2, col, top + 2, col + 1, value, styles["kpi_value"])
+        for offset, text in enumerate(oss_headers):
+            ws.write(top + 1, 8 + offset, text, oss_col_fmt[offset])
+        busy = busy_by_site.get(site, {})
+        for offset, key in enumerate(oss_keys):
+            value = busy.get(key, float("nan"))
+            if value is None or not np.isfinite(value):
+                ws.write_blank(top + 2, 8 + offset, None, styles["kpi_value"])
+            else:
+                ws.write_number(top + 2, 8 + offset, value, styles["kpi_value"])
+
+        ws.set_row(top + 3, 8)
+
+        if n == 0:
+            ws.merge_range(
+                top + 5,
+                0,
+                top + 5,
+                7,
+                "No hourly samples in the latest 3 days.",
+                styles["note"],
+            )
+            for r in range(top + 4, top + block):
+                ws.set_row(r, 15)
+            continue
+
+        chart = book.add_chart({"type": "line"})
+        chart.show_blanks_as("gap")
+        chart.set_title(
+            {
+                "name": site,
+                "name_font": {"name": "Calibri", "size": 16, "color": "#595959"},
+            }
+        )
+        def _add_line(name: str, col: int, color: str, dash: str | None = None) -> None:
+            line = {"color": color, "width": 1.5 if dash else 2.25}
+            if dash:
+                line["dash_type"] = dash
+            chart.add_series(
+                {
+                    "name": name,
+                    "categories": ["_ChartData", 1, c0, n, c0 + 1],
+                    "categories_data": [dates, times],
+                    "values": ["_ChartData", 1, col, n, col],
+                    "line": line,
+                    "marker": {"type": "none"},
+                }
+            )
+
+        _add_line(f"RxMaxSpeed {prev_label}", c0 + 2, "#5B9BD5")
+        _add_line(f"RxMaxSpeed {latest_label}", c0 + 3, "#548235")
+        if np.isfinite(prev_peak):
+            _add_line(f"Peak {prev_label} ({prev_peak:.2f})", c0 + 4, "#C00000", "dash")
+        if np.isfinite(prev_avg):
+            _add_line(f"Avg peak {prev_label} ({prev_avg:.2f})", c0 + 5, "#ED7D31", "dash")
+        if np.isfinite(latest_peak):
+            _add_line(f"Peak {latest_label} ({latest_peak:.2f})", c0 + 6, "#7030A0", "dash")
+        chart.set_x_axis(
+            {
+                "num_font": {
+                    "name": "Calibri",
+                    "size": 8,
+                    "color": "#595959",
+                    "rotation": -90,
+                },
+                "label_position": "nextTo",
+                "label_align": "center",
+                "position_axis": "on_tick",
+                "major_tick_mark": "none",
+                "minor_tick_mark": "none",
+                "major_gridlines": {"visible": False},
+                "minor_gridlines": {"visible": False},
+                "line": {"color": "#B0B0B0"},
+            }
+        )
+        y_max, y_unit = _chart_y_scale(plotted)
+        chart.set_y_axis(
+            {
+                "num_font": {"name": "Calibri", "size": 9, "color": "#595959"},
+                "min": 0,
+                "max": y_max,
+                "major_unit": y_unit,
+                "major_gridlines": {"visible": True, "line": {"color": "#D9D9D9"}},
+                "line": {"none": True},
+            }
+        )
+        chart.set_legend({"position": "top", "font": {"name": "Calibri", "size": 9}})
+        chart.set_chartarea({"border": {"color": "#D0D0D0"}, "fill": {"color": "white"}})
+        # Compact, precise chart layout matching the sample snap.
+        chart.set_plotarea(
+            {
+                "border": {"none": True},
+                "fill": {"color": "white"},
+                "layout": {"x": 0.06, "y": 0.16, "width": 0.91, "height": 0.58},
+            }
+        )
+        chart.set_size({"width": 1200, "height": 410})
+        # Don't let the chart shrink when the sheet is scaled or columns move.
+        ws.insert_chart(
+            top + 4,
+            0,
+            chart,
+            {"x_offset": 6, "y_offset": 6, "object_position": 2},
+        )
+
+        for r in range(top + 4, top + block):
+            ws.set_row(r, 16)
+
+    if records:
+        ws.set_h_pagebreaks([i * block for i in range(1, len(records))])
+    return anchors
+
+
+
+
+def _write_hourly(book, styles, work, records):
+    ws = book.add_worksheet("3. Hourly KPI")
+    _page(ws, "Hourly FEGE KPI — choked sites")
+    ws.set_tab_color("#5B9BD5")
+    headers = [
+        "Date",
+        "Time",
+        "eNodeB Name",
+        "VS.FEGE.RxMaxSpeed(bit/s)",
+        "RxMaxSpeed (Mbit/s)",
+        "VS.FEGE.TxTotalBW(kbit/s)",
+        "Tx Total BW (Mbit/s)",
+        "On cap",
+        "Stuck level (Mbit/s)",
+    ]
+    widths = [14, 10, 16, 30, 22, 30, 22, 12, 20]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+    ws.set_row(0, 30)
+    for col, text in enumerate(headers):
+        ws.write(0, col, text, styles["header"])
+
+    sites = [r["site"] for r in records]
+    hourly = work.loc[work["eNodeB Name"].isin(sites)].sort_values(
+        ["eNodeB Name", "ts"]
+    )
+    # Zebra by site, not by row, so a site reads as one block.
+    site_parity = {site: i % 2 for i, site in enumerate(sites)}
+
+    for excel_row, (_, row) in enumerate(hourly.iterrows(), start=1):
+        zebra = site_parity[row["eNodeB Name"]] == 1
+        ws.write_datetime(
+            excel_row,
+            0,
+            row["Date"].to_pydatetime(),
+            styles["date_z"] if zebra else styles["date"],
+        )
+        hh, mm = (int(p) for p in str(row["Time"]).split(":")[:2])
+        ws.write_datetime(
+            excel_row,
+            1,
+            time(hh, mm),
+            styles["time_z"] if zebra else styles["time"],
+        )
+        ws.write_string(
+            excel_row, 2, row["eNodeB Name"], styles["text_z"] if zebra else styles["text"]
+        )
+        ws.write_number(
+            excel_row, 3, float(row[RX_COL]), styles["raw_z"] if zebra else styles["raw"]
+        )
+        # Excel rows are 1-based; xlsxwriter row 1 is Excel row 2.
+        formula_row = excel_row + 1
+        ws.write_formula(
+            excel_row,
+            4,
+            f"=D{formula_row}/1000/1000",
+            styles["formula_z"] if zebra else styles["formula"],
+        )
+        ws.write_number(
+            excel_row, 5, float(row[TXBW_COL]), styles["raw_z"] if zebra else styles["raw"]
+        )
+        ws.write_formula(
+            excel_row,
+            6,
+            f"=F{formula_row}/1000",
+            styles["formula_z"] if zebra else styles["formula"],
+        )
+        ws.write_string(
+            excel_row,
+            7,
+            "Yes" if bool(row["OnCap"]) else "No",
+            styles["center_z"] if zebra else styles["center"],
+        )
+        ws.write_number(
+            excel_row,
+            8,
+            float(row["StuckLevel"]),
+            styles["num_z"] if zebra else styles["num"],
+        )
+
+    last = len(hourly)
+    ws.autofilter(0, 0, max(last, 1), len(headers) - 1)
+    ws.repeat_rows(0, 0)
+    ws.set_zoom(110)
+
+
+def _write_method(book, styles, source_name, period_txt, n_sites, records):
+    ws = book.add_worksheet("4. Method")
+    _page(ws, "How a site was judged choked")
+    ws.set_tab_color(GREY)
+    ws.set_column(0, 0, 36)
+    ws.set_column(1, 1, 88)
+    ws.set_row(0, 28)
+    ws.merge_range("A1:B1", "How RxMaxSpeed was judged stuck", styles["title"])
+    ws.set_row(1, 18)
+    ws.merge_range(
+        "A2:B2",
+        f"{source_name}    ·    {period_txt}    ·    {n_sites} sites, "
+        f"{len(records)} listed",
+        styles["subtitle"],
+    )
+
+    ws.set_row(3, 20)
+    ws.merge_range("A4:B4", "Counters", styles["section"])
+    rows = [
+        (
+            "RxMaxSpeed (Mbit/s)",
+            "VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000. "
+            "This is the trace on the sample charts. A flat top means the maximum "
+            "rate is no longer moving: the transmission path is limiting it.",
+        ),
+        (
+            "Tx Total BW (Mbit/s)",
+            "VS.FEGE.TxTotalBW(kbit/s) / 1000. "
+            "Configured FEGE transmit bandwidth for the same hour. "
+            "The site value in the list is the median across the period.",
+        ),
+    ]
+    for i, (key, val) in enumerate(rows):
+        r = 4 + i
+        ws.set_row(r, 48)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
+    ws.set_row(7, 20)
+    ws.merge_range("A8:B8", "What the sample snaps show", styles["section"])
+    ws.set_row(8, 72)
+    ws.merge_range(
+        "A9:B9",
+        "DHAPT35 and DHAPT48 were used as the pattern, not as a filter by name. "
+        "On both charts RxMaxSpeed falls in the early morning and then locks to "
+        "one level from about 08:00 through the evening (about 270 Mbit/s on "
+        "DHAPT35, about 241 Mbit/s on DHAPT48). Hours on that level differ by "
+        "only 1–3 Mbit/s, and the line never rises above it. A normal site in "
+        "this file reaches a different maximum every hour, often tens of Mbit/s "
+        "apart, so it is not listed.",
+        styles["method_val"],
+    )
+
+    ws.set_row(10, 20)
+    ws.merge_range("A11:B11", "Rule applied to every site", styles["section"])
+    rules = [
+        (
+            f"Cap shape 1 — {CAP_CROWDED}",
+            "The level in the upper half of the trace that contains the most "
+            f"hourly samples inside ±{TOL_MBPS:.1f} Mbit/s "
+            f"(or ±{TOL_FRAC:.0%} of the 95th percentile, when that is wider). "
+            "The level is the median of those samples. The 99th percentile of "
+            f"RxMaxSpeed may sit at most {OVERSHOOT_MBPS:.0f} Mbit/s above it "
+            f"(or {OVERSHOOT_FRAC:.0%} of the level, when that is wider). "
+            "This is the DHAPT35 / DHAPT48 shape: the line locks to one level.",
+        ),
+        (
+            f"Cap shape 2 — {CAP_CEILING}",
+            "Tried when shape 1 does not fit. The same search is run only over "
+            f"the top {1 - CEIL_TOP_Q:.0%} of the samples, so the level is the top "
+            "the trace keeps returning to. The line may not go above that top "
+            f"by more than {CEIL_OVER_MBPS:.0f} Mbit/s (or {CEIL_OVER_FRAC:.0%}); "
+            f"at most {CEIL_MAX_ABOVE} glitch hour is excused. This catches ports "
+            "that move up and down during the day but are clipped at one value "
+            "every time they rise (the ~500 Mbit/s group such as DHSVRS5, "
+            "GPSDR01, DHKKT87, and DHKKTE2 whose cap moved from 270 to 352). "
+            "Cap shape is shown on the site list.",
+        ),
+        (
+            "Not listed (outliers)",
+            "A trace whose peaks keep changing — spikes of tens to hundreds of "
+            "Mbit/s above the crowded level and no fixed top (DHGULN2, DHDHN40, "
+            "DHBDD32, DHDHN09) — fails both shapes. It is busy, not choked, and is "
+            "not listed.",
+        ),
+        (
+            "Analysis window",
+            f"Only {ANALYSIS_START.strftime('%-d %b %Y')} – "
+            f"{ANALYSIS_END.strftime('%-d %b %Y')} ({ANALYSIS_DAYS} days) is scored. "
+            "Earlier days in the combined Dhaka source (28 Sep–1 Oct) are ignored.",
+        ),
+        (
+            "Hours on the cap (all 24h)",
+            "Every hour is scored — busy hours "
+            f"({BUSY_START:02d}:00–{BUSY_END:02d}:00) and off-peak / night hours. "
+            "A site that is only flat at night is still listed.",
+        ),
+        (
+            "Repeats across days",
+            f"A day counts as on-cap when at least {STUCK_DAY_HOURS} hours "
+            "(any hour of the day, busy or off-peak) sit on the stuck level. "
+            f"A site is listed when this happens on at least {MIN_DAYS_ON_CAP} of the "
+            f"{ANALYSIS_DAYS} days.",
+        ),
+        (
+            "Last day flag",
+            f"Independently, the last day of the window is flagged when at least "
+            f"{LAST_DAY_HOURS} hours that day (busy and/or off-peak) sit on the "
+            "stuck level. The date is written in the Last day cap column. "
+            "A site can be listed for the last-day flag even if it has fewer than "
+            f"{MIN_DAYS_ON_CAP} on-cap days.",
+        ),
+        (
+            "Continuous flat run",
+            f"Longest consecutive run on the cap is reported. A day still counts "
+            f"when {STUCK_DAY_HOURS} hours sit on the level even if they are not "
+            "adjacent.",
+        ),
+        (
+            "Tightness",
+            f"Samples on the cap have a standard deviation of at most {STD_MBPS:.1f} Mbit/s "
+            f"(or {STD_FRAC:.0%} of the stuck level, when that is wider).",
+        ),
+        (
+            "Severity",
+            f"Severe ≥ {SEV_SEVERE_PCT:.0f}% of hours on the cap; "
+            f"High {SEV_HIGH_PCT:.0f}–{SEV_SEVERE_PCT:.0f}%; "
+            f"Moderate {SEV_MODERATE_PCT:.0f}–{SEV_HIGH_PCT:.0f}%; "
+            f"Low under {SEV_MODERATE_PCT:.0f}%. "
+            "This is the share of hours sitting on the wall, not a comparison "
+            "with the RAN Tx Total BW counter.",
+        ),
+        (
+            "Tx Total BW column",
+            "VS.FEGE.TxTotalBW is a RAN-side counter, not the transmission "
+            "engineered bandwidth. It is shown for reference only and is not "
+            "used to list or grade a site.",
+        ),
+        (
+            "Night Rx",
+            f"Median RxMaxSpeed from {NIGHT_START:02d}:00 to {NIGHT_END:02d}:00. "
+            "Shown so the night dip on the sample charts can be compared. "
+            "A site that stays on the cap through the night is still listed: "
+            "that link is full all day.",
+        ),
+    ]
+    for i, (key, val) in enumerate(rules):
+        r = 11 + i
+        ws.set_row(r, 48)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
+    foot = 11 + len(rules) + 1
+    ws.set_row(foot, 20)
+    ws.merge_range(foot, 0, foot, 1, "Check against the sample snaps", styles["section"])
+    ws.set_row(foot + 1, 36)
+    ws.merge_range(
+        foot + 1,
+        0,
+        foot + 1,
+        1,
+        "DHAPT35 and DHAPT48 are the sample-snap pattern. Scoring uses "
+        f"{ANALYSIS_START.strftime('%-d-%b-%y')} to "
+        f"{ANALYSIS_END.strftime('%-d-%b-%y')} and every hour. "
+        "Each snapshot is a clean chart of those three days: "
+        "hourly timestamps 00:00 to 23:00, "
+        "and the date is shown once under that day. The chart title is the site name.",
+        styles["method_val"],
+    )
+
+    last_day_hdr = records[0]["last_day_label"] if records else "last day"
+    kept_head = foot + 3
+    ws.set_row(kept_head, 20)
+    ws.merge_range(
+        kept_head,
+        0,
+        kept_head,
+        1,
+        "Notes kept from Dashboard and Site List",
+        styles["section"],
+    )
+    kept = [
+        (
+            "Dashboard listing note",
+            f"Scored on {period_txt} (latest {ANALYSIS_DAYS} days). "
+            f"Listed when ≥{MIN_DAYS_ON_CAP} days have ≥{STUCK_DAY_HOURS} hours on the cap "
+            f"(busy and off-peak), or the last day has ≥{LAST_DAY_HOURS} hours on the cap. "
+            "Two cap shapes count: a crowded flat level (DHAPT35 shape) or a hard ceiling "
+            "the trace is clipped at and never rises above. Jagged traces with changing "
+            "peaks are not listed. Each hourly chart is the latest 3 days only. "
+            "Open a site name to see it.",
+        ),
+        (
+            "Site List counters",
+            "RxMaxSpeed (Mbit/s)  =  VS.FEGE.RxMaxSpeed(bit/s) / 1000 / 1000"
+            "          Tx Total BW (Mbit/s)  =  VS.FEGE.TxTotalBW(kbit/s) / 1000  "
+            f"(RAN-side, reference only)          Source: {source_name}",
+        ),
+        (
+            "Site List scoring note",
+            f"Scored on {period_txt} "
+            f"({ANALYSIS_START.strftime('%-d-%b-%y')} to "
+            f"{ANALYSIS_END.strftime('%-d-%b-%y')}). "
+            f"Listed when ≥{MIN_DAYS_ON_CAP} of {ANALYSIS_DAYS} days have ≥{STUCK_DAY_HOURS} hours on the cap "
+            f"(busy 08:00–22:00 and off-peak / night). "
+            f"Last day cap column flags {last_day_hdr} when ≥{LAST_DAY_HOURS} hours that day "
+            "sit on the cap. "
+            f"Severity is hours on the cap: Severe ≥{SEV_SEVERE_PCT:.0f}%, "
+            f"High ≥{SEV_HIGH_PCT:.0f}%, Moderate ≥{SEV_MODERATE_PCT:.0f}%, Low below that. "
+            f"Cap shape: '{CAP_CROWDED}' or '{CAP_CEILING}'. "
+            "The hourly chart is the latest 3 days only. Open a site name to jump to it.",
+        ),
+        (
+            "GeoPlot top thanas",
+            f"Thana maps use only names listed in {TOP_THANA_FILE}, matched to the "
+            f"Thana column in {GEO_FILE}. Cluster maps after that cover remaining "
+            "issue sites. Each thana and cluster map has an issue-severity map "
+            "beside it.",
+        ),
+        (
+            "Double check",
+            f"Site List Double check = Yes when Peak is ≥{DOUBLE_CHECK_PEAK_GAP:.0%} above "
+            "Avg peak (Peak − Avg peak) / Peak. Example: DHGULAP. Tx may read this as "
+            "low radio demand rather than a hard wall. Detection listing is unchanged.",
+        ),
+        (
+            "Tech (4G / 4G+5G)",
+            f"Dashboard, Site List, and UrgentTxBWInc Tech is taken from the "
+            f"Tech column in {GEO_FILE}. Unmapped sites are treated as 4G "
+            "(every site has 4G).",
+        ),
+        (
+            "Site Type",
+            f"Site List and URGENTBWINC_BusyHour Site Type are copied from the "
+            f"Site Type column in {GEO_FILE} (GF, RTT, RTP, IBS, and so on). "
+            "If the site is not in that file, the cell is Not found.",
+        ),
+        (
+            "Site List 4H / 1H OSS KPIs",
+            "The four blocks after Site Type on 1. Site List copy DataBusyHour "
+            "and UserBusyHour 4h / 1h values from URGENTBWINC_BusyHour: "
+            "DL Throughput, DLPRBUtilization,%, Data Volume, and Max User. "
+            "Blank means the issue site is not in the OSS BusyHour scan.",
+        ),
+        (
+            "HourlyChart New Add OSS KPIs",
+            "2. HourlyChartOfIssueSites copies the same 4H / 1H DataBusyHour "
+            "and UserBusyHour values as 1. Site List (DL Throughput, "
+            "DLPRBUtilization,%, Data Volume, Max User) into the yellow New Add "
+            "strip to the right of the FEGE KPI banner. Capacity layer only.",
+        ),
+    ]
+    for i, (key, val) in enumerate(kept):
+        r = kept_head + 1 + i
+        ws.set_row(r, 56)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
+    action_head = kept_head + 1 + len(kept) + 1
+    ws.set_row(action_head, 20)
+    ws.merge_range(action_head, 0, action_head, 1, "UrgentTxBWInc", styles["section"])
+    action_notes = (
+        (
+            "Why this sheet",
+            "Tx cannot raise bandwidth on every issue site (cost and budget). "
+            "UrgentTxBWInc is the urgent upgrade list only.",
+        ),
+        (
+            "Who is listed",
+            f"Severe and High from both '{CAP_CROWDED}' and '{CAP_CEILING}'. "
+            f"Hours on cap (all 24h) is at least {SEV_HIGH_PCT:.0f}% "
+            f"(Severe ≥{SEV_SEVERE_PCT:.0f}%). "
+            f"Busy hours 08:00–22:00 sit on the cap at least {ACTION_BUSY_PCT:.0f}% "
+            "of those hours — the busy period is heavily capped, so radio still has demand.",
+        ),
+        (
+            "Who is left off",
+            "Moderate, Low, Off-peak-only, and sites whose busy-hour cap is below "
+            f"{ACTION_BUSY_PCT:.0f}%. Double check = Yes (Peak well above Avg peak) "
+            "is left off — Tx reads those as low radio demand, not a hard wall.",
+        ),
+        (
+            "Order",
+            "Severe first, then highest Hours on cap (all 24h) %, then highest "
+            "busy-hour cap %. Open a site name to jump to its hourly chart.",
+        ),
+        (
+            "Thana summary",
+            "The Thana Name / Site Count grid is sized from the thana count. "
+            "More thanas add pairs to the right; fewer thanas shrink the grid. "
+            "Highest counts fill column 1 first, then column 2, and so on.",
+        ),
+    )
+    for i, (key, val) in enumerate(action_notes):
+        r = action_head + 1 + i
+        ws.set_row(r, 56)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
+    busy_head = action_head + 1 + len(action_notes) + 1
+    ws.set_row(busy_head, 20)
+    ws.merge_range(busy_head, 0, busy_head, 1, "URGENTBWINC_BusyHour", styles["section"])
+    busy_notes = (
+        (
+            "Why this sheet",
+            "Independent of UrgentTxBWInc. This sheet scans every site in "
+            f"{OSS_FILE} (capacity layer only: L1800/L2100/L2600, L900 coverage "
+            "dropped from cell-level hourly) and scores DataBusyHour / "
+            "UserBusyHour against FEGE choke hours for 7 BusyHour, 4 BusyHour, "
+            "and 1 BusyHour. The UrgentTxBWInc 560-site filter is not used.",
+        ),
+        (
+            "DataBusyHour (7 BusyHour)",
+            f"From capacity-only {OSS_FILE} only. Each day, sort Data Volume,GB largest to "
+            f"lowest and take the top {OSS_BUSY_HOURS} hours (any hour). "
+            "Example 2-Oct DHADB01: 12:00, 11:00, 3:00, 13:00, 2:00, 1:00, "
+            "0:00.",
+        ),
+        (
+            "UserBusyHour (7 BusyHour)",
+            f"Same file and days. Sort Max User largest to lowest and take the "
+            f"top {OSS_BUSY_HOURS} hours. Example 2-Oct DHADB01: 20:00, 18:00, "
+            "21:00, 19:00, 13:00, 17:00, 14:00.",
+        ),
+        (
+            "DataBusyHour (4 BusyHour)",
+            "Same Data Volume sort as 7 BusyHour, but take only the top "
+            f"{OSS_BUSY_HOURS_4} hours each day. Example 2-Oct DHADB01: "
+            "12:00, 11:00, 3:00, 13:00.",
+        ),
+        (
+            "UserBusyHour (4 BusyHour)",
+            "Same Max User sort as 7 BusyHour, but take only the top "
+            f"{OSS_BUSY_HOURS_4} hours each day. Example 2-Oct DHADB01: "
+            "20:00, 18:00, 21:00, 19:00.",
+        ),
+        (
+            "DataBusyHour (1 BusyHour)",
+            "Same Data Volume sort, but take only the single highest hour "
+            "each day. Example 2-Oct DHADB01: 12:00.",
+        ),
+        (
+            "UserBusyHour (1 BusyHour)",
+            "Same Max User sort, but take only the single highest hour each "
+            "day. Example 2-Oct DHADB01: 20:00.",
+        ),
+        (
+            "Who is listed",
+            "Every OSS site where both DataBusyHour and UserBusyHour can be "
+            f"filled for any day in {ANALYSIS_START.strftime('%-d %b')}–"
+            f"{ANALYSIS_END.strftime('%-d %b')}, or for the last day "
+            f"({ANALYSIS_END.strftime('%-d %b')}), on "
+            "the 7, 4, or 1 BusyHour set. Not limited to UrgentTxBWInc.",
+        ),
+        (
+            "Hours matched %",
+            "A matched hour is a busy hour that is actually choked (FEGE on "
+            "cap). Each block has its own Hours matched / % / Last day match "
+            f"/ Listed because. 7 BusyHour is "
+            f"{OSS_BUSY_HOURS * ANALYSIS_DAYS} hours "
+            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS}), last day choked / "
+            f"{OSS_BUSY_HOURS}. 4 BusyHour is "
+            f"{OSS_BUSY_HOURS_4 * ANALYSIS_DAYS} hours "
+            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS_4}), last day choked / "
+            f"{OSS_BUSY_HOURS_4}. 1 BusyHour is "
+            f"{OSS_BUSY_HOURS_1 * ANALYSIS_DAYS} hours "
+            f"({ANALYSIS_DAYS} × {OSS_BUSY_HOURS_1}), last day choked / "
+            f"{OSS_BUSY_HOURS_1}.",
+        ),
+        (
+            "DL Throughput 7h / 4h / 1h",
+            "DL User Throughput,Mbps = DL User Throughput_N / DL User "
+            "Throughput_D. Each block uses only its own busy hours (7h, 4h, or 1h).",
+        ),
+        (
+            "DLPRBUtilization,%",
+            "DLPRBUtilization,% = (DL PRB Utilization_N / DL PRB Utilization_D) "
+            "× 100. Each 7h / 4h / 1h DataBusyHour and UserBusyHour block uses "
+            "only its own busy hours (same hours as that block’s DL Throughput). "
+            "Not added to BH Flag.",
+        ),
+        (
+            "Data Volume / Max User 7h / 4h / 1h",
+            "Average Data Volume,GB and average Max User over that block’s own "
+            "busy hours (7 × 3, 4 × 3, or 1 × 3). DataBusyHour uses top volume "
+            "hours; UserBusyHour uses top Max User hours. Not added to BH Flag.",
+        ),
+        (
+            "4 BH Flag",
+            "Filtering(4H only) only. (1) Chocked %_Data OR Chocked %_User. "
+            "(2) Data Busy Hour_TP OR User Busy Hour_TP. Yes when both (1) "
+            "and (2) are true — choked and poor throughput in the 4h window.",
+        ),
+        (
+            "1 BH Flag",
+            "Filtering(1H only) only. (1) Chocked %_Data OR Chocked %_User. "
+            "(2) Data Busy Hour_TP OR User Busy Hour_TP. Yes when both (1) "
+            "and (2) are true — choked and poor throughput in the 1h window.",
+        ),
+        (
+            "4/1BH Flag",
+            "Yes when 4 BH Flag OR 1 BH Flag is Yes.",
+        ),
+        (
+            "Comparison / BW Increased",
+            f"All-site sheet comparing busy-hour RxMaxSpeed (90th percentile, "
+            f"08:00–22:00) on {COMPARE_OLD_START.strftime('%-d %b')}–"
+            f"{COMPARE_OLD_END.strftime('%-d %b')} from {COMPARE_OLD_FILE} "
+            f"versus {ANALYSIS_START.strftime('%-d %b')}–"
+            f"{ANALYSIS_END.strftime('%-d %b')} from the current FEGE file. "
+            f"RxMaxSpeed only (Tx Total BW is not used). BW Increased is Yes "
+            f"when the RxMaxSpeed ceiling steps up by at least "
+            f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}% (the DHKKTE2 / "
+            "GPSDR01 shape).",
+        ),
+        (
+            "Filtering(1H only)",
+            "The four Yes columns after the BH Flag columns use the 1 BusyHour "
+            "section only (not 7h/4h). Chocked %_Data / Chocked %_User are Yes "
+            f"when that 1h Hours matched % is ≥ {OSS_CHOKE_MATCH_PCT:g}%. "
+            "Data Busy Hour_TP / User Busy Hour_TP are Yes when that 1h DL "
+            f"Throughput is ≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter the four "
+            "columns together with OR.",
+        ),
+        (
+            "Filtering(4H only)",
+            "The next four Yes columns use the 4 BusyHour section only "
+            "(not 7h/1h). Chocked %_Data / Chocked %_User are Yes when that "
+            f"4h Hours matched % is ≥ {OSS_CHOKE_MATCH_PCT:g}%. "
+            "Data Busy Hour_TP / User Busy Hour_TP are Yes when that 4h DL "
+            f"Throughput is ≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter the four "
+            "columns together with OR.",
+        ),
+        (
+            "Filtering(7H/4H/1H)",
+            "The next four Yes columns (Chocked %_Data / Chocked %_User "
+            "/ Data Busy Hour / User Busy Hour) sit under Filtering(7H/4H/1H). "
+            "Each 7H / 4H / 1H Data and User block uses its own header colour.",
+        ),
+        (
+            "Chocked %_Data Busy Hour",
+            f"Yes when any DataBusyHour Hours matched % (7h OR 4h OR 1h) is "
+            f"≥ {OSS_CHOKE_MATCH_PCT:g}%. Filter together with Data Busy Hour "
+            "to find poor throughput sites that are also FEGE-choked.",
+        ),
+        (
+            "Chocked %_User Busy Hour",
+            f"Yes when any UserBusyHour Hours matched % (7h OR 4h OR 1h) is "
+            f"≥ {OSS_CHOKE_MATCH_PCT:g}%. Filter together with User Busy Hour "
+            "to find poor throughput sites that are also FEGE-choked.",
+        ),
+        (
+            "Data Busy Hour",
+            f"Yes when any DataBusyHour DL Throughput (7h OR 4h OR 1h) is "
+            f"≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter this column for worst "
+            "data-busy throughput sites.",
+        ),
+        (
+            "User Busy Hour",
+            f"Yes when any UserBusyHour DL Throughput (7h OR 4h OR 1h) is "
+            f"≤ {OSS_POOR_TP_MBPS:g} Mbps. Filter this column for worst "
+            "user-busy throughput sites.",
+        ),
+        (
+            "comparison_v1",
+            f"Previous FEGE is {ANALYSIS_START.strftime('%-d %b')}–"
+            f"{ANALYSIS_END.strftime('%-d %b')} ({PREV_FEG_FILE}). "
+            f"Latest FEGE is {LATEST_START.strftime('%-d %b')}–"
+            f"{LATEST_END.strftime('%-d %b')} ({LATEST_FEG_FILE}). "
+            "Tx BW increased = busy-hour (08:00–22:00) RxMaxSpeed p90 rises by "
+            f"at least {BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}%. "
+            "Tx Total BW is a reference column only. "
+            "Choked again = listed on both windows and Tx BW increased. "
+            "Solved = listed previously, present in the latest file, and not listed now. "
+            "OSS columns are the 1 BusyHour block only (top hour by Data Volume and "
+            "by Max User): DL Throughput N/D, DLPRBUtilization,% from PRB N/D, "
+            "average Data Volume, average Max User, Hours matched %, last-day match. "
+            "Previous OSS is the 5–7 Oct capacity layer. Latest OSS is 6–8 Nov "
+            "cell hourly with L900 excluded. Site names link to "
+            "2. HourlyChartOfIssueSites, which draws both FEGE windows.",
+        ),
+    )
+    for i, (key, val) in enumerate(busy_notes):
+        r = busy_head + 1 + i
+        ws.set_row(r, 64)
+        ws.write(r, 0, key, styles["method_key"])
+        ws.write(r, 1, val, styles["method_val"])
+
+
+
+def load_site_geo(path: Path) -> pd.DataFrame:
+    """Read the physical site database (Site Code, Latitude, Longitude)."""
+    raw = pd.read_excel(path)
+    cols = {str(c).strip().lower(): c for c in raw.columns}
+
+    def pick(*names):
+        for name in names:
+            if name in cols:
+                return cols[name]
+        raise SystemExit(
+            f"{path.name} is missing a required column. Need one of: {', '.join(names)}"
+        )
+
+    site_col = pick("site code", "sitecode", "site", "enodeb name")
+    lat_col = pick("latitude", "lat")
+    lon_col = pick("longitude", "lon", "long")
+    district_col = cols.get("district")
+    region_col = cols.get("region")
+    tech_col = cols.get("tech")
+    thana_col = cols.get("thana")
+    type_col = cols.get("site type") or cols.get("sitetype") or cols.get("type")
+    geo = pd.DataFrame(
+        {
+            "site": raw[site_col].astype(str).str.strip(),
+            "lat": pd.to_numeric(raw[lat_col], errors="coerce"),
+            "lon": pd.to_numeric(raw[lon_col], errors="coerce"),
+            "district": raw[district_col].astype(str) if district_col else "",
+            "region": raw[region_col].astype(str) if region_col else "",
+            "tech": raw[tech_col].astype(str).str.strip() if tech_col else "",
+            "thana": raw[thana_col].astype(str).str.strip() if thana_col else "",
+            "site_type": raw[type_col].astype(str).str.strip() if type_col else "",
+        }
+    )
+    geo = geo.dropna(subset=["lat", "lon"])
+    geo = geo[geo["site"] != ""]
+    geo.loc[geo["thana"].str.lower().isin(("", "nan", "none")), "thana"] = ""
+    geo.loc[geo["site_type"].str.lower().isin(("", "nan", "none")), "site_type"] = ""
+    return geo.drop_duplicates("site", keep="last")
+
+
+def load_top_thanas(path: Path) -> list[str]:
+    """Thana names to plot first on GeoPlot, in file order."""
+    raw = pd.read_excel(path, header=None)
+    names: list[str] = []
+    skip = {"", "nan", "top than", "top thana", "thana", "name", "thana name"}
+    for val in raw.iloc[:, 0].tolist():
+        text = str(val or "").strip()
+        if not text or text.lower() in skip:
+            continue
+        names.append(text)
+    return names
+
+
+def _find_input(name: str, source: Path | None = None) -> Path | None:
+    candidates = []
+    if source is not None:
+        candidates.append(source.parent / name)
+    candidates.extend((Path(name), Path("/workspace") / name, Path("/tmp") / name))
+    return next((path for path in candidates if path.exists()), None)
+
+
+def _norm_list_tech(value: object) -> str:
+    """4G or 4G+5G. Unknown / missing is 4G — every site has 4G."""
+    key = str(value or "").strip().upper().replace(" ", "")
+    if key in ("4G+5G", "4G5G") or "5G" in key:
+        return TECH_4G5G
+    return TECH_4G
+
+
+def tech_by_site_from_geo(geo: pd.DataFrame) -> dict[str, str]:
+    """Tech (4G / 4G+5G) from the physical site database."""
+    out: dict[str, str] = {}
+    if geo is None or geo.empty:
+        return out
+    for row in geo.itertuples(index=False):
+        out[str(row.site)] = _norm_list_tech(getattr(row, "tech", ""))
+    return out
+
+
+def site_type_by_site_from_geo(geo: pd.DataFrame) -> dict[str, str]:
+    """Site Type from the physical site database. Missing stays empty for Not found."""
+    out: dict[str, str] = {}
+    if geo is None or geo.empty:
+        return out
+    for row in geo.itertuples(index=False):
+        name = str(getattr(row, "site_type", "") or "").strip()
+        if name.lower() in ("", "nan", "none"):
+            continue
+        out[str(row.site)] = name
+    return out
+
+
+def _attach_site_type(records: list[dict], geo: pd.DataFrame) -> None:
+    types = site_type_by_site_from_geo(geo)
+    for rec in records:
+        rec["site_type"] = types.get(rec["site"]) or "Not found"
+
+
+def _attach_tech(records: list[dict], tech_by_site: dict[str, str]) -> None:
+    for rec in records:
+        rec["tech"] = tech_by_site.get(rec["site"], TECH_4G)
+
+
+def _rec_tech(rec: dict) -> str:
+    return rec.get("tech") or TECH_4G
+
+
+def summarise_tech(
+    records: list[dict],
+    tech_by_site: dict[str, str],
+    checked_sites: list[str] | None = None,
+) -> dict[str, int]:
+    def listed(site: str) -> str:
+        return tech_by_site.get(site, TECH_4G)
+
+    names = checked_sites if checked_sites is not None else list(tech_by_site)
+    checked_4g = sum(1 for site in names if listed(site) == TECH_4G)
+    checked_4g5g = sum(1 for site in names if listed(site) == TECH_4G5G)
+    choked_4g = 0
+    choked_4g5g = 0
+    for rec in records:
+        if listed(rec["site"]) == TECH_4G5G:
+            choked_4g5g += 1
+        else:
+            choked_4g += 1
+    return {
+        "checked_4g": checked_4g,
+        "checked_4g5g": checked_4g5g,
+        "choked_4g": choked_4g,
+        "choked_4g5g": choked_4g5g,
+        "unmapped": 0,
+    }
+
+
+CAP_WHEN_COLS = ("Busy + off-peak", "Busy hours", "Off-peak")
+
+
+def cap_when_matrix(records: list[dict], tech_by_site: dict[str, str]) -> dict:
+    """Severity × cap-window counts for all sites, 4G+5G, and 4G."""
+    sevs = (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW)
+    groups = ("total", TECH_4G5G, TECH_4G)
+    matrix = {
+        group: {sev: {when: 0 for when in CAP_WHEN_COLS} for sev in sevs}
+        for group in groups
+    }
+    for rec in records:
+        sev = rec["severity"]
+        when = rec["cap_when"]
+        if sev not in matrix["total"] or when not in matrix["total"][sev]:
+            continue
+        matrix["total"][sev][when] += 1
+        tech = tech_by_site.get(rec["site"], TECH_4G)
+        if tech in (TECH_4G, TECH_4G5G):
+            matrix[tech][sev][when] += 1
+    return matrix
+
+
+def _write_geoplot(
+    book,
+    styles,
+    work,
+    records,
+    geo: pd.DataFrame,
+    output: Path,
+    tech_by_site: dict[str, str] | None = None,
+) -> None:
+    """Google-satellite GeoPlot: 4G / 5G coverage plus 4G / 4G+5G issue legends."""
+    from geoplot_satellite import (
+        KIND_ISSUE_4G,
+        KIND_ISSUE_4G5G,
+        classify_rows,
+        cluster_bounds,
+        cluster_issue_sites,
+        cluster_label,
+        render_html,
+        render_map_images,
+        thana_focus_specs,
+    )
+
+    ws = book.add_worksheet(GEO_SHEET)
+    _page(ws, "GeoPlot — 4G / 5G / issue sites")
+    ws.set_tab_color(DARK_RED)
+    ws.hide_gridlines(2)
+
+    data_ws = book.add_worksheet(GEO_DATA_SHEET)
+    data_ws.hide()
+
+    issue_order = [rec["site"] for rec in records]
+    issue_set = set(issue_order)
+    sev_by_site = {rec["site"]: rec["severity"] for rec in records}
+    by_code = geo.set_index("site")
+
+    def lookup(site: str) -> dict | None:
+        if site not in by_code.index:
+            return None
+        row = by_code.loc[site]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        return {
+            "site": site,
+            "lat": float(row["lat"]),
+            "lon": float(row["lon"]),
+            "district": str(row["district"]),
+            "region": str(row["region"]),
+            "tech": str(row.get("tech", "")),
+            "thana": str(row["thana"]) if "thana" in row.index and pd.notna(row["thana"]) else "",
+            "severity": sev_by_site.get(site, "—"),
+        }
+
+    issue_rows = [r for r in (lookup(site) for site in issue_order) if r]
+    other_rows = []
+    for row in geo.itertuples(index=False):
+        site = str(row.site)
+        if site in issue_set:
+            continue
+        other_rows.append(
+            {
+                "site": site,
+                "lat": float(row.lat),
+                "lon": float(row.lon),
+                "district": str(row.district),
+                "region": str(row.region),
+                "tech": str(getattr(row, "tech", "")),
+                "thana": str(getattr(row, "thana", "") or ""),
+                "severity": "—",
+            }
+        )
+
+    headers = ["Site", "Latitude", "Longitude", "Status", "Tech", "Issue Tech", "District", "Region", "Thana", "Severity"]
+    for col, text in enumerate(headers):
+        data_ws.write_string(0, col, text)
+    excel_row = 1
+    for row in other_rows + issue_rows:
+        status = "Issue" if row["site"] in issue_set else "Non-issue"
+        listed = (tech_by_site or {}).get(row["site"], "")
+        data_ws.write_string(excel_row, 0, row["site"])
+        data_ws.write_number(excel_row, 1, row["lat"])
+        data_ws.write_number(excel_row, 2, row["lon"])
+        data_ws.write_string(excel_row, 3, status)
+        data_ws.write_string(excel_row, 4, row["tech"])
+        data_ws.write_string(excel_row, 5, listed if status == "Issue" else "")
+        data_ws.write_string(excel_row, 6, row["district"])
+        data_ws.write_string(excel_row, 7, row["region"])
+        data_ws.write_string(excel_row, 8, str(row.get("thana") or ""))
+        data_ws.write_string(excel_row, 9, row["severity"])
+        excel_row += 1
+
+    classified = classify_rows(other_rows + issue_rows, issue_set, tech_by_site)
+    kind_by_site = {row["site"]: row["kind"] for row in classified}
+    n4 = sum(1 for r in classified if r["tech"] == "4G")
+    n5 = sum(1 for r in classified if r["tech"] == "5G")
+    n_issue_4g = sum(1 for r in classified if r["kind"] == KIND_ISSUE_4G)
+    n_issue_4g5g = sum(1 for r in classified if r["kind"] == KIND_ISSUE_4G5G)
+    n_issue = n_issue_4g + n_issue_4g5g
+
+    thana_path = _find_input(TOP_THANA_FILE, output)
+    if thana_path is None:
+        raise SystemExit(f"Top thana list not found: {TOP_THANA_FILE}")
+    top_thanas = load_top_thanas(thana_path)
+    zoom_specs = thana_focus_specs(classified, top_thanas, tech_by_site)
+    for index, zoom_issues in enumerate(cluster_issue_sites(issue_rows), start=1):
+        lat_min, lat_max, lon_min, lon_max = cluster_bounds(zoom_issues)
+        issue_names = {row["site"] for row in zoom_issues}
+        zoom_rows = []
+        for row in classified:
+            if not (lat_min <= row["lat"] <= lat_max and lon_min <= row["lon"] <= lon_max):
+                continue
+            # Keep this cluster's issue-legend counts exact: neighbouring
+            # issue sites stay as 4G/5G coverage, not extra issue dots.
+            if row["kind"] in (KIND_ISSUE_4G, KIND_ISSUE_4G5G) and row["site"] not in issue_names:
+                zoom_rows.append({**row, "kind": row["tech"] if row["tech"] in ("4G", "5G") else "4G"})
+            else:
+                zoom_rows.append(row)
+        label = cluster_label(zoom_issues, index)
+        issue_4g = sum(1 for row in zoom_issues if kind_by_site.get(row["site"]) == KIND_ISSUE_4G)
+        issue_4g5g = sum(1 for row in zoom_issues if kind_by_site.get(row["site"]) == KIND_ISSUE_4G5G)
+        zoom_specs.append(
+            {
+                "label": label,
+                "slug": f"Cluster_{index:02d}",
+                "issue_count": len(zoom_issues),
+                "issue_4g_count": issue_4g,
+                "issue_4g5g_count": issue_4g5g,
+                "issue_sites": [row["site"] for row in zoom_issues],
+                "rows": zoom_rows,
+                "lat_min": lat_min,
+                "lat_max": lat_max,
+                "lon_min": lon_min,
+                "lon_max": lon_max,
+            }
+        )
+
+    html_path = output.with_name(output.stem + "_GeoPlot.html")
+    maps = render_map_images(classified, zoom_specs, output.parent, output.stem + "_GeoPlot")
+    render_html(classified, zoom_specs, html_path, GEO_TITLE)
+
+    ws.set_column(0, 18, 12)
+    ws.set_row(0, 28)
+    ws.merge_range("A1:R1", GEO_TITLE, styles["title"])
+    ws.set_row(1, 18)
+    ws.merge_range(
+        "A2:R2",
+        f"Google satellite    ·    Physical sites: {len(classified)}"
+        f"    ·    4G: {n4}    ·    5G: {n5}"
+        f"    ·    Issue 4G: {n_issue_4g}    ·    Issue 4G+5G: {n_issue_4g5g}"
+        f"    ·    Source: {GEO_FILE} + {TOP_THANA_FILE}",
+        styles["subtitle"],
+    )
+    ws.set_row(2, 20)
+    ws.merge_range(
+        "A3:R3",
+        "National, top-thana, and cluster maps each have an issue-severity map "
+        "on the right (Severe / High / Moderate / Low). "
+        f"Top thanas from {TOP_THANA_FILE}, then issue clusters "
+        f"({sum(1 for z in zoom_specs if z.get('focus') != 'thana')} maps). "
+        "Coverage: Cyan = 4G, Yellow = 5G. Issue: Red = 4G, Orange = 4G+5G.",
+        styles["note"],
+    )
+    row = 5
+    paired = {slot: (title, path) for title, path, slot in maps if slot in ("national", "severity")}
+    zoom_maps = [(title, path) for title, path, slot in maps if slot == "zoom"]
+    zoom_sevs = [(title, path) for title, path, slot in maps if slot == "zoom_sev"]
+    if len(zoom_maps) != len(zoom_sevs):
+        raise SystemExit(
+            f"GeoPlot zoom/severity mismatch: {len(zoom_maps)} vs {len(zoom_sevs)}"
+        )
+
+    def _rows_for_image(path: Path, scale: float) -> int:
+        from PIL import Image as PILImage
+
+        with PILImage.open(path) as im:
+            height = im.size[1]
+        # Default Excel row is 15 px. Keep a gap so the next title never
+        # lands on top of the previous map.
+        return max(28, int(height * scale / 15) + 5)
+
+    def _insert_pair(left_title: str, left_path: Path, right_title: str, right_path: Path) -> int:
+        from PIL import Image as PILImage
+
+        pair_scale = 0.42
+        pair_gap_px = 24
+        col_px = 89  # set_column width 12
+        with PILImage.open(left_path) as left_im, PILImage.open(right_path) as right_im:
+            left_w, _lh = left_im.size
+            right_w, _rh = right_im.size
+        left_disp_w = left_w * pair_scale
+        left_cols = max(3, int(round(left_disp_w / col_px)))
+        right_cols = max(3, int(round(right_w * pair_scale / col_px)))
+        ws.merge_range(row, 0, row, left_cols - 1, left_title, styles["section"])
+        ws.merge_range(
+            row,
+            left_cols,
+            row,
+            left_cols + right_cols - 1,
+            right_title,
+            styles["section"],
+        )
+        pair_opts = {"x_scale": pair_scale, "y_scale": pair_scale, "object_position": 1}
+        ws.insert_image(row + 1, 0, str(left_path), pair_opts)
+        ws.insert_image(
+            row + 1,
+            0,
+            str(right_path),
+            {**pair_opts, "x_offset": int(left_disp_w + pair_gap_px)},
+        )
+        return max(
+            _rows_for_image(left_path, pair_scale),
+            _rows_for_image(right_path, pair_scale),
+        )
+
+    if "national" in paired and "severity" in paired:
+        nat_title, nat_path = paired["national"]
+        sev_title, sev_path = paired["severity"]
+        row += _insert_pair(nat_title, nat_path, sev_title, sev_path)
+    for (title, path), (sev_title, sev_path) in zip(zoom_maps, zoom_sevs):
+        row += _insert_pair(title, path, sev_title, sev_path)
+    ws.set_zoom(100)
+
+
+# Banner + KPI strip + a compact chart (about 1120 × 400 px).
+BLOCK_ROWS = 32
+
+
+def _dump_report_cache(
+    source_name: str,
+    work: pd.DataFrame,
+    records: list[dict],
+    geo,
+    tech_summary,
+    tech_by_site,
+    busy_rows: list[dict],
+) -> None:
+    REPORT_CACHE.write_bytes(
+        pickle.dumps(
+            {
+                "source_name": source_name,
+                "work": work,
+                "records": records,
+                "geo": geo,
+                "tech_summary": tech_summary,
+                "tech_by_site": tech_by_site,
+                "busy_rows": busy_rows,
+                "oss_file": OSS_FILE,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )
+    print(f"Saved analysis cache {REPORT_CACHE}")
+
+
+def _refresh_busy_rows(
+    records: list[dict],
+    work: pd.DataFrame,
+    geo,
+    tech_by_site: dict[str, str],
+    source: Path | None = None,
+) -> list[dict]:
+    oss_path = ensure_capacity_site_oss()
+    print("Scoring OSS BusyHour Data Volume / Max User / DL PRB Utilization...")
+    oss = load_oss_kpi(oss_path)
+    busy_rows = analyse_urgent_busy_hours(oss, records, work, tech_by_site)
+    _attach_site_type(busy_rows, geo)
+    return busy_rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "source",
+        nargs="?",
+        default="FEG_KPI_DHAKA_5Oct.rar",
+        help="FEGE KPI source (.csv, .xlsb, .xlsx, or .rar)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="FEGE_Choked_Flat_Sites_v86.xlsx",
+        help="Report workbook to write",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip snapshot charts, hourly KPI, and GeoPlot (BusyHour-only edits)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not load /tmp/fege_report_cache.pkl",
+    )
+    parser.add_argument(
+        "--geo",
+        action="store_true",
+        help="Regenerate the satellite GeoPlot (same 5–7 Oct issue set as v85)",
+    )
+    args = parser.parse_args()
+    output = Path(args.output)
+    t0 = pytime.perf_counter()
+
+    cache = None
+    if not args.no_cache and REPORT_CACHE.exists():
+        try:
+            cache = pickle.loads(REPORT_CACHE.read_bytes())
+            print(f"Loaded analysis cache {REPORT_CACHE}")
+        except Exception as exc:
+            print(f"Cache unused ({exc})")
+            cache = None
+
+    if cache:
+        source_name = cache["source_name"]
+        work = cache["work"]
+        records = cache["records"]
+        geo = cache["geo"]
+        tech_summary = cache["tech_summary"]
+        tech_by_site = cache["tech_by_site"]
+        busy_rows = cache["busy_rows"]
+        if (
+            not busy_rows
+            or "prb_data_7h" not in busy_rows[0]
+            or cache.get("oss_file") != OSS_FILE
+        ):
+            busy_rows = _refresh_busy_rows(records, work, geo, tech_by_site)
+            _dump_report_cache(
+                source_name, work, records, geo, tech_summary, tech_by_site, busy_rows
+            )
+        else:
+            busy_rows = _attach_window_filter_flags(busy_rows)
+            _attach_site_type(busy_rows, geo)
+    else:
+        source = resolve_source(Path(args.source))
+        source_name = source.name
+        raw = load_kpi(source)
+        required = {"Date", "Time", "eNodeB Name", RX_COL, TXBW_COL}
+        missing = required - set(raw.columns)
+        if missing:
+            raise SystemExit(f"Missing columns: {', '.join(sorted(missing))}")
+
+        work, records = analyse(raw)
+        _require_references(records)
+
+        geo_path = _find_input(GEO_FILE, source)
+        if geo_path is None:
+            raise SystemExit(f"Physical site database not found: {GEO_FILE}")
+        geo = load_site_geo(geo_path)
+
+        tech_by_site = tech_by_site_from_geo(geo)
+        checked_sites = (
+            work["eNodeB Name"].astype(str).str.strip().drop_duplicates().tolist()
+        )
+        for site in checked_sites:
+            tech_by_site.setdefault(site, TECH_4G)
+        _attach_site_type(records, geo)
+        _attach_tech(records, tech_by_site)
+        tech_summary = summarise_tech(records, tech_by_site, checked_sites)
+
+        chart_end = work["Date"].max().normalize()
+        chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
+        _attach_chart_peaks(work, records, chart_start, chart_end)
+        busy_rows = _refresh_busy_rows(records, work, geo, tech_by_site, source)
+        _dump_report_cache(
+            source_name, work, records, geo, tech_summary, tech_by_site, busy_rows
+        )
+
+    # Snapshots are laid out at a fixed stride so the site-list links can be
+    # written in the same pass: site i starts at Excel row i * BLOCK_ROWS + 1.
+    if args.fast:
+        print("Fast mode: skipping snapshot charts, hourly KPI, and GeoPlot")
+    print("Building Comparison (previous 2–4 Oct vs current 5–7 Oct)...", flush=True)
+    compare_rows = _build_bw_comparison(work, records, tech_by_site, geo)
+    if compare_rows:
+        Path("/tmp/fege_compare_rows.pkl").write_bytes(pickle.dumps(compare_rows))
+    print("Scoring latest FEGE 6–8 Nov for comparison_v1...", flush=True)
+    latest_path = _find_input(LATEST_FEG_FILE) or Path(LATEST_FEG_FILE)
+    latest_raw = load_kpi(resolve_source(latest_path))
+    latest_work, latest_records = analyse(latest_raw, LATEST_START, LATEST_END)
+    compare_v1 = _build_comparison_v1(
+        work, records, latest_work, latest_records, tech_by_site, geo
+    )
+    _attach_comparison_oss(compare_v1, work, latest_work)
+    chart_records = _chart_records_for(records, compare_v1)
+    _stamp_latest_on_charts(chart_records, compare_v1, latest_records, latest_work)
+    t_write = pytime.perf_counter()
+    _write_workbook(
+        output,
+        source_name,
+        work,
+        records,
+        geo,
+        tech_summary,
+        tech_by_site,
+        busy_rows,
+        skip_heavy=args.fast,
+        compare_rows=compare_rows,
+        compare_v1=compare_v1,
+        chart_records=chart_records,
+        latest_work=latest_work,
+        skip_geo=not args.geo,
+    )
+    print(
+        f"Workbook write {pytime.perf_counter() - t_write:.1f}s"
+        f" (total {pytime.perf_counter() - t0:.1f}s)"
+        + (" [fast]" if args.fast else "")
+    )
+
+    by_sev = defaultdict(int)
+    for rec in records:
+        by_sev[rec["severity"]] += 1
+    print(f"Window: {work['Date'].min().date()} – {work['Date'].max().date()} ({ANALYSIS_DAYS} days, all hours)")
+    print(f"Sites checked: {work['eNodeB Name'].nunique()}")
+    print(f"Issue sites: {len(records)}")
+    print(
+        f"4G choked: {tech_summary['choked_4g']} of {tech_summary['checked_4g']}"
+    )
+    print(
+        f"4G+5G choked: {tech_summary['choked_4g5g']} of {tech_summary['checked_4g5g']}"
+    )
+    print("Severity (hours on cap):")
+    for name in (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW):
+        print(f"  {name}: {by_sev[name]}")
+    by_when = defaultdict(int)
+    by_listed = defaultdict(int)
+    last_n = 0
+    for rec in records:
+        by_when[rec["cap_when"]] += 1
+        by_listed[rec["listed_by"]] += 1
+        last_n += int(rec["last_flag"])
+    print("Listed because:")
+    for name in ("≥3 days + last day", "≥3 days", "Last day"):
+        print(f"  {name}: {by_listed[name]}")
+    print(f"Last-day cap flag ({records[0]['last_day_label'] if records else 'n/a'}): {last_n}")
+    print("Where capped:")
+    for name in ("Busy + off-peak", "Busy hours", "Off-peak", "Partial"):
+        print(f"  {name}: {by_when[name]}")
+    by_shape = defaultdict(int)
+    for rec in records:
+        by_shape[rec["cap_type"]] += 1
+    print("Cap shape:")
+    for name in (CAP_CROWDED, CAP_CEILING):
+        print(f"  {name}: {by_shape[name]}")
+    print("Sample snaps:")
+    for rec in records:
+        if rec["reference"]:
+            print(
+                f"  {rec['site']}: stuck {rec['center']:.2f} Mbit/s, "
+                f"Tx BW {rec['bw']:.0f}, hours {rec['hours_pct']:.1f}%, "
+                f"days {rec['days_on_cap']}/{rec['days_total']}, "
+                f"{last_day_text(rec)}"
+            )
+    print(
+        f"URGENTBWINC_BusyHour: {len(busy_rows)} OSS sites "
+        f"(independent of UrgentTxBWInc) from {OSS_FILE}; "
+        f"4 BH Flag Yes: {sum(1 for r in busy_rows if r.get('flag_4h'))}; "
+        f"1 BH Flag Yes: {sum(1 for r in busy_rows if r.get('flag_1h'))}; "
+        f"4/1BH Flag Yes: {sum(1 for r in busy_rows if r.get('flag_41h'))}; "
+        f"Filtering(1H only) Chocked %_Data Yes: "
+        f"{sum(1 for r in busy_rows if r.get('data1_choke_high'))}; "
+        f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user1_choke_high'))}; "
+        f"Data Busy Hour_TP Yes: {sum(1 for r in busy_rows if r.get('data1_busy_poor'))}; "
+        f"User Busy Hour_TP Yes: {sum(1 for r in busy_rows if r.get('user1_busy_poor'))}; "
+        f"Filtering(4H only) Chocked %_Data Yes: "
+        f"{sum(1 for r in busy_rows if r.get('data4_choke_high'))}; "
+        f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user4_choke_high'))}; "
+        f"Data Busy Hour_TP Yes: {sum(1 for r in busy_rows if r.get('data4_busy_poor'))}; "
+        f"User Busy Hour_TP Yes: {sum(1 for r in busy_rows if r.get('user4_busy_poor'))}; "
+        f"Filtering(7H/4H/1H) Data Busy Hour Yes: "
+        f"{sum(1 for r in busy_rows if r.get('data_busy_poor'))}; "
+        f"User Busy Hour Yes: {sum(1 for r in busy_rows if r.get('user_busy_poor'))}; "
+        f"Chocked %_Data Yes: {sum(1 for r in busy_rows if r.get('data_choke_high'))}; "
+        f"Chocked %_User Yes: {sum(1 for r in busy_rows if r.get('user_choke_high'))}"
+    )
+    print(
+        f"Comparison: {len(compare_rows)} sites, "
+        f"BW Increased Yes: {sum(1 for r in compare_rows if r.get('bw_up'))}"
+    )
+    print(
+        f"comparison_v1: {len(compare_v1)} sites, "
+        f"Tx BW increased: {sum(1 for r in compare_v1 if r.get('bw_up'))}, "
+        f"Choked again: {sum(1 for r in compare_v1 if r['finding'] == FINDING_AGAIN)}, "
+        f"Solved: {sum(1 for r in compare_v1 if r['finding'] in (FINDING_SOLVED, FINDING_SOLVED_UP))}, "
+        f"charts: {len(chart_records)}"
+    )
+    print(f"Wrote {output}")
+
+
+def _write_summary(
+    book,
+    styles,
+    source_name,
+    period_txt,
+    n_sites,
+    records,
+    tech_summary=None,
+    tech_by_site=None,
+):
+    """One sheet that shows the result without opening the other pages."""
+    ws = book.add_worksheet("Dashboard")
+    _page(ws, REPORT_TITLE)
+    ws.set_tab_color("#C65911")
+
+    widths = [16, 16, 16, 16, 16, 20, 22, 16, 16, 16]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    big = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 22,
+            "bold": True,
+            "font_color": NAVY,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": PALE,
+        }
+    )
+    big_alert = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 22,
+            "bold": True,
+            "font_color": ORANGE_FONT,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": ORANGE,
+        }
+    )
+    tile = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 9,
+            "bold": True,
+            "font_color": GREY,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": PALE,
+        }
+    )
+    tile_alert = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 9,
+            "bold": True,
+            "font_color": ORANGE_FONT,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": ORANGE,
+        }
+    )
+
+    counts = defaultdict(int)
+    for rec in records:
+        counts[rec["severity"]] += 1
+
+    ws.set_row(0, 28)
+    ws.merge_range("A1:J1", REPORT_TITLE, styles["title"])
+    ws.set_row(1, 18)
+    ws.merge_range(
+        "A2:J2",
+        f"DHK transmission    ·    {period_txt}    ·    hourly    ·    {source_name}",
+        styles["subtitle"],
+    )
+
+    tiles = [
+        (0, "Sites checked", n_sites, False),
+        (2, "Issue sites", len(records), True),
+        (4, "Severe choke", counts[SEV_SEVERE], True),
+        (
+            6,
+            "High / Moderate / Low",
+            f"{counts[SEV_HIGH]}  /  {counts[SEV_MODERATE]}  /  {counts[SEV_LOW]}",
+            False,
+        ),
+    ]
+    ws.set_row(3, 18)
+    ws.set_row(4, 32)
+    for col, label, value, alert in tiles:
+        label_fmt = tile_alert if alert else tile
+        value_fmt = big_alert if alert else big
+        ws.merge_range(3, col, 3, col + 1, label, label_fmt)
+        if isinstance(value, int):
+            ws.merge_range(4, col, 4, col + 1, value, value_fmt)
+        else:
+            ws.merge_range(4, col, 4, col + 1, value, value_fmt)
+
+    tech_summary = tech_summary or {}
+    tech_by_site = tech_by_site or {}
+    group_title = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 14,
+            "bold": True,
+            "font_color": NAVY,
+            "valign": "vcenter",
+        }
+    )
+    row = 5
+    if tech_summary:
+        ws.set_row(row, 22)
+        ws.merge_range(row, 0, row, 9, "Technology-wise Link Health", group_title)
+        row += 1
+        ws.set_row(row, 20)
+        ws.merge_range(
+            row,
+            0,
+            row,
+            9,
+            "4G / 4G+5G choke summary",
+            styles["section"],
+        )
+        row += 1
+        tech_tiles = [
+            (0, "4G sites checked", tech_summary["checked_4g"], False),
+            (2, "4G sites choked", tech_summary["choked_4g"], True),
+            (4, "4G+5G sites checked", tech_summary["checked_4g5g"], False),
+            (6, "4G+5G sites choked", tech_summary["choked_4g5g"], True),
+        ]
+        ws.set_row(row, 18)
+        ws.set_row(row + 1, 32)
+        for col, label, value, alert in tech_tiles:
+            label_fmt = tile_alert if alert else tile
+            value_fmt = big_alert if alert else big
+            ws.merge_range(row, col, row, col + 1, label, label_fmt)
+            ws.merge_range(row + 1, col, row + 1, col + 1, value, value_fmt)
+        row += 3
+
+    if tech_by_site:
+        matrix = cap_when_matrix(records, tech_by_site)
+        ws.set_row(row, 22)
+        ws.merge_range(row, 0, row, 9, "Cap Window Observation", group_title)
+        row += 1
+        ws.set_row(row, 20)
+        ws.merge_range(row, 0, row + 1, 0, "Category", styles["header"])
+        ws.merge_range(row, 1, row, 3, "Total Summary", styles["header"])
+        ws.merge_range(row, 4, row, 6, "4G+5G Sites Summary", styles["header"])
+        ws.merge_range(row, 7, row, 9, "4G Sites Summary", styles["header"])
+        row += 1
+        ws.set_row(row, 28)
+        subheads = ("Busy + off-peak", "Busy hours", "Off-peak")
+        for base in (1, 4, 7):
+            for offset, text in enumerate(subheads):
+                ws.write(row, base + offset, text, styles["header"])
+        row += 1
+        total_fmt = book.add_format(
+            {
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "align": "center",
+                "valign": "vcenter",
+                "bg_color": PALE,
+                "border": 1,
+                "border_color": LINE,
+            }
+        )
+        total_label = book.add_format(
+            {
+                "font_name": "Calibri",
+                "font_size": 10,
+                "bold": True,
+                "align": "left",
+                "valign": "vcenter",
+                "bg_color": PALE,
+                "border": 1,
+                "border_color": LINE,
+            }
+        )
+        sevs = (SEV_SEVERE, SEV_HIGH, SEV_MODERATE, SEV_LOW)
+        groups = ("total", TECH_4G5G, TECH_4G)
+        for sev in sevs:
+            ws.set_row(row, 18)
+            ws.write(row, 0, sev, styles["center"])
+            col = 1
+            for group in groups:
+                for when in CAP_WHEN_COLS:
+                    value = matrix[group][sev][when]
+                    if value:
+                        ws.write_number(row, col, value, styles["int"])
+                    else:
+                        ws.write_blank(row, col, None, styles["center"])
+                    col += 1
+            row += 1
+        ws.set_row(row, 18)
+        ws.write(row, 0, "Grand Total", total_label)
+        col = 1
+        for group in groups:
+            for when in CAP_WHEN_COLS:
+                value = sum(matrix[group][sev][when] for sev in sevs)
+                if value:
+                    ws.write_number(row, col, value, total_fmt)
+                else:
+                    ws.write_blank(row, col, None, total_fmt)
+                col += 1
+        row += 2
+
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Stuck Rx (Mbit/s)",
+        "Hours on cap (%)",
+        "Days on cap (≥3h)",
+        "Last day cap",
+        "Listed because",
+    ]
+    indexed = list(enumerate(records))
+    for name, note in SEVERITY_NOTES:
+        group = [(i, rec) for i, rec in indexed if rec["severity"] == name]
+        ws.set_row(row, 22)
+        ws.merge_range(
+            row,
+            0,
+            row,
+            9,
+            f"{name}    ·    {len(group)} site{'s' if len(group) != 1 else ''}",
+            styles["section"],
+        )
+        row += 1
+        ws.set_row(row, 28)
+        ws.merge_range(row, 0, row, 9, note, styles["body"])
+        row += 1
+        ws.set_row(row, 22)
+        for col, text in enumerate(headers):
+            ws.write(row, col, text, styles["header"])
+        row += 1
+        for n_in_group, (i, rec) in enumerate(group):
+            zebra = n_in_group % 2 == 1
+            ws.set_row(row, 18)
+            nfmt = styles["num_z"] if zebra else styles["num"]
+            cfmt = styles["center_z"] if zebra else styles["center"]
+            link = styles["link_z"] if zebra else styles["link"]
+            excel_anchor = i * BLOCK_ROWS + 1
+            ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+            ws.write_url(
+                row,
+                1,
+                f"internal:'{SNAP_SHEET}'!A{excel_anchor}",
+                link,
+                string=rec["site"],
+            )
+            ws.write_string(row, 2, _rec_tech(rec), cfmt)
+            ws.write_number(row, 3, rec["center"], nfmt)
+            ws.write_number(row, 4, rec["hours_pct"], styles["pct_z"] if zebra else styles["pct"])
+            ws.write_string(row, 5, f"{rec['days_on_cap']}/{rec['days_total']}", cfmt)
+            ws.write_string(row, 6, last_day_text(rec), cfmt)
+            ws.write_string(row, 7, rec["listed_by"], cfmt)
+            row += 1
+        row += 1
+
+    ws.set_zoom(110)
+
+
+def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
+    """Previous vs current busy-hour RxMaxSpeed ceiling for every site."""
+    ws = book.add_worksheet(COMPARE_SHEET)
+    _page(ws, "Comparison — RxMaxSpeed BW increase")
+    ws.set_tab_color("#548235")
+    old_lbl = (
+        f"{COMPARE_OLD_START.strftime('%-d %b')}–{COMPARE_OLD_END.strftime('%-d %b')}"
+    )
+    new_lbl = (
+        f"{ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b %Y')}"
+    )
+    n_yes = sum(1 for r in compare_rows if r.get("bw_up"))
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Site Type",
+        "Severity",
+        f"RxMaxSpeed {old_lbl} (Mbps)",
+        f"RxMaxSpeed {new_lbl} (Mbps)",
+        "Increase (Mbps)",
+        "Increase %",
+        "BW Increased",
+    ]
+    last_col = len(headers) - 1
+    widths = [5, 16, 10, 14, 12, 26, 28, 14, 12, 14]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    ws.set_row(0, 28)
+    ws.merge_range(
+        0,
+        0,
+        0,
+        last_col,
+        "Comparison — sites where RxMaxSpeed ceiling increased",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        1,
+        0,
+        1,
+        last_col,
+        f"{old_lbl} from {COMPARE_OLD_FILE}    ·    {new_lbl} from current FEGE    ·    "
+        f"{len(compare_rows)} sites    ·    BW Increased Yes: {n_yes}    ·    "
+        f"Yes when busy-hour RxMaxSpeed p90 rises ≥ {BW_UP_MBPS:g} Mbit/s or "
+        f"{100 * BW_UP_FRAC:.0f}% (DHKKTE2 / GPSDR01 shape)",
+        styles["subtitle"],
+    )
+
+    group_row = 3
+    header_row = 4
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_old = _busy_section_header(book, "#2471A3", "white")
+    hdr_new = _busy_section_header(book, "#0D7377", "white")
+    hdr_chg = _busy_section_header(book, "#C65911", "white")
+    hdr_flag = _busy_section_header(book, "#548235", "white")
+    col_fmt = [hdr_site] * 5 + [hdr_old] + [hdr_new] + [hdr_chg] * 2 + [hdr_flag]
+
+    def _group(c1: int, c2: int, text: str, fmt) -> None:
+        if c1 == c2:
+            ws.write(group_row, c1, text, fmt)
+        else:
+            ws.merge_range(group_row, c1, group_row, c2, text, fmt)
+
+    ws.set_row(group_row, 22)
+    _group(0, 4, "Site", hdr_site)
+    _group(5, 5, f"Previous ({old_lbl})", hdr_old)
+    _group(6, 6, f"Current ({new_lbl})", hdr_new)
+    _group(7, 8, "Change", hdr_chg)
+    _group(9, 9, "BW Increased", hdr_flag)
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, col_fmt[col])
+
+    def _num(row, col, value, nfmt):
+        if value is None or not np.isfinite(value):
+            ws.write_blank(row, col, None, nfmt)
+        else:
+            ws.write_number(row, col, value, nfmt)
+
+    for i, rec in enumerate(compare_rows):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 18)
+        n = styles["num_z"] if zebra else styles["num"]
+        c = styles["center_z"] if zebra else styles["center"]
+        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        ws.write_string(row, 1, rec["site"], c)
+        ws.write_string(row, 2, rec.get("tech") or TECH_4G, c)
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row,
+            3,
+            site_type,
+            styles["below"] if site_type == "Not found" else c,
+        )
+        ws.write_string(
+            row, 4, rec["severity"], _severity_format(styles, rec["severity"], zebra)
+        )
+        _num(row, 5, rec.get("old_rx"), n)
+        _num(row, 6, rec.get("new_rx"), n)
+        _num(row, 7, rec.get("delta_rx"), n)
+        _num(row, 8, rec.get("delta_pct"), n)
+        up = bool(rec.get("bw_up"))
+        ws.write_string(row, 9, "Yes" if up else "", styles["yes"] if up else c)
+
+    last = header_row + max(len(compare_rows), 1)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(group_row, header_row)
+    ws.set_zoom(110)
+
+
+def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, int]) -> None:
+    """Findings: Tx BW step-up, solved, and choked again, with 1H OSS both windows."""
+    ws = book.add_worksheet(COMPARE_V1_SHEET)
+    _page(ws, "comparison_v1 — Tx BW increase and choke after the increase")
+    ws.set_tab_color("#548235")
+    prev_lbl = f"{ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b')}"
+    new_lbl = f"{LATEST_START.strftime('%-d %b')}–{LATEST_END.strftime('%-d %b')}"
+    n_again = sum(1 for row in rows if row["finding"] == FINDING_AGAIN)
+    n_solved = sum(1 for row in rows if row["finding"] in (FINDING_SOLVED, FINDING_SOLVED_UP))
+    n_up = sum(1 for row in rows if row.get("bw_up"))
+    data_fields = (
+        ("tp_data_1h", "DL Throughput 1h"),
+        ("prb_data_1h", "DLPRBUtilization,%"),
+        ("vol_data_1h", "Data Volume 1h"),
+        ("users_data_1h", "Max User 1h"),
+        ("data1_hours_matched_pct", "Hours matched %"),
+        ("data1_last_match_text", "Last day match"),
+    )
+    user_fields = (
+        ("tp_user_1h", "DL Throughput 1h"),
+        ("prb_user_1h", "DLPRBUtilization,%"),
+        ("vol_user_1h", "Data Volume 1h"),
+        ("users_user_1h", "Max User 1h"),
+        ("user1_hours_matched_pct", "Hours matched %"),
+        ("user1_last_match_text", "Last day match"),
+    )
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Site Type",
+        "Severity",
+        "Finding",
+        "Previous choked",
+        "Latest choked",
+        f"Rx p90 {prev_lbl}",
+        f"Rx p90 {new_lbl}",
+        "Increase (Mbps)",
+        "Increase %",
+        "Tx BW increased",
+        f"Tx BW {prev_lbl}",
+        f"Tx BW {new_lbl}",
+    ]
+    for _fields in (data_fields, data_fields, user_fields, user_fields):
+        for _key, label in _fields:
+            headers.append(label)
+    last_col = len(headers) - 1
+    widths = [5, 16, 10, 14, 12, 34, 16, 14, 16, 16, 14, 12, 16, 14, 14] + [16] * (len(headers) - 15)
+    for i, width in enumerate(widths):
+        ws.set_column(i, i, width)
+
+    ws.set_row(0, 28)
+    ws.merge_range(
+        0, 0, 0, last_col,
+        "comparison_v1 — Tx BW increased, solved, and choked again",
+        styles["title"],
+    )
+    ws.set_row(1, 32)
+    ws.merge_range(
+        1, 0, 1, last_col,
+        f"{prev_lbl} {PREV_FEG_FILE}    ·    {new_lbl} {LATEST_FEG_FILE}    ·    "
+        f"{len(rows)} sites    ·    Tx BW increased: {n_up}    ·    "
+        f"Choked again: {n_again}    ·    Solved: {n_solved}    ·    "
+        f"Yes when busy-hour RxMaxSpeed p90 rises ≥ {BW_UP_MBPS:g} Mbit/s or "
+        f"{100 * BW_UP_FRAC:.0f}%. OSS columns are the 1H block only.",
+        styles["subtitle"],
+    )
+
+    group_row = 3
+    header_row = 4
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_find = _busy_section_header(book, "#833C0C", "white")
+    hdr_old = _busy_section_header(book, "#2471A3", "white")
+    hdr_new = _busy_section_header(book, "#0D7377", "white")
+    hdr_flag = _busy_section_header(book, "#548235", "white")
+    hdr_prev_data = _busy_section_header(book, "#1A5276", "white")
+    hdr_new_data = _busy_section_header(book, "#6C3483", "white")
+    hdr_prev_user = _busy_section_header(book, "#1F618D", "white")
+    hdr_new_user = _busy_section_header(book, "#7D3C98", "white")
+    col_fmt = (
+        [hdr_site] * 5
+        + [hdr_find] * 3
+        + [hdr_old, hdr_new, hdr_flag, hdr_flag, hdr_flag, hdr_old, hdr_new]
+        + [hdr_prev_data] * 6
+        + [hdr_new_data] * 6
+        + [hdr_prev_user] * 6
+        + [hdr_new_user] * 6
+    )
+
+    def _group(c1: int, c2: int, text: str, fmt) -> None:
+        if c1 == c2:
+            ws.write(group_row, c1, text, fmt)
+        else:
+            ws.merge_range(group_row, c1, group_row, c2, text, fmt)
+
+    ws.set_row(group_row, 22)
+    _group(0, 4, "Site", hdr_site)
+    _group(5, 7, "Finding", hdr_find)
+    _group(8, 12, "FEGE Tx ceiling (RxMaxSpeed p90, 08:00–22:00)", hdr_flag)
+    _group(13, 14, "Tx Total BW reference", hdr_old)
+    _group(15, 20, f"Previous OSS 1H Data ({prev_lbl})", hdr_prev_data)
+    _group(21, 26, f"Latest OSS 1H Data ({new_lbl})", hdr_new_data)
+    _group(27, 32, f"Previous OSS 1H User ({prev_lbl})", hdr_prev_user)
+    _group(33, 38, f"Latest OSS 1H User ({new_lbl})", hdr_new_user)
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, col_fmt[col])
+    ws.freeze_panes(header_row + 1, 2)
+
+    again_fmt = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "border_color": LINE,
+            "bg_color": "#F4CCCC",
+            "font_color": "#990000",
+        }
+    )
+    solved_fmt = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "border_color": LINE,
+            "bg_color": GREEN,
+            "font_color": GREEN_FONT,
+        }
+    )
+
+    def _num(row, col, value, nfmt):
+        if value is None or not isinstance(value, (int, float)) or not np.isfinite(value):
+            ws.write_blank(row, col, None, nfmt)
+        else:
+            ws.write_number(row, col, value, nfmt)
+
+    text_keys = {"data1_last_match_text", "user1_last_match_text"}
+    for i, rec in enumerate(rows):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 18)
+        nfmt = styles["num_z"] if zebra else styles["num"]
+        cfmt = styles["center_z"] if zebra else styles["center"]
+        link = styles["link_z"] if zebra else styles["link"]
+        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        anchor = chart_index.get(rec["site"])
+        if anchor is None:
+            ws.write_string(row, 1, rec["site"], cfmt)
+        else:
+            excel_row = anchor * BLOCK_ROWS + 1
+            ws.write_url(
+                row,
+                1,
+                f"internal:'{SNAP_SHEET}'!A{excel_row}",
+                link,
+                string=rec["site"],
+            )
+        ws.write_string(row, 2, rec.get("tech") or TECH_4G, cfmt)
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row, 3, site_type, styles["below"] if site_type == "Not found" else cfmt
+        )
+        ws.write_string(row, 4, rec.get("severity") or "—", _severity_format(styles, rec.get("severity") or "", zebra))
+        finding = rec["finding"]
+        if finding == FINDING_AGAIN:
+            ffmt = again_fmt
+        elif finding in (FINDING_SOLVED, FINDING_SOLVED_UP):
+            ffmt = solved_fmt
+        else:
+            ffmt = styles["at"] if rec.get("bw_up") else cfmt
+        ws.write_string(row, 5, finding, ffmt)
+        ws.write_string(row, 6, "Yes" if rec.get("prev_choked") else "", styles["yes"] if rec.get("prev_choked") else cfmt)
+        ws.write_string(row, 7, "Yes" if rec.get("latest_choked") else "", styles["yes"] if rec.get("latest_choked") else cfmt)
+        _num(row, 8, rec.get("old_rx"), nfmt)
+        _num(row, 9, rec.get("new_rx"), nfmt)
+        _num(row, 10, rec.get("delta_rx"), nfmt)
+        _num(row, 11, rec.get("delta_pct"), nfmt)
+        ws.write_string(row, 12, "Yes" if rec.get("bw_up") else "", styles["yes"] if rec.get("bw_up") else cfmt)
+        _num(row, 13, rec.get("prev_tx"), nfmt)
+        _num(row, 14, rec.get("latest_tx"), nfmt)
+        prev_oss = rec.get("prev_oss") or {}
+        latest_oss = rec.get("latest_oss") or {}
+        col = 15
+        for source, fields in (
+            (prev_oss, data_fields),
+            (latest_oss, data_fields),
+            (prev_oss, user_fields),
+            (latest_oss, user_fields),
+        ):
+            for key, _label in fields:
+                value = source.get(key)
+                if key in text_keys:
+                    text = "" if value is None else str(value)
+                    ws.write_string(row, col, text if text and text != "—" else "", cfmt)
+                else:
+                    _num(row, col, value, nfmt)
+                col += 1
+
+    last = header_row + max(len(rows), 1)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(group_row, header_row)
+    ws.set_zoom(110)
+
+
+def _write_workbook(
+    path: Path,
+    source_name: str,
+    work: pd.DataFrame,
+    records: list[dict],
+    geo: pd.DataFrame | None = None,
+    tech_summary: dict[str, int] | None = None,
+    tech_by_site: dict[str, str] | None = None,
+    busy_rows: list[dict] | None = None,
+    skip_heavy: bool = False,
+    compare_rows: list[dict] | None = None,
+    compare_v1: list[dict] | None = None,
+    chart_records: list[dict] | None = None,
+    latest_work: pd.DataFrame | None = None,
+    skip_geo: bool = True,
+) -> None:
+    """Write the report. List links use the fixed snapshot block stride."""
+    import xlsxwriter
+
+    book = xlsxwriter.Workbook(str(path))
+    styles = _styles(book)
+    period_start = work["Date"].min()
+    period_end = work["Date"].max()
+    n_sites = int(work["eNodeB Name"].nunique())
+    period_txt = (
+        f"{period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')}"
+    )
+
+    # Dashboard is the first sheet so the file opens on the report view.
+    chart_end = period_end.normalize()
+    chart_start = chart_end - pd.Timedelta(days=SNAP_DAYS - 1)
+    if not skip_heavy and records and "peak_72" not in records[0]:
+        _attach_chart_peaks(work, records, chart_start, chart_end)
+    _write_summary(
+        book, styles, source_name, period_txt, n_sites, records, tech_summary, tech_by_site
+    )
+    _write_list_linked(
+        book, styles, source_name, period_txt, n_sites, records, busy_rows or []
+    )
+    _write_action_plan(book, styles, source_name, period_txt, n_sites, records, geo)
+    _write_busy_hour_plan(book, styles, period_txt, records, busy_rows or [])
+    if compare_rows:
+        _write_comparison(book, styles, compare_rows)
+    charts = chart_records or records
+    chart_index = {rec["site"]: i for i, rec in enumerate(charts)}
+    _write_comparison_v1(book, styles, compare_v1 or [], chart_index)
+    if not skip_heavy:
+        _write_snapshots(
+            book,
+            styles,
+            work,
+            charts,
+            period_txt,
+            chart_start,
+            chart_end,
+            busy_rows or [],
+            latest_work=latest_work,
+            latest_start=LATEST_START,
+            latest_end=LATEST_END,
+        )
+        print("Writing hourly KPI...", flush=True)
+        _write_hourly(book, styles, work, records)
+    _write_method(book, styles, source_name, period_txt, n_sites, records)
+    if not skip_heavy and not skip_geo and geo is not None and len(geo):
+        print("Writing GeoPlot...", flush=True)
+        _write_geoplot(book, styles, work, records, geo, path, tech_by_site)
+    book.close()
+
+
+def _write_list_linked(
+    book, styles, source_name, period_txt, n_sites, records, busy_rows: list[dict] | None = None
+):
+    """Same list as _write_list, with each site name linked to its snapshot."""
+    ws = book.add_worksheet("1. Site List")
+    _page(ws, REPORT_TITLE)
+
+    last_day_hdr = records[0]["last_day_label"] if records else "last day"
+    kpi_4 = [
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+    ]
+    kpi_1 = [
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+    ]
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Severity",
+        "Cap shape",
+        "Tx Total BW (Mbit/s)",
+        "Stuck RxMaxSpeed (Mbit/s)",
+        "Max RxMaxSpeed (Mbit/s)",
+        "Hours on cap (all 24h)",
+        "Where capped",
+        "Days on cap (≥3h)",
+        f"Last day cap ({last_day_hdr})",
+        "Listed because",
+        "Longest flat run (h)",
+        "Double check",
+        "Site Type",
+        *kpi_4,
+        *kpi_4,
+        *kpi_1,
+        *kpi_1,
+    ]
+    last_col = len(headers) - 1
+    last_col_letter = xl_rowcol_to_cell(0, last_col).rstrip("0123456789")
+    widths = [5, 14, 12, 12, 14, 16, 16, 16, 18, 16, 12, 32, 18, 12, 14, 14] + [16] * 16
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    ws.set_row(0, 28)
+    ws.merge_range(
+        f"A1:{last_col_letter}1",
+        f"{REPORT_TITLE} — issue sites ({ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b %Y')})",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        f"A2:{last_col_letter}2",
+        f"DHK transmission    ·    {period_txt}    ·    hourly    ·    "
+        f"{n_sites} sites checked    ·    {len(records)} issue sites    ·    "
+        "4H / 1H OSS KPIs from URGENTBWINC_BusyHour after Site Type",
+        styles["subtitle"],
+    )
+
+    group_row = 3
+    header_row = 4
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_data4 = _busy_section_header(book, "#C65911", "white")
+    hdr_user4 = _busy_section_header(book, "#B7950B", "white")
+    hdr_data1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_user1 = _busy_section_header(book, "#1A5276", "white")
+    col_fmt = [styles["header"]] * 16 + [hdr_data4] * 4 + [hdr_user4] * 4 + [hdr_data1] * 4 + [hdr_user1] * 4
+    ws.set_row(group_row, 22)
+    ws.merge_range(group_row, 0, group_row, 15, "Site", hdr_site)
+    ws.merge_range(group_row, 16, group_row, 19, "DataBusyHour (4 BusyHour)", hdr_data4)
+    ws.merge_range(group_row, 20, group_row, 23, "UserBusyHour (4 BusyHour)", hdr_user4)
+    ws.merge_range(group_row, 24, group_row, 27, "DataBusyHour (1 BusyHour)", hdr_data1)
+    ws.merge_range(group_row, 28, group_row, 31, "UserBusyHour (1 BusyHour)", hdr_user1)
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, col_fmt[col])
+    busy_by_site = {row["site"]: row for row in (busy_rows or [])}
+
+    for i, rec in enumerate(records):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 18)
+        n = styles["num_z"] if zebra else styles["num"]
+        c = styles["center_z"] if zebra else styles["center"]
+        link = styles["link_z"] if zebra else styles["link"]
+        excel_anchor = i * BLOCK_ROWS + 1  # 1-based row on the snapshot sheet
+        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        ws.write_url(
+            row,
+            1,
+            f"internal:'{SNAP_SHEET}'!A{excel_anchor}",
+            link,
+            string=rec["site"],
+        )
+        ws.write_string(row, 2, _rec_tech(rec), c)
+        ws.write_string(row, 3, rec["severity"], _severity_format(styles, rec["severity"], zebra))
+        ws.write_string(row, 4, rec["cap_type"], c)
+        ws.write_number(row, 5, rec["bw"], n)
+        ws.write_number(row, 6, rec["center"], n)
+        ws.write_number(row, 7, rec["max_rx"], n)
+        ws.write_string(
+            row,
+            8,
+            f"{rec['hours_on']}/{rec['hours_n']} ({rec['hours_pct']:.1f}%)",
+            c,
+        )
+        ws.write_string(row, 9, rec["cap_when"], c)
+        ws.write_string(row, 10, f"{rec['days_on_cap']}/{rec['days_total']}", c)
+        last_txt = last_day_text(rec)
+        ws.write_string(row, 11, last_txt, styles["yes"] if rec["last_flag"] else c)
+        ws.write_string(row, 12, rec["listed_by"], c)
+        ws.write_number(row, 13, rec["longest"], styles["int_z"] if zebra else styles["int"])
+        if rec.get("double_check"):
+            ws.write_string(row, 14, "Yes", styles["yes"])
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row,
+            15,
+            site_type,
+            styles["below"] if site_type == "Not found" else c,
+        )
+
+        def _num(r, col, value):
+            if value is None or not np.isfinite(value):
+                ws.write_blank(r, col, None, n)
+            else:
+                ws.write_number(r, col, value, n)
+
+        busy = busy_by_site.get(rec["site"], {})
+        kpi_keys = (
+            "tp_data_4h",
+            "prb_data_4h",
+            "vol_data_4h",
+            "users_data_4h",
+            "tp_user_4h",
+            "prb_user_4h",
+            "vol_user_4h",
+            "users_user_4h",
+            "tp_data_1h",
+            "prb_data_1h",
+            "vol_data_1h",
+            "users_data_1h",
+            "tp_user_1h",
+            "prb_user_1h",
+            "vol_user_1h",
+            "users_user_1h",
+        )
+        for offset, key in enumerate(kpi_keys):
+            _num(row, 16 + offset, busy.get(key, float("nan")))
+
+    last = header_row + len(records)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(group_row, header_row)
+
+    note_row = last + 2
+    ws.set_row(note_row, 20)
+    ws.merge_range(note_row, 0, note_row, last_col, "How to read Severity", styles["section"])
+    for offset, (name, text) in enumerate(SEVERITY_NOTES):
+        r = note_row + 1 + offset
+        ws.set_row(r, 32)
+        ws.merge_range(r, 0, r, 1, name, _severity_format(styles, name, False))
+        ws.merge_range(r, 2, r, last_col, text, styles["body"])
+
+    where_row = note_row + 1 + len(SEVERITY_NOTES) + 1
+    ws.set_row(where_row, 20)
+    ws.merge_range(where_row, 0, where_row, last_col, "How to read Where capped", styles["section"])
+    where_notes = (
+        (
+            "Busy + off-peak",
+            "The ceiling appears in both 08:00–22:00 and night / off-peak hours. "
+            "The port is limited around the clock.",
+        ),
+        (
+            "Busy hours",
+            "The ceiling is clear in 08:00–22:00. Night hours leave the cap.",
+        ),
+        (
+            "Off-peak",
+            "The ceiling is clear in night / off-peak hours even if daytime "
+            "busy hours are less flat. These sites are still listed.",
+        ),
+    )
+    for offset, (name, text) in enumerate(where_notes):
+        r = where_row + 1 + offset
+        ws.set_row(r, 28)
+        ws.merge_range(r, 0, r, 1, name, styles["center"])
+        ws.merge_range(r, 2, r, last_col, text, styles["body"])
+
+    last_help = where_row + 5
+    ws.set_row(last_help, 20)
+    ws.merge_range(last_help, 0, last_help, last_col, "How to read Last day cap", styles["section"])
+    ws.set_row(last_help + 1, 36)
+    ws.merge_range(
+        last_help + 1,
+        0,
+        last_help + 1,
+        last_col,
+        f"Green cell with a date means {last_day_hdr} had at least {LAST_DAY_HOURS} hours "
+        "on the same stuck level (busy and/or off-peak). Example: "
+        f"'{last_day_hdr} · 6h (busy 4, off-peak 2)'. "
+        "A dash means that last day was not on the cap. "
+        "Listed because = Last day means the site is in this file only for that last-day flag.",
+        styles["body"],
+    )
+
+    dc_row = last_help + 3
+    ws.set_row(dc_row, 20)
+    ws.merge_range(dc_row, 0, dc_row, last_col, "How to read Double check", styles["section"])
+    ws.set_row(dc_row + 1, 40)
+    ws.merge_range(
+        dc_row + 1,
+        0,
+        dc_row + 1,
+        last_col,
+        f"Yes means Peak is at least {DOUBLE_CHECK_PEAK_GAP:.0%} above Avg peak on the "
+        "hourly chart (example: DHGULAP Peak 71.97 vs Avg peak 34.92). "
+        "Tx may treat this as low radio demand rather than a hard transmission wall. "
+        "The site stays in the issue list for review.",
+        styles["body"],
+    )
+
+    st_row = dc_row + 3
+    ws.set_row(st_row, 20)
+    ws.merge_range(st_row, 0, st_row, last_col, "How to read Site Type", styles["section"])
+    ws.set_row(st_row + 1, 36)
+    ws.merge_range(
+        st_row + 1,
+        0,
+        st_row + 1,
+        last_col,
+        f"Copied from the Site Type column in {GEO_FILE} (GF, RTT, RTP, IBS, and so on). "
+        "Not found means the site is not in that physical database.",
+        styles["body"],
+    )
+
+    oss_row = st_row + 3
+    ws.set_row(oss_row, 20)
+    ws.merge_range(
+        oss_row, 0, oss_row, last_col, "How to read 4H / 1H OSS KPIs", styles["section"]
+    )
+    ws.set_row(oss_row + 1, 44)
+    ws.merge_range(
+        oss_row + 1,
+        0,
+        oss_row + 1,
+        last_col,
+        "The four coloured blocks after Site Type are copied from URGENTBWINC_BusyHour "
+        "for the same eNodeB: DataBusyHour (4 BusyHour), UserBusyHour (4 BusyHour), "
+        "DataBusyHour (1 BusyHour), UserBusyHour (1 BusyHour). Each block has "
+        "DL Throughput, DLPRBUtilization,% = (DL PRB Utilization_N / DL PRB "
+        "Utilization_D) × 100, Data Volume, and Max User. Blank means the site is "
+        "not in the OSS BusyHour scan.",
+        styles["body"],
+    )
+
+    tech_row = oss_row + 3
+    ws.set_row(tech_row, 20)
+    ws.merge_range(tech_row, 0, tech_row, last_col, "How to read Tech", styles["section"])
+    ws.set_row(tech_row + 1, 32)
+    ws.merge_range(
+        tech_row + 1,
+        0,
+        tech_row + 1,
+        last_col,
+        f"Copied from the Tech column in {GEO_FILE} (4G or 4G+5G). "
+        "Unmapped sites are 4G — every site has 4G.",
+        styles["body"],
+    )
+
+    counts = defaultdict(int)
+    listed = defaultdict(int)
+    when = defaultdict(int)
+    shapes = defaultdict(int)
+    last_n = 0
+    for rec in records:
+        counts[rec["severity"]] += 1
+        listed[rec["listed_by"]] += 1
+        when[rec["cap_when"]] += 1
+        shapes[rec["cap_type"]] += 1
+        last_n += int(rec["last_flag"])
+    count_row = tech_row + 3
+    ws.write(count_row, 0, "Severity", styles["label"])
+    ws.merge_range(count_row, 1, count_row, 2, f"Severe: {counts[SEV_SEVERE]}", styles["meta"])
+    ws.merge_range(
+        count_row, 3, count_row, 4, f"High: {counts[SEV_HIGH]}", styles["meta"]
+    )
+    ws.merge_range(
+        count_row, 5, count_row, 6,
+        f"Moderate: {counts[SEV_MODERATE]}    ·    Low: {counts[SEV_LOW]}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row,
+        7,
+        count_row,
+        last_col,
+        f"Cap shapes: {shapes[CAP_CROWDED]} crowded · {shapes[CAP_CEILING]} ceiling",
+        styles["meta"],
+    )
+    ws.set_row(count_row + 1, 18)
+    ws.write(count_row + 1, 0, "Listed", styles["label"])
+    ws.merge_range(
+        count_row + 1, 1, count_row + 1, 4,
+        f"≥3 days + last day: {listed['≥3 days + last day']}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 1, 5, count_row + 1, 8,
+        f"≥3 days: {listed['≥3 days']}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 1, 9, count_row + 1, last_col,
+        f"Last day only: {listed['Last day']}    ·    last-day flag: {last_n}",
+        styles["meta"],
+    )
+    ws.set_row(count_row + 2, 18)
+    ws.write(count_row + 2, 0, "Where", styles["label"])
+    ws.merge_range(
+        count_row + 2, 1, count_row + 2, 4,
+        f"Busy + off-peak: {when['Busy + off-peak']}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 2, 5, count_row + 2, 8,
+        f"Busy hours: {when['Busy hours']}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 2, 9, count_row + 2, last_col,
+        f"Off-peak: {when['Off-peak']}    ·    Partial: {when['Partial']}",
+        styles["meta"],
+    )
+    ws.set_row(count_row + 3, 18)
+    ws.write(count_row + 3, 0, "Shape", styles["label"])
+    ws.merge_range(
+        count_row + 3, 1, count_row + 3, 4,
+        f"{CAP_CROWDED}: {shapes[CAP_CROWDED]}",
+        styles["meta"],
+    )
+    ws.merge_range(
+        count_row + 3, 5, count_row + 3, last_col,
+        f"{CAP_CEILING}: {shapes[CAP_CEILING]}",
+        styles["meta"],
+    )
+    ws.set_row(count_row + 4, 20)
+    ws.merge_range(
+        count_row + 4,
+        0,
+        count_row + 4,
+        last_col,
+        f"Window is {period_txt}. "
+        f"{ANALYSIS_DAYS}-day rule: ≥{MIN_DAYS_ON_CAP} days with ≥{STUCK_DAY_HOURS} hours on the cap. "
+        f"Last-day rule: {last_day_hdr} with ≥{LAST_DAY_HOURS} hours on the cap "
+        "(busy and/or off-peak).",
+        styles["note"],
+    )
+
+
+def _urgent_thana_counts(
+    selected: list[dict], geo: pd.DataFrame | None
+) -> list[tuple[str, int]]:
+    """Site counts by physical Thana for the UrgentTxBWInc list."""
+    by_site: dict[str, str] = {}
+    if geo is not None and len(geo):
+        for row in geo.itertuples(index=False):
+            name = str(getattr(row, "thana", "") or "").strip()
+            if name.lower() in ("", "nan", "none"):
+                name = ""
+            by_site[str(row.site)] = name
+    counts: dict[str, int] = defaultdict(int)
+    for rec in selected:
+        name = by_site.get(rec["site"], "")
+        if not name:
+            name = "(No thana)"
+        counts[name] += 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+
+
+def _thana_summary_layout(n: int) -> tuple[int, int]:
+    """Name/Count pair count and data rows for the Thana summary.
+
+    Keep the grid short (about 8 rows) by adding pairs to the right when
+    thanas increase. Shrink both width and height when thanas decrease.
+    """
+    target_rows = 8
+    max_pairs = 16
+    if n <= 0:
+        return 1, 1
+    pair_n = min(max_pairs, max(1, (n + target_rows - 1) // target_rows))
+    n_rows = (n + pair_n - 1) // pair_n
+    while pair_n > 1 and (pair_n - 1) * n_rows >= n:
+        pair_n -= 1
+        n_rows = (n + pair_n - 1) // pair_n
+    return pair_n, n_rows
+
+
+def _thana_extra_col_widths(pair_n: int) -> tuple[int, int]:
+    """Tighter extra columns when the grid grows to the right."""
+    if pair_n <= 6:
+        return 18, 8
+    if pair_n <= 10:
+        return 16, 7
+    return 14, 6
+
+
+def _write_action_plan(
+    book,
+    styles,
+    source_name,
+    period_txt,
+    n_sites,
+    records,
+    geo: pd.DataFrame | None = None,
+):
+    """Budgeted urgent Tx BW increase list: Severe/High with a heavy busy-hour cap."""
+    ws = book.add_worksheet(ACTION_SHEET)
+    _page(ws, "UrgentTxBWInc — urgent Tx BW increase")
+    ws.set_tab_color(ORANGE_FONT)
+
+    widths = [5, 18, 12, 12, 18, 16, 18, 20, 26, 16, 12, 18]
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    selected = _action_plan_records(records)
+    chart_row = {rec["site"]: i * BLOCK_ROWS + 1 for i, rec in enumerate(records)}
+    last_col = 11  # UrgentTxBWInc site table A–L; Thana summary continues further right
+
+    sum_title = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 12,
+            "bold": True,
+            "font_color": NAVY,
+            "valign": "vcenter",
+        }
+    )
+    sum_head = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#F8CBAD",
+            "border": 1,
+            "border_color": "#C65911",
+        }
+    )
+    sum_name = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "align": "left",
+            "valign": "vcenter",
+            "border": 1,
+            "border_color": LINE,
+        }
+    )
+    sum_count = book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "border_color": LINE,
+            "num_format": "0",
+        }
+    )
+
+    thana_counts = _urgent_thana_counts(selected, geo)
+    pair_n, n_sum_rows = _thana_summary_layout(len(thana_counts))
+    pair_start = 1  # column B; A stays the site-list No. column (width 5)
+    sum_last_col = pair_start + pair_n * 2 - 1
+    title_last_col = max(sum_last_col, last_col)
+    name_w, count_w = _thana_extra_col_widths(pair_n)
+    for pair in range(pair_n):
+        name_col = pair_start + pair * 2
+        count_col = name_col + 1
+        if name_col > last_col:
+            ws.set_column(name_col, name_col, name_w)
+        if count_col > last_col:
+            ws.set_column(count_col, count_col, count_w)
+
+    ws.set_row(0, 28)
+    ws.merge_range(
+        0,
+        0,
+        0,
+        title_last_col,
+        "UrgentTxBWInc — urgent Tx BW increase",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        1,
+        0,
+        1,
+        title_last_col,
+        f"DHK transmission    ·    {period_txt}    ·    {len(selected)} of {len(records)} issue sites",
+        styles["subtitle"],
+    )
+
+    ws.set_row(3, 20)
+    ws.merge_range(
+        3,
+        0,
+        3,
+        sum_last_col,
+        "Thana Level Summary of urgent Tx BW increase",
+        sum_title,
+    )
+    head_row = 5
+    ws.set_row(head_row, 20)
+    for pair in range(pair_n):
+        col = pair_start + pair * 2
+        ws.write(head_row, col, "Thana Name", sum_head)
+        ws.write(head_row, col + 1, "Site Count", sum_head)
+    for r in range(n_sum_rows):
+        excel_r = head_row + 1 + r
+        ws.set_row(excel_r, 18)
+        for pair in range(pair_n):
+            idx = pair * n_sum_rows + r
+            col = pair_start + pair * 2
+            if idx < len(thana_counts):
+                name, count = thana_counts[idx]
+                ws.write_string(excel_r, col, name, sum_name)
+                ws.write_number(excel_r, col + 1, count, sum_count)
+            else:
+                ws.write_blank(excel_r, col, None, sum_name)
+                ws.write_blank(excel_r, col + 1, None, sum_count)
+
+    headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Severity",
+        "Cap shape",
+        "Tx Total BW (Mbit/s)",
+        "Stuck RxMaxSpeed (Mbit/s)",
+        "Hours on cap (all 24h)",
+        "Busy hours on cap (08:00–22:00)",
+        "Where capped",
+        "Days on cap (≥3h)",
+        "Action",
+    ]
+    header_row = head_row + 1 + n_sum_rows + 2
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, styles["header"])
+
+    for i, rec in enumerate(selected):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 18)
+        n = styles["num_z"] if zebra else styles["num"]
+        c = styles["center_z"] if zebra else styles["center"]
+        link = styles["link_z"] if zebra else styles["link"]
+        ws.write_number(row, 0, i + 1, styles["int_z"] if zebra else styles["int"])
+        ws.write_url(
+            row,
+            1,
+            f"internal:'{SNAP_SHEET}'!A{chart_row[rec['site']]}",
+            link,
+            string=rec["site"],
+        )
+        ws.write_string(row, 2, _rec_tech(rec), c)
+        ws.write_string(row, 3, rec["severity"], _severity_format(styles, rec["severity"], zebra))
+        ws.write_string(row, 4, rec["cap_type"], c)
+        ws.write_number(row, 5, rec["bw"], n)
+        ws.write_number(row, 6, rec["center"], n)
+        ws.write_string(
+            row,
+            7,
+            f"{rec['hours_on']}/{rec['hours_n']} ({rec['hours_pct']:.1f}%)",
+            c,
+        )
+        ws.write_string(
+            row,
+            8,
+            f"{rec['busy_on']}/{rec['busy_n']} ({rec['busy_pct']:.1f}%)",
+            c,
+        )
+        ws.write_string(row, 9, rec["cap_when"], c)
+        ws.write_string(row, 10, f"{rec['days_on_cap']}/{rec['days_total']}", c)
+        ws.write_string(row, 11, "Increase Tx BW", styles["yes"])
+
+    last = header_row + max(len(selected), 1)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(header_row, header_row)
+
+    by_sev = defaultdict(int)
+    for rec in selected:
+        by_sev[rec["severity"]] += 1
+
+    count_row = last + 2
+    ws.set_row(count_row, 18)
+    ws.write(count_row, 0, "This plan", styles["label"])
+    ws.merge_range(count_row, 1, count_row, 2, f"Sites: {len(selected)}", styles["meta"])
+    ws.merge_range(count_row, 3, count_row, 4, f"Severe: {by_sev[SEV_SEVERE]}", styles["meta"])
+    ws.merge_range(count_row, 5, count_row, last_col, f"High: {by_sev[SEV_HIGH]}", styles["meta"])
+    ws.set_zoom(110)
+
+
+def _busy_section_header(book, bg: str, fg: str = "white"):
+    return book.add_format(
+        {
+            "font_name": "Calibri",
+            "font_size": 10,
+            "bold": True,
+            "font_color": fg,
+            "bg_color": bg,
+            "align": "center",
+            "valign": "vcenter",
+            "text_wrap": True,
+            "border": 1,
+            "border_color": bg,
+        }
+    )
+
+
+def _write_busy_hour_plan(book, styles, period_txt, records, busy_rows: list[dict]) -> None:
+    """OSS DataBusyHour / UserBusyHour for 7, 4, and 1 BusyHour."""
+    ws = book.add_worksheet(BUSY_SHEET)
+    _page(ws, "URGENTBWINC_BusyHour — OSS data and user busy hours")
+    ws.set_tab_color("#C00000")
+
+    days = list(pd.date_range(ANALYSIS_START, ANALYSIS_END, freq="D"))
+    day_labels = [day.strftime("%-d-%b") for day in days]
+    match_7 = [
+        "Hours matched",
+        "Hours matched %",
+        "Last day match",
+        "Listed because",
+        "DL Throughput 7h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 7h (GB)",
+        "Max User 7h",
+    ]
+    match_4 = [
+        "Hours matched",
+        "Hours matched %",
+        "Last day match",
+        "Listed because",
+        "DL Throughput 4h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 4h (GB)",
+        "Max User 4h",
+    ]
+    match_1 = [
+        "Hours matched",
+        "Hours matched %",
+        "Last day match",
+        "Listed because",
+        "DL Throughput 1h (Mbps)",
+        "DLPRBUtilization,%",
+        "Data Volume 1h (GB)",
+        "Max User 1h",
+    ]
+    id_headers = [
+        "No.",
+        "eNodeB Name",
+        "Tech",
+        "Severity",
+        "Site Type",
+        "4 BH Flag",
+        "1 BH Flag",
+        "4/1BH Flag",
+        "Chocked %_Data Busy Hour",
+        "Chocked %_User Busy Hour",
+        "Data Busy Hour_TP",
+        "User Busy Hour_TP",
+        "Chocked %_Data Busy Hour",
+        "Chocked %_User Busy Hour",
+        "Data Busy Hour_TP",
+        "User Busy Hour_TP",
+        "Chocked %_Data Busy Hour",
+        "Chocked %_User Busy Hour",
+        "Data Busy Hour",
+        "User Busy Hour",
+    ]
+    data_day_headers = [f"DataBusyHour ({label})" for label in day_labels]
+    user_day_headers = [f"UserBusyHour ({label})" for label in day_labels]
+    headers = (
+        id_headers
+        + data_day_headers
+        + match_7
+        + user_day_headers
+        + match_7
+        + data_day_headers
+        + match_4
+        + user_day_headers
+        + match_4
+        + data_day_headers
+        + match_1
+        + user_day_headers
+        + match_1
+    )
+    last_col = len(headers) - 1
+    day_widths = [22] * len(days)
+    day1_widths = [12] * len(days)
+    match_widths = [12, 14, 16, 16, 16, 16, 16, 12]
+    widths = (
+        [5, 16, 10, 12, 14, 12, 12, 14, 22, 22, 16, 16, 22, 22, 16, 16, 22, 22, 16, 16]
+        + day_widths
+        + match_widths
+        + day_widths
+        + match_widths
+        + day_widths
+        + match_widths
+        + day_widths
+        + match_widths
+        + day1_widths
+        + match_widths
+        + day1_widths
+        + match_widths
+    )
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+
+    chart_row = {rec["site"]: i * BLOCK_ROWS + 1 for i, rec in enumerate(records)}
+    ws.set_row(0, 28)
+    ws.merge_range(
+        0,
+        0,
+        0,
+        last_col,
+        "URGENTBWINC_BusyHour — OSS DataBusyHour / UserBusyHour choke match",
+        styles["title"],
+    )
+    ws.set_row(1, 18)
+    ws.merge_range(
+        1,
+        0,
+        1,
+        last_col,
+        f"DHK transmission    ·    {period_txt}    ·    {len(busy_rows)} sites"
+        f"    ·    independent of UrgentTxBWInc"
+        f"    ·    7 / 4 / 1 BusyHour from {OSS_FILE}",
+        styles["subtitle"],
+    )
+
+    group_row = 3
+    header_row = 4
+    data7_start = len(id_headers)
+    data7_end = data7_start + len(data_day_headers) + len(match_7) - 1
+    user7_start = data7_end + 1
+    user7_end = user7_start + len(user_day_headers) + len(match_7) - 1
+    data4_start = user7_end + 1
+    data4_end = data4_start + len(data_day_headers) + len(match_4) - 1
+    user4_start = data4_end + 1
+    user4_end = user4_start + len(user_day_headers) + len(match_4) - 1
+    data1_start = user4_end + 1
+    data1_end = data1_start + len(data_day_headers) + len(match_1) - 1
+    user1_start = data1_end + 1
+    user1_end = user1_start + len(user_day_headers) + len(match_1) - 1
+    site_end = 4  # No. / eNodeB Name / Tech / Severity / Site Type
+    flag4_col = 5
+    flag1_col = 6
+    flag41_col = 7
+    filter1_start = 8
+    filter1_end = 11  # Filtering(1H only)
+    filter4_start = 12
+    filter4_end = 15  # Filtering(4H only)
+    filter_start = 16
+    filter_end = 19  # Filtering(7H/4H/1H)
+    hdr_site = _busy_section_header(book, NAVY, "white")
+    hdr_bhflag = _busy_section_header(book, "#FFF2CC", "#7F6000")
+    hdr_flag4 = _busy_section_header(book, "#C65911", "white")
+    hdr_flag1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_flag41 = _busy_section_header(book, "#833C0C", "white")
+    hdr_filter1 = _busy_section_header(book, "#E2D4F8", "#5B2C6F")
+    hdr_filter1_col = _busy_section_header(book, "#1B4F72", "white")
+    hdr_filter4 = _busy_section_header(book, "#F4CBE8", "#9B2D8A")
+    hdr_filter4_col = _busy_section_header(book, "#134F5C", "white")
+    hdr_filter = _busy_section_header(book, "#C6EFCE", "#006100")
+    hdr_filter_col = _busy_section_header(book, "#548235", "white")
+    hdr_data7 = _busy_section_header(book, "#2471A3", "white")
+    hdr_user7 = _busy_section_header(book, "#0D7377", "white")
+    hdr_data4 = _busy_section_header(book, "#C65911", "white")
+    hdr_user4 = _busy_section_header(book, "#B7950B", "white")
+    hdr_data1 = _busy_section_header(book, "#6C3483", "white")
+    hdr_user1 = _busy_section_header(book, "#1A5276", "white")
+    col_fmt = [hdr_site] * len(headers)
+    col_fmt[flag4_col] = hdr_flag4
+    col_fmt[flag1_col] = hdr_flag1
+    col_fmt[flag41_col] = hdr_flag41
+    for col in range(filter1_start, filter1_end + 1):
+        col_fmt[col] = hdr_filter1_col
+    for col in range(filter4_start, filter4_end + 1):
+        col_fmt[col] = hdr_filter4_col
+    for col in range(filter_start, filter_end + 1):
+        col_fmt[col] = hdr_filter_col
+    for col in range(data7_start, data7_end + 1):
+        col_fmt[col] = hdr_data7
+    for col in range(user7_start, user7_end + 1):
+        col_fmt[col] = hdr_user7
+    for col in range(data4_start, data4_end + 1):
+        col_fmt[col] = hdr_data4
+    for col in range(user4_start, user4_end + 1):
+        col_fmt[col] = hdr_user4
+    for col in range(data1_start, data1_end + 1):
+        col_fmt[col] = hdr_data1
+    for col in range(user1_start, user1_end + 1):
+        col_fmt[col] = hdr_user1
+
+    def _group(c1: int, c2: int, text: str, fmt) -> None:
+        if c1 == c2:
+            ws.write(group_row, c1, text, fmt)
+        else:
+            ws.merge_range(group_row, c1, group_row, c2, text, fmt)
+
+    ws.set_row(group_row, 22)
+    _group(0, site_end, "Site", hdr_site)
+    _group(flag4_col, flag41_col, "BH Flag", hdr_bhflag)
+    _group(filter1_start, filter1_end, "Filtering(1H only)", hdr_filter1)
+    _group(filter4_start, filter4_end, "Filtering(4H only)", hdr_filter4)
+    _group(filter_start, filter_end, "Filtering(7H/4H/1H)", hdr_filter)
+    _group(data7_start, data7_end, "DataBusyHour (7 BusyHour)", hdr_data7)
+    _group(user7_start, user7_end, "UserBusyHour (7 BusyHour)", hdr_user7)
+    _group(data4_start, data4_end, "DataBusyHour (4 BusyHour)", hdr_data4)
+    _group(user4_start, user4_end, "UserBusyHour (4 BusyHour)", hdr_user4)
+    _group(data1_start, data1_end, "DataBusyHour (1 BusyHour)", hdr_data1)
+    _group(user1_start, user1_end, "UserBusyHour (1 BusyHour)", hdr_user1)
+    ws.set_row(header_row, 36)
+    for col, text in enumerate(headers):
+        ws.write(header_row, col, text, col_fmt[col])
+
+    def _num(row, col, value, nfmt):
+        if value is None or not np.isfinite(value):
+            ws.write_blank(row, col, None, nfmt)
+        else:
+            ws.write_number(row, col, value, nfmt)
+
+    for i, rec in enumerate(busy_rows):
+        row = header_row + 1 + i
+        zebra = i % 2 == 1
+        ws.set_row(row, 22)
+        n = styles["num_z"] if zebra else styles["num"]
+        c = styles["center_z"] if zebra else styles["center"]
+        link = styles["link_z"] if zebra else styles["link"]
+        col = 0
+        ws.write_number(row, col, i + 1, styles["int_z"] if zebra else styles["int"])
+        col += 1
+        if rec["site"] in chart_row:
+            ws.write_url(
+                row,
+                col,
+                f"internal:'{SNAP_SHEET}'!A{chart_row[rec['site']]}",
+                link,
+                string=rec["site"],
+            )
+        else:
+            ws.write_string(row, col, rec["site"], c)
+        col += 1
+        ws.write_string(row, col, _rec_tech(rec), c)
+        col += 1
+        ws.write_string(
+            row, col, rec["severity"], _severity_format(styles, rec["severity"], zebra)
+        )
+        col += 1
+        site_type = str(rec.get("site_type") or "Not found")
+        ws.write_string(
+            row,
+            col,
+            site_type,
+            styles["below"] if site_type == "Not found" else c,
+        )
+        col += 1
+
+        def _write_flag(on: bool) -> int:
+            ws.write_string(
+                row, col, "Yes" if on else "", styles["yes"] if on else c
+            )
+            return col + 1
+
+        col = _write_flag(bool(rec.get("flag_4h")))
+        col = _write_flag(bool(rec.get("flag_1h")))
+        col = _write_flag(bool(rec.get("flag_41h")))
+        col = _write_flag(bool(rec.get("data1_choke_high")))
+        col = _write_flag(bool(rec.get("user1_choke_high")))
+        col = _write_flag(bool(rec.get("data1_busy_poor")))
+        col = _write_flag(bool(rec.get("user1_busy_poor")))
+        col = _write_flag(bool(rec.get("data4_choke_high")))
+        col = _write_flag(bool(rec.get("user4_choke_high")))
+        col = _write_flag(bool(rec.get("data4_busy_poor")))
+        col = _write_flag(bool(rec.get("user4_busy_poor")))
+        col = _write_flag(bool(rec.get("data_choke_high")))
+        col = _write_flag(bool(rec.get("user_choke_high")))
+        col = _write_flag(bool(rec.get("data_busy_poor")))
+        col = _write_flag(bool(rec.get("user_busy_poor")))
+
+        def _write_match_block(
+            prefix: str,
+            last_key: str,
+            listed_key: str,
+            tp_key: str,
+            prb_key: str,
+            vol_key: str,
+            user_key: str,
+        ) -> int:
+            pos = col
+            window_n = rec.get(
+                f"{prefix}_hours_matched_n", OSS_BUSY_HOURS * ANALYSIS_DAYS
+            )
+            ws.write_string(
+                row, pos, f"{rec[f'{prefix}_hours_matched']}/{window_n}", c
+            )
+            pos += 1
+            ws.write_string(row, pos, f"{rec[f'{prefix}_hours_matched_pct']:.2f}%", c)
+            pos += 1
+            ws.write_string(
+                row,
+                pos,
+                rec[f"{prefix}_last_match_text"],
+                styles["yes"] if rec.get(last_key) else c,
+            )
+            pos += 1
+            ws.write_string(row, pos, rec[listed_key], c)
+            pos += 1
+            _num(row, pos, rec[tp_key], n)
+            pos += 1
+            _num(row, pos, rec.get(prb_key), n)
+            pos += 1
+            _num(row, pos, rec.get(vol_key), n)
+            pos += 1
+            _num(row, pos, rec.get(user_key), n)
+            return pos + 1
+
+        for day in days:
+            ws.write_string(row, col, rec["data_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block(
+            "data",
+            "data_last_match",
+            "data_listed",
+            "tp_data_7h",
+            "prb_data_7h",
+            "vol_data_7h",
+            "users_data_7h",
+        )
+        for day in days:
+            ws.write_string(row, col, rec["user_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block(
+            "user",
+            "user_last_match",
+            "user_listed",
+            "tp_user_7h",
+            "prb_user_7h",
+            "vol_user_7h",
+            "users_user_7h",
+        )
+        for day in days:
+            ws.write_string(row, col, rec["data4_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block(
+            "data4",
+            "data4_last_match",
+            "data4_listed",
+            "tp_data_4h",
+            "prb_data_4h",
+            "vol_data_4h",
+            "users_data_4h",
+        )
+        for day in days:
+            ws.write_string(row, col, rec["user4_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block(
+            "user4",
+            "user4_last_match",
+            "user4_listed",
+            "tp_user_4h",
+            "prb_user_4h",
+            "vol_user_4h",
+            "users_user_4h",
+        )
+        for day in days:
+            ws.write_string(row, col, rec["data1_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block(
+            "data1",
+            "data1_last_match",
+            "data1_listed",
+            "tp_data_1h",
+            "prb_data_1h",
+            "vol_data_1h",
+            "users_data_1h",
+        )
+        for day in days:
+            ws.write_string(row, col, rec["user1_hours"].get(day, ""), c)
+            col += 1
+        col = _write_match_block(
+            "user1",
+            "user1_last_match",
+            "user1_listed",
+            "tp_user_1h",
+            "prb_user_1h",
+            "vol_user_1h",
+            "users_user_1h",
+        )
+
+    last = header_row + max(len(busy_rows), 1)
+    ws.autofilter(header_row, 0, last, last_col)
+    ws.repeat_rows(group_row, header_row)
+    ws.set_zoom(100)
+
+
+
+if __name__ == "__main__":
+    main()
