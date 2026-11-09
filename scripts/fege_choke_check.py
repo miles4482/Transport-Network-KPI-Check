@@ -691,8 +691,31 @@ def _attach_comparison_oss(rows: list[dict], prev_work: pd.DataFrame, latest_wor
         LATEST_END,
     )
     for row in rows:
-        row["prev_oss"] = prev_oss.get(row["site"], {})
-        row["latest_oss"] = latest_oss.get(row["site"], {})
+        previous = prev_oss.get(row["site"], {})
+        latest = latest_oss.get(row["site"], {})
+        row["prev_oss"] = previous
+        row["latest_oss"] = latest
+        # Data BusyHour 1H: latest window versus 5–7 Oct.
+        row["throughput_impact"] = _impact_label(
+            previous.get("tp_data_1h"), latest.get("tp_data_1h")
+        )
+        row["volume_impact"] = _impact_label(
+            previous.get("vol_data_1h"), latest.get("vol_data_1h")
+        )
+
+
+def _impact_label(previous: float, latest: float) -> str:
+    """Improved when the latest 1H value is higher than the previous window."""
+    if previous is None or latest is None:
+        return ""
+    try:
+        old = float(previous)
+        new = float(latest)
+    except (TypeError, ValueError):
+        return ""
+    if not (np.isfinite(old) and np.isfinite(new)):
+        return ""
+    return "Improved" if new > old else "Not improved"
 
 
 def _chart_records_for(records: list[dict], compare_rows: list[dict]) -> list[dict]:
@@ -2792,6 +2815,9 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             "OSS columns are the 1 BusyHour block only (top hour by Data Volume and "
             "by Max User): DL Throughput N/D, DLPRBUtilization,% from PRB N/D, "
             "average Data Volume, average Max User, Hours matched %, last-day match. "
+            "Throughput Impact is Improved when latest Data BusyHour 1H DL Throughput "
+            "is higher than 5–7 Oct. Data Volume impact is Improved when latest Data "
+            "BusyHour 1H Data Volume is higher than 5–7 Oct. Otherwise Not improved. "
             "Previous OSS is the 5–7 Oct capacity layer. Latest OSS is 6–8 Nov "
             "cell hourly with L900 excluded. Site names link to "
             "2. HourlyChartOfIssueSites, which draws both FEGE windows.",
@@ -3241,7 +3267,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v86.xlsx",
+        default="FEGE_Choked_Flat_Sites_v87.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -3443,6 +3469,8 @@ def main() -> None:
         f"Tx BW increased: {sum(1 for r in compare_v1 if r.get('bw_up'))}, "
         f"Choked again: {sum(1 for r in compare_v1 if r['finding'] == FINDING_AGAIN)}, "
         f"Solved: {sum(1 for r in compare_v1 if r['finding'] in (FINDING_SOLVED, FINDING_SOLVED_UP))}, "
+        f"Throughput Improved: {sum(1 for r in compare_v1 if r.get('throughput_impact') == 'Improved')}, "
+        f"Data Volume Improved: {sum(1 for r in compare_v1 if r.get('volume_impact') == 'Improved')}, "
         f"charts: {len(chart_records)}"
     )
     print(f"Wrote {output}")
@@ -3863,6 +3891,8 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
         "Finding",
         "Previous choked",
         "Latest choked",
+        "Throughput Impact",
+        "Data Volume impact",
         f"Rx p90 {prev_lbl}",
         f"Rx p90 {new_lbl}",
         "Increase (Mbps)",
@@ -3875,7 +3905,9 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
         for _key, label in _fields:
             headers.append(label)
     last_col = len(headers) - 1
-    widths = [5, 16, 10, 14, 12, 34, 16, 14, 16, 16, 14, 12, 16, 14, 14] + [16] * (len(headers) - 15)
+    widths = [5, 16, 10, 14, 12, 34, 16, 14, 22, 24, 16, 16, 14, 12, 16, 14, 14] + [16] * (
+        len(headers) - 17
+    )
     for i, width in enumerate(widths):
         ws.set_column(i, i, width)
 
@@ -3892,7 +3924,8 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
         f"{len(rows)} sites    ·    Tx BW increased: {n_up}    ·    "
         f"Choked again: {n_again}    ·    Solved: {n_solved}    ·    "
         f"Yes when busy-hour RxMaxSpeed p90 rises ≥ {BW_UP_MBPS:g} Mbit/s or "
-        f"{100 * BW_UP_FRAC:.0f}%. OSS columns are the 1H block only.",
+        f"{100 * BW_UP_FRAC:.0f}%. Throughput Impact and Data Volume impact compare "
+        f"Data BusyHour 1H, {new_lbl} versus {prev_lbl}: Improved when the latest value is higher.",
         styles["subtitle"],
     )
 
@@ -3900,6 +3933,7 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
     header_row = 4
     hdr_site = _busy_section_header(book, NAVY, "white")
     hdr_find = _busy_section_header(book, "#833C0C", "white")
+    hdr_impact = _busy_section_header(book, "#FFFF00", "#000000")
     hdr_old = _busy_section_header(book, "#2471A3", "white")
     hdr_new = _busy_section_header(book, "#0D7377", "white")
     hdr_flag = _busy_section_header(book, "#548235", "white")
@@ -3910,6 +3944,7 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
     col_fmt = (
         [hdr_site] * 5
         + [hdr_find] * 3
+        + [hdr_impact] * 2
         + [hdr_old, hdr_new, hdr_flag, hdr_flag, hdr_flag, hdr_old, hdr_new]
         + [hdr_prev_data] * 6
         + [hdr_new_data] * 6
@@ -3926,12 +3961,15 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
     ws.set_row(group_row, 22)
     _group(0, 4, "Site", hdr_site)
     _group(5, 7, "Finding", hdr_find)
-    _group(8, 12, "FEGE Tx ceiling (RxMaxSpeed p90, 08:00–22:00)", hdr_flag)
-    _group(13, 14, "Tx Total BW reference", hdr_old)
-    _group(15, 20, f"Previous OSS 1H Data ({prev_lbl})", hdr_prev_data)
-    _group(21, 26, f"Latest OSS 1H Data ({new_lbl})", hdr_new_data)
-    _group(27, 32, f"Previous OSS 1H User ({prev_lbl})", hdr_prev_user)
-    _group(33, 38, f"Latest OSS 1H User ({new_lbl})", hdr_new_user)
+    _group(8, 9, "Data BusyHour 1H impact", hdr_impact)
+    _group(10, 14, "FEGE Tx ceiling (RxMaxSpeed p90, 08:00–22:00)", hdr_flag)
+    _group(15, 16, "Tx Total BW reference", hdr_old)
+    _group(17, 22, f"Previous OSS 1H Data ({prev_lbl})", hdr_prev_data)
+    _group(23, 28, f"Latest OSS 1H Data ({new_lbl})", hdr_new_data)
+    _group(29, 34, f"Previous OSS 1H User ({prev_lbl})", hdr_prev_user)
+    _group(35, 40, f"Latest OSS 1H User ({new_lbl})", hdr_new_user)
+    if len(col_fmt) != len(headers):
+        raise SystemExit(f"comparison_v1 columns {len(col_fmt)} != headers {len(headers)}")
     ws.set_row(header_row, 36)
     for col, text in enumerate(headers):
         ws.write(header_row, col, text, col_fmt[col])
@@ -3963,6 +4001,8 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
             "font_color": GREEN_FONT,
         }
     )
+    improved_fmt = solved_fmt
+    not_fmt = again_fmt
 
     def _num(row, col, value, nfmt):
         if value is None or not isinstance(value, (int, float)) or not np.isfinite(value):
@@ -4007,16 +4047,26 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
         ws.write_string(row, 5, finding, ffmt)
         ws.write_string(row, 6, "Yes" if rec.get("prev_choked") else "", styles["yes"] if rec.get("prev_choked") else cfmt)
         ws.write_string(row, 7, "Yes" if rec.get("latest_choked") else "", styles["yes"] if rec.get("latest_choked") else cfmt)
-        _num(row, 8, rec.get("old_rx"), nfmt)
-        _num(row, 9, rec.get("new_rx"), nfmt)
-        _num(row, 10, rec.get("delta_rx"), nfmt)
-        _num(row, 11, rec.get("delta_pct"), nfmt)
-        ws.write_string(row, 12, "Yes" if rec.get("bw_up") else "", styles["yes"] if rec.get("bw_up") else cfmt)
-        _num(row, 13, rec.get("prev_tx"), nfmt)
-        _num(row, 14, rec.get("latest_tx"), nfmt)
+        def _impact(col: int, label: str) -> None:
+            if label == "Improved":
+                ws.write_string(row, col, label, improved_fmt)
+            elif label == "Not improved":
+                ws.write_string(row, col, label, not_fmt)
+            else:
+                ws.write_string(row, col, "", cfmt)
+
+        _impact(8, rec.get("throughput_impact") or "")
+        _impact(9, rec.get("volume_impact") or "")
+        _num(row, 10, rec.get("old_rx"), nfmt)
+        _num(row, 11, rec.get("new_rx"), nfmt)
+        _num(row, 12, rec.get("delta_rx"), nfmt)
+        _num(row, 13, rec.get("delta_pct"), nfmt)
+        ws.write_string(row, 14, "Yes" if rec.get("bw_up") else "", styles["yes"] if rec.get("bw_up") else cfmt)
+        _num(row, 15, rec.get("prev_tx"), nfmt)
+        _num(row, 16, rec.get("latest_tx"), nfmt)
         prev_oss = rec.get("prev_oss") or {}
         latest_oss = rec.get("latest_oss") or {}
-        col = 15
+        col = 17
         for source, fields in (
             (prev_oss, data_fields),
             (latest_oss, data_fields),
