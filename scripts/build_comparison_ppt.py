@@ -33,7 +33,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v4.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v5.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -56,11 +56,12 @@ ORANGE = "#ED7D31"
 PURPLE = "#7030A0"
 GREY = "#595959"
 
+# Highest daytime-throughput improvement first.
 CATEGORY_ORDER = (
+    fege.FINDING_UP_CHOKED,
     fege.FINDING_SOLVED_UP,
     fege.FINDING_UP,
     fege.FINDING_AGAIN,
-    fege.FINDING_UP_CHOKED,
     fege.FINDING_SOLVED,
 )
 BUCKET_BOTH = "both"
@@ -435,12 +436,10 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, zorder=3)
     pre_peak, pre_low = _daily_peak_low(tp[:72])
     post_peak, post_low = _daily_peak_low(tp[72:])
-    guides = (
-        (_guide(ax, x[:72], pre_peak, "#548235", "--"), f"Peak pre {pre_peak:.1f}"),
-        (_guide(ax, x[72:], post_peak, "#203864", "--"), f"Peak post {post_peak:.1f}"),
-        (_guide(ax, x[:72], pre_low, "#7F7F7F", "--"), f"Low pre {pre_low:.1f}"),
-        (_guide(ax, x[72:], post_low, "#000000", "--"), f"Low post {post_low:.1f}"),
-    )
+    _guide(ax, x[:72], pre_peak, "#548235", "--")
+    _guide(ax, x[72:], post_peak, "#203864", "--")
+    _guide(ax, x[:72], pre_low, "#7F7F7F", "--")
+    _guide(ax, x[72:], post_low, "#000000", "--")
     levels = [value for value in (pre_peak, post_peak, pre_low, post_low) if np.isfinite(value)]
     tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
     vol_min, vol_max = _sharp_limits(vol)
@@ -459,25 +458,19 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
         note.append(f"Post {post_level:.1f} Mbps")
     if note:
         fig.text(0.98, 0.985, "    ".join(note), ha="right", va="top", fontsize=8, color=GREY)
-    handles = [line_tp, bars]
-    labels = ["Throughput", "Data volume"]
-    for line, label in guides:
-        if line is not None and "nan" not in label:
-            handles.append(line)
-            labels.append(label)
     fig.legend(
-        handles,
-        labels,
+        [line_tp, bars],
+        ["Throughput", "Data volume"],
         loc="upper left",
-        bbox_to_anchor=(0.10, 0.94),
-        ncol=3,
+        bbox_to_anchor=(0.10, 0.95),
+        ncol=2,
         frameon=False,
-        fontsize=7.5,
+        fontsize=8,
         borderaxespad=0,
-        columnspacing=1.0,
-        handlelength=1.6,
+        columnspacing=1.2,
+        handlelength=1.8,
     )
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.80, bottom=0.20)
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.86, bottom=0.18)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
