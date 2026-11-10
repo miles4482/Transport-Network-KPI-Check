@@ -33,7 +33,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v2.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v3.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -397,11 +397,26 @@ def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_
     plt.close(fig)
 
 
-def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
-    """Hourly throughput, bars for data volume, and two level lines for the impact.
+def _daily_peak_low(tp: np.ndarray) -> tuple[float, float]:
+    """Mean of each day's highest throughput hour, and of each day's lowest."""
+    peaks, lows = [], []
+    for day in range(tp.size // 24):
+        chunk = tp[day * 24 : (day + 1) * 24]
+        good = chunk[np.isfinite(chunk)]
+        if good.size == 0:
+            continue
+        peaks.append(float(np.max(good)))
+        lows.append(float(np.min(good)))
+    peak = float(np.mean(peaks)) if peaks else float("nan")
+    low = float(np.mean(lows)) if lows else float("nan")
+    return peak, low
 
-    The dashed lines are the 09:00–22:00 median before and after, drawn across
-    the whole window so the pre versus post step can be read off the gap.
+
+def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
+    """Hourly throughput, volume bars, and two throughput guide lines.
+
+    The guides are the average daily peak and the average daily low. The
+    pre and post daytime levels stay as a note and are not drawn.
     """
     fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
     x = np.arange(len(tp))
@@ -409,19 +424,20 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     ax2 = ax.twinx()
     ax2.bar(x, vol, width=0.85, color="#C65911", alpha=0.45, zorder=1, label="Data volume")
     line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, label="Throughput", zorder=3)
-    pre_line = post_line = None
-    if np.isfinite(pre_level):
-        pre_line, = ax.plot(
-            x, np.full(len(x), pre_level), color="#5B9BD5", linewidth=1.3, linestyle="--",
-            label=f"Pre {pre_level:.1f} Mbps", zorder=4,
+    avg_peak, avg_low = _daily_peak_low(tp)
+    peak_line = low_line = None
+    if np.isfinite(avg_peak):
+        peak_line, = ax.plot(
+            x, np.full(len(x), avg_peak), color="#548235", linewidth=1.3, linestyle="--",
+            label=f"Avg peak {avg_peak:.1f}", zorder=4,
         )
-    if np.isfinite(post_level):
-        post_line, = ax.plot(
-            x, np.full(len(x), post_level), color="#548235", linewidth=1.3, linestyle="--",
-            label=f"Post {post_level:.1f} Mbps", zorder=4,
+    if np.isfinite(avg_low):
+        low_line, = ax.plot(
+            x, np.full(len(x), avg_low), color="#595959", linewidth=1.3, linestyle="--",
+            label=f"Avg low {avg_low:.1f}", zorder=4,
         )
-    levels = [value for value in (pre_level, post_level) if np.isfinite(value)]
-    tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
+    guides = [value for value in (avg_peak, avg_low) if np.isfinite(value)]
+    tp_min, tp_max = _sharp_limits(np.concatenate([tp, guides]) if guides else tp)
     vol_min, vol_max = _sharp_limits(vol)
     ax.set_ylim(tp_min, tp_max)
     ax2.set_ylim(vol_min, vol_max)
@@ -431,14 +447,21 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     ax2.tick_params(axis="y", labelsize=8, colors="#C65911")
     ax2.spines["right"].set_color("#C65911")
     fig.text(0.09, 0.98, "OSS throughput and data volume", ha="left", va="top", fontsize=12, color=NAVY, fontweight="bold")
+    note = []
+    if np.isfinite(pre_level):
+        note.append(f"Pre {pre_level:.1f} Mbps")
+    if np.isfinite(post_level):
+        note.append(f"Post {post_level:.1f} Mbps")
+    if note:
+        fig.text(0.98, 0.98, "    ".join(note), ha="right", va="top", fontsize=8, color=GREY)
     handles = [line_tp]
     labels = ["Throughput"]
-    if pre_line is not None:
-        handles.append(pre_line)
-        labels.append(f"Pre {pre_level:.1f} Mbps")
-    if post_line is not None:
-        handles.append(post_line)
-        labels.append(f"Post {post_level:.1f} Mbps")
+    if peak_line is not None:
+        handles.append(peak_line)
+        labels.append(f"Avg peak {avg_peak:.1f}")
+    if low_line is not None:
+        handles.append(low_line)
+        labels.append(f"Avg low {avg_low:.1f}")
     handles.append(ax2.containers[0])
     labels.append("Data volume")
     ax.legend(
@@ -446,12 +469,12 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
         labels,
         loc="lower left",
         bbox_to_anchor=(0.0, 1.02),
-        ncol=2,
+        ncol=4,
         frameon=False,
         fontsize=7.5,
         borderaxespad=0,
     )
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.68, bottom=0.22)
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.70, bottom=0.22)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
