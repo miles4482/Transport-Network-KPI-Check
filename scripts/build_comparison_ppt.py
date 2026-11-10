@@ -559,23 +559,23 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page
     stripe.fill.fore_color.rgb = accent
     stripe.line.fill.background()
 
-    title = slide.shapes.add_textbox(Inches(0.28), Inches(0.08), Inches(8.4), Inches(0.40))
+    title = slide.shapes.add_textbox(Inches(0.28), Inches(0.06), Inches(10.15), Inches(0.40))
     tf = title.text_frame
     tf.word_wrap = False
-    _set_run(tf.paragraphs[0], site["site"], 26, white, True)
+    _set_run(tf.paragraphs[0], f"{site['finding']}: {site['site']}", 22, white, True)
 
-    meta = slide.shapes.add_textbox(Inches(0.30), Inches(0.44), Inches(8.6), Inches(0.30))
+    meta = slide.shapes.add_textbox(Inches(0.30), Inches(0.44), Inches(9.6), Inches(0.30))
     mf = meta.text_frame
     mf.word_wrap = False
     _set_run(
         mf.paragraphs[0],
-        f"{site['finding']}    ·    {BUCKET_LABEL[site['bucket']]}",
-        12,
+        BUCKET_LABEL[site["bucket"]],
+        13,
         RGBColor(0xFF, 0xF2, 0xCC),
         False,
     )
 
-    side = slide.shapes.add_textbox(Inches(9.2), Inches(0.18), Inches(3.85), Inches(0.46))
+    side = slide.shapes.add_textbox(Inches(10.45), Inches(0.16), Inches(2.65), Inches(0.46))
     sf = side.text_frame
     sf.word_wrap = False
     p = sf.paragraphs[0]
@@ -631,6 +631,125 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page
     _set_run(pp, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
 
 
+def _join_sites(sites: list[dict]) -> str:
+    names = [site["site"] for site in sites]
+    if len(names) <= 1:
+        return names[0] if names else ""
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _summary_blocks(selected: list[dict]) -> list[tuple[str, str]]:
+    """One heading and one observation for each finding that has slides."""
+    leads = {
+        fege.FINDING_SOLVED_UP: (
+            "Choked on 5–7 Oct, the Tx ceiling stepped up, and the port is off the choke list on 6–8 Nov."
+        ),
+        fege.FINDING_UP: (
+            "The Tx ceiling stepped up. The port was not choked in either window."
+        ),
+        fege.FINDING_AGAIN: (
+            "The Tx ceiling stepped up and the port is still choked, so the gain is already on the new ceiling."
+        ),
+        fege.FINDING_UP_CHOKED: (
+            "The Tx ceiling stepped up and the port is newly choked on 6–8 Nov."
+        ),
+        fege.FINDING_SOLVED: (
+            "Off the choke list without a ceiling step-up, so this gain is not from a Tx BW increase."
+        ),
+    }
+    blocks = []
+    for finding in CATEGORY_ORDER:
+        sites = [site for site in selected if site["finding"] == finding]
+        if not sites:
+            continue
+        both = [site for site in sites if site["bucket"] == BUCKET_BOTH]
+        hold = [site for site in sites if site["bucket"] == BUCKET_HOLD]
+        small = [site for site in sites if site["bucket"] == BUCKET_SMALL]
+        parts = [leads[finding]]
+        if both:
+            shown = []
+            for site in both:
+                metrics = site["metrics"]
+                shown.append(
+                    f"{site['site']} ({metrics['tp_pct']:+.0f}% throughput, {metrics['vol_pct']:+.0f}% volume)"
+                )
+            parts.append("Both rose at " + " and ".join(shown) + ".")
+        if hold:
+            parts.append(f"Throughput rose and volume held at {_join_sites(hold)}.")
+        if small:
+            site = small[0]
+            metrics = site["metrics"]
+            parts.append(
+                f"{site['site']} is a smaller gain ({metrics['tp_pct']:+.0f}% throughput) and volume did not fall."
+            )
+        heading = f"{finding}   ·   {len(sites)} site" + ("s" if len(sites) != 1 else "")
+        blocks.append((heading, " ".join(parts)))
+    return blocks
+
+
+def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    ink = RGBColor(0x33, 0x33, 0x33)
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.72))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.32), Inches(0.14), Inches(10.5), Inches(0.46))
+    _set_run(title.text_frame.paragraphs[0], "Management summary", 26, RGBColor(0xFF, 0xFF, 0xFF), True)
+
+    intro = slide.shapes.add_textbox(Inches(0.32), Inches(0.84), Inches(12.7), Inches(0.48))
+    intro.text_frame.word_wrap = True
+    _set_run(
+        intro.text_frame.paragraphs[0],
+        "Pre 5–7 Oct versus post 6–8 Nov. Where the Tx ceiling stepped up, throughput is higher. "
+        "Data volume rising or holding is an acceptable result. Each following page is one site.",
+        14,
+        navy,
+        False,
+    )
+
+    blocks = _summary_blocks(selected)
+    top = 1.40
+    height = 1.05
+    gap = 0.08
+    for index, (heading, body) in enumerate(blocks):
+        y = top + index * (height + gap)
+        shape = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.28), Inches(y), Inches(12.78), Inches(height)
+        )
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = RGBColor(0xF7, 0xF9, 0xFB)
+        shape.line.color.rgb = RGBColor(0xD0, 0xD7, 0xE2)
+        frame = shape.text_frame
+        frame.word_wrap = True
+        frame.margin_left = Inches(0.14)
+        frame.margin_right = Inches(0.12)
+        frame.margin_top = Inches(0.06)
+        frame.margin_bottom = Inches(0.04)
+        head = frame.paragraphs[0]
+        head.space_after = Pt(2)
+        _set_run(head, heading, 14, navy, True)
+        paragraph = frame.add_paragraph()
+        paragraph.space_after = Pt(0)
+        _set_run(paragraph, body, 12, ink, False)
+
+    foot = slide.shapes.add_textbox(Inches(0.32), Inches(7.18), Inches(10.2), Inches(0.26))
+    _set_run(
+        foot.text_frame.paragraphs[0],
+        "Data BusyHour 1H    ·    Throughput up at least 1 Mbps and 10% is a significant gain",
+        10,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.18), Inches(1.65), Inches(0.26))
+    paragraph = page_box.text_frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.RIGHT
+    _set_run(paragraph, f"1 / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
+
+
 def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
     out = np.zeros(72, dtype=bool)
     if "OnCap" not in work.columns:
@@ -683,8 +802,9 @@ def main() -> None:
     prs.core_properties.title = "Tx BW increase: throughput and data volume"
     prs.core_properties.subject = "comparison_v1 site findings, 5–7 Oct versus 6–8 Nov"
 
-    pages = len(selected)
-    for page, site in enumerate(selected, start=1):
+    pages = len(selected) + 1
+    _add_summary_slide(prs, selected, pages)
+    for page, site in enumerate(selected, start=2):
         name = site["site"]
         rx = _concat(pre_feg[name]["rx"], post_feg[name]["rx"])
         pre_on = _on_cap_vector(pre_work, name, fege.ANALYSIS_START, fege.ANALYSIS_END)
@@ -703,7 +823,7 @@ def main() -> None:
         print(f"  slide {page}/{pages} {name}", flush=True)
 
     prs.save(OUT)
-    print(f"Wrote {OUT} ({pages} site slides)", flush=True)
+    print(f"Wrote {OUT} ({pages} slides)", flush=True)
 
 
 if __name__ == "__main__":
