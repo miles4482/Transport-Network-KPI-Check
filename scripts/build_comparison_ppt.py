@@ -32,7 +32,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v19.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v20.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -1124,6 +1124,18 @@ def _trend_note(group: dict) -> list[str]:
     return lines
 
 
+def _raised_limits(low: float, high: float) -> tuple[float, float]:
+    """Place the axis floor just under the series so the movement fills the chart."""
+    span = max(high - low, 0.4)
+    ymin = low - 0.55 * span
+    ymax = high + 0.35 * span
+    if ymin < 0:
+        ymin = 0.0
+    if ymax <= ymin:
+        ymax = ymin + 1.0
+    return ymin, ymax
+
+
 def _draw_trend_chart(
     path: Path,
     frame: pd.DataFrame,
@@ -1135,7 +1147,6 @@ def _draw_trend_chart(
     bar_color: str,
     left_label: str,
     pre_on: str,
-    bars_from_zero: bool,
 ) -> None:
     dates = frame.index.to_pydatetime()
     bars = frame[bar].to_numpy(dtype=float)
@@ -1159,26 +1170,17 @@ def _draw_trend_chart(
             label="11–12 Oct throughput" if pre_on == "line" else "11–12 Oct PRB",
         )
     finite_bars = bars[np.isfinite(bars)]
-    if bars_from_zero and len(finite_bars):
-        ax.set_ylim(0, max(finite_bars) * 1.22)
-    elif len(finite_bars):
+    if len(finite_bars):
         low, high = float(np.min(finite_bars)), float(np.max(finite_bars))
         if pre_on == "bar" and np.isfinite(pre_value):
             low, high = min(low, pre_value), max(high, pre_value)
-        span = max(high - low, 1.0)
-        # Keep the floor well under the shortest bar so the column is not clipped.
-        ax.set_ylim(max(0.0, low - max(span * 1.4, 8.0)), high + span * 0.45)
+        ax.set_ylim(*_raised_limits(low, high))
     finite_line = line_values[np.isfinite(line_values)]
     if len(finite_line):
         low, high = float(np.min(finite_line)), float(np.max(finite_line))
         if pre_on == "line" and np.isfinite(pre_value):
             low, high = min(low, pre_value), max(high, pre_value)
-        if pre_on == "line":
-            # User throughput starts at zero, so the line sits clear of the axis.
-            ax2.set_ylim(0, high * 1.18 if high > 0 else 1)
-        else:
-            span = max(high - low, 0.5)
-            ax2.set_ylim(max(0.0, low - max(span * 1.6, 6.0)), high + span * 0.55)
+        ax2.set_ylim(*_raised_limits(low, high))
     span_days = max((dates[-1] - dates[0]).days, 1) if len(dates) else 1
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=4 if span_days < 40 else 7))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
@@ -1211,13 +1213,13 @@ def _add_trend_slide(prs: Presentation, group: dict, chart_dir: Path, page: int,
     title = slide.shapes.add_textbox(Inches(0.32), Inches(0.08), Inches(9.4), Inches(0.46))
     _set_run(title.text_frame.paragraphs[0], group["finding"], 26, RGBColor(0xFF, 0xFF, 0xFF), True)
     charts = (
-        ("BH Chart", group["bh"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line", True),
-        ("Daily Chart", group["daily"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line", True),
-        ("Daily", group["daily"], "prb", "cell", "DL PRB, %", "Cell throughput, Mbps", "#7DCEA0", "DL PRB, %", "bar", False),
+        ("BH Chart", group["bh"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line"),
+        ("Daily Chart", group["daily"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line"),
+        ("Daily", group["daily"], "prb", "cell", "DL PRB, %", "Cell throughput, Mbps", "#7DCEA0", "DL PRB, %", "bar"),
     )
     lefts = (0.22, 4.52, 8.82)
     for left, spec in zip(lefts, charts):
-        caption, frame, bar, line, bar_name, line_name, color, ylabel, pre_on, from_zero = spec
+        caption, frame, bar, line, bar_name, line_name, color, ylabel, pre_on = spec
         png = chart_dir / f"trend_{page:02d}_{caption.replace(' ', '_').lower()}.png"
         _draw_trend_chart(
             png,
@@ -1229,7 +1231,6 @@ def _add_trend_slide(prs: Presentation, group: dict, chart_dir: Path, page: int,
             bar_color=color,
             left_label=ylabel,
             pre_on=pre_on,
-            bars_from_zero=from_zero,
         )
         cap = slide.shapes.add_textbox(Inches(left), Inches(0.70), Inches(4.15), Inches(0.28))
         cap_p = cap.text_frame.paragraphs[0]
