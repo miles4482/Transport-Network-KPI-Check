@@ -18,6 +18,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -31,7 +32,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v16.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v17.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -958,6 +959,257 @@ def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
     return out
 
 
+# Long trend uploaded on main. Daily is 15 Sep–9 Nov. Hourly is 10 Oct–9 Nov.
+TREND_DAILY_CSV = Path("/tmp/kpi_trend/daily/OSS KPI trend_Daily_15Sep-09Nov.csv")
+TREND_HOURLY_CSV = Path("/tmp/kpi_trend/hourly/OSS KPI trend_Hourly_10Oct-09Nov.csv")
+TREND_PRE = (pd.Timestamp("2026-10-11"), pd.Timestamp("2026-10-12"))
+TREND_POST = (pd.Timestamp("2026-11-08"), pd.Timestamp("2026-11-09"))
+TREND_COLS = {
+    "traffic": "Total Traffic (Mbit)",
+    "tp_n": "User Throughput in DownLink (Mbps)_N",
+    "tp_d": "User Throughput in DownLink (Mbps)_D",
+    "cell_n": "DL PDCP Throughput (Mbit/s)_N",
+    "cell_d": "DL PDCP Throughput (Mbit/s)_D",
+    "prb_n": "DL PRB Utilization_N",
+    "prb_d": "UL PRB Utilization_D",
+}
+
+
+def _trend_dates(series: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(series.astype(str).str.strip(), format="%d-%b")
+    return parsed.map(lambda stamp: stamp.replace(year=2026))
+
+
+def _load_trend_frame(path: Path, hourly: bool) -> pd.DataFrame:
+    if not path.exists():
+        raise SystemExit(f"Trend KPI file not found: {path}")
+    usecols = ["Date", "eNodeB Name", *TREND_COLS.values()]
+    if hourly:
+        usecols.insert(1, "Time")
+    frame = pd.read_csv(path, usecols=usecols)
+    frame = frame.rename(columns={"eNodeB Name": "site", **{v: k for k, v in TREND_COLS.items()}})
+    frame["site"] = frame["site"].astype(str).str.strip()
+    frame["day"] = _trend_dates(frame["Date"])
+    for column in TREND_COLS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if hourly:
+        frame["hour"] = frame["Time"].astype(str).str.split(":").str[0].astype(int)
+    return frame
+
+
+def _aggregate_kpi(frame: pd.DataFrame) -> pd.DataFrame:
+    """One row per day. Rates are summed counters, then divided."""
+    grouped = frame.groupby("day", sort=True)[list(TREND_COLS)].sum(min_count=1)
+    denominator = grouped["tp_d"].where(grouped["tp_d"] > 0)
+    cell_den = grouped["cell_d"].where(grouped["cell_d"] > 0)
+    prb_den = grouped["prb_d"].where(grouped["prb_d"] > 0)
+    return pd.DataFrame(
+        {
+            "vol": grouped["traffic"] / 8 / 1024 / 1024 / 1024,
+            "tp": grouped["tp_n"] / denominator,
+            "cell": grouped["cell_n"] / cell_den / 1000,
+            "prb": grouped["prb_n"] / prb_den * 100,
+        }
+    )
+
+
+def _window_mean(frame: pd.DataFrame, days: tuple[pd.Timestamp, pd.Timestamp], column: str) -> float:
+    values = frame.reindex(list(days))[column].astype(float)
+    values = values[np.isfinite(values)]
+    if values.empty:
+        return float("nan")
+    return float(values.mean())
+
+
+def _move(before: float, after: float, unit: str, digits: int, points: bool = False) -> str:
+    if not (np.isfinite(before) and np.isfinite(after)):
+        return "n/a"
+    delta = after - before
+    if points:
+        return f"{before:.1f}% to {after:.1f}% ({delta:+.1f} pp)"
+    pct = delta / before * 100 if before else float("nan")
+    pct_text = f", {pct:+.0f}%" if np.isfinite(pct) else ""
+    return f"{before:,.{digits}f} to {after:,.{digits}f} {unit} ({delta:+.{digits}f}{pct_text})"
+
+
+def _trend_groups(rows: list[dict]) -> list[dict]:
+    daily = _load_trend_frame(TREND_DAILY_CSV, hourly=False)
+    hourly = _load_trend_frame(TREND_HOURLY_CSV, hourly=True)
+    hourly = hourly[hourly["hour"].isin(BH_HOURS)]
+    uploaded = set(daily["site"])
+    groups = []
+    for finding in DECK_ORDER:
+        sites = sorted(row["site"] for row in rows if row.get("finding") == finding and row["site"] in uploaded)
+        if not sites:
+            continue
+        wanted = set(sites)
+        groups.append(
+            {
+                "finding": finding,
+                "sites": sites,
+                "daily": _aggregate_kpi(daily[daily["site"].isin(wanted)]),
+                "bh": _aggregate_kpi(hourly[hourly["site"].isin(wanted)]),
+            }
+        )
+    skipped = len(uploaded - {row["site"] for row in rows})
+    print(f"Trend sites in a finding: {sum(len(g['sites']) for g in groups)} of {len(uploaded)}; {skipped} uploaded sites are outside the current findings", flush=True)
+    return groups
+
+
+def _trend_note(group: dict) -> list[str]:
+    daily, bh = group["daily"], group["bh"]
+    n = len(group["sites"])
+    site_word = "site" if n == 1 else "sites"
+    lines = [
+        f"{group['finding']}: {n} {site_word} from the uploaded trend. Pre is the mean of 11–12 Oct. Post is the mean of 8–9 Nov.",
+        "Busy hour (hours 20, 21 and 22): "
+        f"user throughput {_move(_window_mean(bh, TREND_PRE, 'tp'), _window_mean(bh, TREND_POST, 'tp'), 'Mbps', 1)}. "
+        f"Data volume {_move(_window_mean(bh, TREND_PRE, 'vol'), _window_mean(bh, TREND_POST, 'vol'), 'GB', 0)}.",
+        "Daily: "
+        f"user throughput {_move(_window_mean(daily, TREND_PRE, 'tp'), _window_mean(daily, TREND_POST, 'tp'), 'Mbps', 1)}. "
+        f"Data volume {_move(_window_mean(daily, TREND_PRE, 'vol'), _window_mean(daily, TREND_POST, 'vol'), 'GB', 0)}.",
+        "Daily cell throughput "
+        f"{_move(_window_mean(daily, TREND_PRE, 'cell'), _window_mean(daily, TREND_POST, 'cell'), 'Mbps', 1)}. "
+        f"DL PRB {_move(_window_mean(daily, TREND_PRE, 'prb'), _window_mean(daily, TREND_POST, 'prb'), '%', 1, points=True)}.",
+    ]
+    return lines
+
+
+def _draw_trend_chart(
+    path: Path,
+    frame: pd.DataFrame,
+    *,
+    bar: str,
+    line: str,
+    bar_name: str,
+    line_name: str,
+    bar_color: str,
+    left_label: str,
+    pre_on: str,
+    bars_from_zero: bool,
+) -> None:
+    dates = frame.index.to_pydatetime()
+    bars = frame[bar].to_numpy(dtype=float)
+    line_values = frame[line].to_numpy(dtype=float)
+    pre_days = list(TREND_PRE)
+    pre_value = float(frame.reindex(pre_days)[line if pre_on == "line" else bar].mean())
+    fig, ax = plt.subplots(figsize=(8.15, 4.25), dpi=140)
+    fig.patch.set_facecolor("white")
+    x = mdates.date2num(dates)
+    ax.bar(x, bars, width=0.72, color=bar_color, label=bar_name, zorder=2)
+    ax2 = ax.twinx()
+    ax2.plot(x, line_values, color="#C459B0", lw=1.8, label=line_name, zorder=3)
+    if np.isfinite(pre_value):
+        host = ax2 if pre_on == "line" else ax
+        host.axhline(
+            pre_value,
+            color="#222222",
+            ls="--",
+            lw=1.05,
+            zorder=4,
+            label="11–12 Oct throughput" if pre_on == "line" else "11–12 Oct PRB",
+        )
+    finite_bars = bars[np.isfinite(bars)]
+    if bars_from_zero and len(finite_bars):
+        ax.set_ylim(0, max(finite_bars) * 1.22)
+    elif len(finite_bars):
+        low, high = float(np.min(finite_bars)), float(np.max(finite_bars))
+        pad = max((high - low) * 0.45, 1.0)
+        ax.set_ylim(low - pad, high + pad)
+    finite_line = line_values[np.isfinite(line_values)]
+    if len(finite_line):
+        low, high = float(np.min(finite_line)), float(np.max(finite_line))
+        if pre_on == "line" and np.isfinite(pre_value):
+            low, high = min(low, pre_value), max(high, pre_value)
+        pad = max((high - low) * 0.3, 0.4)
+        ax2.set_ylim(low - pad, high + pad)
+    span_days = max((dates[-1] - dates[0]).days, 1) if len(dates) else 1
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=4 if span_days < 40 else 7))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.tick_params(axis="x", labelsize=8, labelrotation=40)
+    ax.tick_params(axis="y", labelsize=8, colors="#595959")
+    ax2.tick_params(axis="y", labelsize=8, colors="#C459B0")
+    ax.set_ylabel(left_label, fontsize=8, color="#595959")
+    ax2.set_ylabel("Mbps", fontsize=8, color="#C459B0")
+    ax.yaxis.grid(True, color="#E6E6E6", zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ("top",):
+        ax.spines[spine].set_visible(False)
+        ax2.spines[spine].set_visible(False)
+    ax.spines["left"].set_color("#BFBFBF")
+    ax2.spines["right"].set_color("#C459B0")
+    handles, labels = ax.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(handles + handles2, labels + labels2, loc="upper center", bbox_to_anchor=(0.5, 1.18), ncol=3, frameon=False, fontsize=7.5)
+    fig.subplots_adjust(left=0.13, right=0.87, top=0.82, bottom=0.22)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _add_trend_slide(prs: Presentation, group: dict, chart_dir: Path, page: int, pages: int) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    header = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.62))
+    header.fill.solid()
+    header.fill.fore_color.rgb = RGBColor(0x1F, 0x4E, 0x79)
+    header.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.32), Inches(0.08), Inches(9.4), Inches(0.46))
+    _set_run(title.text_frame.paragraphs[0], group["finding"], 26, RGBColor(0xFF, 0xFF, 0xFF), True)
+    charts = (
+        ("BH Chart", group["bh"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line", True),
+        ("Daily Chart", group["daily"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line", True),
+        ("Daily", group["daily"], "prb", "cell", "DL PRB, %", "Cell throughput, Mbps", "#7DCEA0", "DL PRB, %", "bar", False),
+    )
+    lefts = (0.22, 4.52, 8.82)
+    for left, spec in zip(lefts, charts):
+        caption, frame, bar, line, bar_name, line_name, color, ylabel, pre_on, from_zero = spec
+        png = chart_dir / f"trend_{page:02d}_{caption.replace(' ', '_').lower()}.png"
+        _draw_trend_chart(
+            png,
+            frame,
+            bar=bar,
+            line=line,
+            bar_name=bar_name,
+            line_name=line_name,
+            bar_color=color,
+            left_label=ylabel,
+            pre_on=pre_on,
+            bars_from_zero=from_zero,
+        )
+        cap = slide.shapes.add_textbox(Inches(left), Inches(0.70), Inches(4.15), Inches(0.28))
+        cap_p = cap.text_frame.paragraphs[0]
+        cap_p.alignment = PP_ALIGN.CENTER
+        _set_run(cap_p, caption, 13, RGBColor(0x1F, 0x4E, 0x79), True)
+        slide.shapes.add_picture(str(png), Inches(left), Inches(0.98), Inches(4.22), Inches(4.15))
+
+    notes = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.22), Inches(5.22), Inches(12.90), Inches(1.88)
+    )
+    notes.fill.solid()
+    notes.fill.fore_color.rgb = RGBColor(0xF7, 0xF9, 0xFB)
+    notes.line.color.rgb = RGBColor(0xD0, 0xD7, 0xE2)
+    box = notes.text_frame
+    box.word_wrap = True
+    box.margin_left = Inches(0.14)
+    box.margin_right = Inches(0.12)
+    box.margin_top = Inches(0.08)
+    for index, line in enumerate(_trend_note(group)):
+        paragraph = box.paragraphs[0] if index == 0 else box.add_paragraph()
+        paragraph.space_after = Pt(3)
+        _set_run(paragraph, line, 13, RGBColor(0x1F, 0x4E, 0x79) if index == 0 else RGBColor(0x33, 0x33, 0x33), index == 0)
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.18), Inches(10.6), Inches(0.26))
+    _set_run(
+        foot.text_frame.paragraphs[0],
+        "Dashed line is 11–12 Oct. BH sums hours 20, 21 and 22. Daily runs 15 Sep–9 Nov.",
+        10,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.18), Inches(1.65), Inches(0.26))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
+
+
 def main() -> None:
     cached = pickle.loads(ROW_CACHE.read_bytes())
     rows = cached["rows"]
@@ -991,9 +1243,16 @@ def main() -> None:
     prs.core_properties.title = "Tx BW increase: throughput and data volume"
     prs.core_properties.subject = "comparison_v1 site findings, 5–7 Oct versus 6–8 Nov"
 
-    pages = len(selected) + 1
+    trends = _trend_groups(rows)
+    pages = len(selected) + 1 + len(trends)
     _add_summary_slide(prs, rows, selected, profiles, pages)
-    for page, site in enumerate(selected, start=2):
+    for offset, group in enumerate(trends):
+        page = 2 + offset
+        _add_trend_slide(prs, group, CHART_DIR, page, pages)
+        print(f"  trend {page}/{pages} {group['finding']} ({len(group['sites'])} sites)", flush=True)
+        for line in _trend_note(group):
+            print("   ", line, flush=True)
+    for page, site in enumerate(selected, start=2 + len(trends)):
         name = site["site"]
         rx = _concat(pre_feg[name]["rx"], post_feg[name]["rx"])
         pre_on = _on_cap_vector(pre_work, name, fege.ANALYSIS_START, fege.ANALYSIS_END)
