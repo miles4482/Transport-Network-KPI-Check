@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Management PPT: one slide per site for comparison_v1 findings.
 
-Pre window is 5–7 Oct. Post window is 6–8 Nov. comparison_v1 keeps one
-pattern: October RxMaxSpeed sits on a ceiling, and November is higher
-and no longer choked. Each finding category contributes up to five
+Pre window is 5–7 Oct. Post window is 6–8 Nov. comparison_v1 keeps
+sites that were already flat, then the ceiling rose. November is either
+released (solved) or flat again on the new ceiling (choked again).
+Each finding category contributes up to five
 sites, then those slides are ordered by the daytime throughput step,
 largest first:
 
@@ -36,7 +37,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v11.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v12.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 

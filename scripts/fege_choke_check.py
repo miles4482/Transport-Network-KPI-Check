@@ -23,11 +23,11 @@ A site is listed when at least three of those days have three hours on
 the cap, or when the last day has two hours on the cap.
 
 comparison_v1 compares that window with FEG_KPI_DHAKA_08Nov.rar
-(6–8 Nov 2026) and keeps one pattern only: on 5–7 Oct the busy-hour
-RxMaxSpeed trace is almost choked (it sits on a ceiling, as on GPSDR38
-and DHNMK02), and on 6–8 Nov that ceiling is higher and the port is no
-longer choked. A jagged October trace is left out, including a port
-that only goes flat on the latest window. Tx Total BW is not used.
+(6–8 Nov 2026). A site is listed when 5–7 Oct RxMaxSpeed was already
+choked or flat on a ceiling and the busy-hour ceiling then stepped up.
+Two outcomes both count: the port is no longer choked (GPSDR38), or it
+is choked again on the new ceiling (DHSVRI8). A jagged October trace
+that only goes flat after the window is left out. Tx Total BW is not used.
 Each kept site is listed with previous vs latest 1-hour OSS KPIs.
 Each hourly chart draws both FEGE windows.
 """
@@ -643,11 +643,11 @@ def _build_comparison_v1(
     tech_by_site: dict[str, str] | None,
     geo: pd.DataFrame | None,
 ) -> list[dict]:
-    """Sites with the GPSDR38 / DHNMK02 pattern only.
+    """Flat October ceiling, then a higher November ceiling.
 
-    5–7 Oct busy-hour RxMaxSpeed is almost choked, the ceiling then steps
-    up, and 6–8 Nov is no longer choked. Jagged October traces and ports
-    that are flat only on the latest window are not listed.
+    Solved when 6–8 Nov is no longer choked (GPSDR38). Choked again when
+    the port is flat on the new ceiling as well (DHSVRI8). A jagged
+    October trace is not listed.
     """
     prev_stats = _window_stats(prev_work)
     latest_stats = _window_stats(latest_work)
@@ -671,14 +671,21 @@ def _build_comparison_v1(
         )
         pct = 100.0 * delta / old_rx if np.isfinite(delta) and old_rx else float("nan")
         bw_up = _bw_increased(old_rx, new_rx)
+        prev_listed = site in prev_by
         latest_choked = site in latest_by
         has_latest = site in latest_sites
-        # One pattern: almost flat on the old ceiling, then a higher ceiling
-        # and off the choke list. Tx Total BW is not part of this test.
-        if not (site in almost and bw_up and has_latest and not latest_choked):
+        # October was already flat, and the ceiling stepped up. November
+        # may be released (solved) or flat again on the new ceiling.
+        # Tx Total BW is not part of this test.
+        if not (bw_up and has_latest and (site in almost or prev_listed)):
+            continue
+        if latest_choked:
+            finding = FINDING_AGAIN
+        elif site in almost:
+            finding = FINDING_SOLVED_UP
+        else:
             continue
         prev_choked = True
-        finding = FINDING_SOLVED_UP
         prev_rec = prev_by.get(site, {})
         latest_rec = latest_by.get(site, {})
         rows.append(
@@ -2883,15 +2890,13 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"{ANALYSIS_END.strftime('%-d %b')} ({PREV_FEG_FILE}). "
             f"Latest FEGE is {LATEST_START.strftime('%-d %b')}–"
             f"{LATEST_END.strftime('%-d %b')} ({LATEST_FEG_FILE}). "
-            "Only one pattern is listed: on 5–7 Oct the busy-hour RxMaxSpeed "
-            "sits on a ceiling (median within "
-            f"{ALMOST_GAP_PCT:.0%} of the p90, at least {ALMOST_NEAR:.0%} of hours "
-            f"near that ceiling, and at most {ALMOST_DIP:.0%} of hours below "
-            f"{ALMOST_DIP_FRAC:.0%} of it — the GPSDR38 / DHNMK02 shape). "
-            "On 6–8 Nov that ceiling is higher by at least "
-            f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}%, and the port is "
-            "no longer choked. Jagged October traces are left out, as are ports "
-            "that go flat only on the latest window. Tx Total BW is not used. "
+            "Listed when 5–7 Oct RxMaxSpeed was already choked or flat on a "
+            "ceiling and the busy-hour p90 then rises by at least "
+            f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}%. "
+            "Solved — Tx BW increased: November is no longer choked (GPSDR38). "
+            "Choked again: November is flat on the new ceiling (DHSVRI8). "
+            "A jagged October trace that only goes flat later is left out. "
+            "Tx Total BW is not used. "
             "OSS columns are the 1 BusyHour block only (top hour by Data Volume and "
             "by Max User): DL Throughput N/D, DLPRBUtilization,% from PRB N/D, "
             "average Data Volume, average Max User, Hours matched %, last-day match. "
@@ -3349,7 +3354,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v89.xlsx",
+        default="FEGE_Choked_Flat_Sites_v90.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -3944,11 +3949,12 @@ def _write_comparison(book, styles, compare_rows: list[dict]) -> None:
 def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, int]) -> None:
     """Findings: Tx BW step-up, solved, and choked again, with 1H OSS both windows."""
     ws = book.add_worksheet(COMPARE_V1_SHEET)
-    _page(ws, "comparison_v1 — almost choked, then the Tx ceiling rose")
+    _page(ws, "comparison_v1 — flat before the increase, solved or choked again")
     ws.set_tab_color("#548235")
     prev_lbl = f"{ANALYSIS_START.strftime('%-d %b')}–{ANALYSIS_END.strftime('%-d %b')}"
     new_lbl = f"{LATEST_START.strftime('%-d %b')}–{LATEST_END.strftime('%-d %b')}"
-    n_up = sum(1 for row in rows if row.get("bw_up"))
+    n_again = sum(1 for row in rows if row["finding"] == FINDING_AGAIN)
+    n_solved = sum(1 for row in rows if row["finding"] == FINDING_SOLVED_UP)
     data_fields = (
         ("tp_data_1h", "DL Throughput 1h"),
         ("prb_data_1h", "DLPRBUtilization,%"),
@@ -3998,17 +4004,19 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
     ws.set_row(0, 28)
     ws.merge_range(
         0, 0, 0, last_col,
-        "comparison_v1 — almost choked on 5–7 Oct, Tx ceiling higher on 6–8 Nov",
+        "comparison_v1 — flat on 5–7 Oct, then solved or choked again",
         styles["title"],
     )
     ws.set_row(1, 36)
     ws.merge_range(
         1, 0, 1, last_col,
         f"{prev_lbl} {PREV_FEG_FILE}    ·    {new_lbl} {LATEST_FEG_FILE}    ·    "
-        f"{len(rows)} sites    ·    ceiling up: {n_up}    ·    "
-        "Kept only when 5–7 Oct busy-hour RxMaxSpeed sits on a ceiling "
-        "(GPSDR38 / DHNMK02) and 6–8 Nov is higher and no longer choked. "
-        "Jagged October traces are left out. Tx Total BW is not used. "
+        f"{len(rows)} sites    ·    Solved — Tx BW increased: {n_solved}    ·    "
+        f"Choked again: {n_again}    ·    "
+        "October was already flat. The ceiling then rose. "
+        "Solved means November is off that ceiling (GPSDR38). "
+        "Choked again means November is flat on the new ceiling (DHSVRI8). "
+        "Tx Total BW is not used. "
         f"Data BusyHour 1H impact, {new_lbl} versus {prev_lbl}: "
         "Improved when the latest value is higher.",
         styles["subtitle"],
