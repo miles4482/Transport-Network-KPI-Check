@@ -4,15 +4,9 @@
 Pre window is 5–7 Oct. Post window is 6–8 Nov. comparison_v1 keeps
 sites that were already flat, then the ceiling rose. November is either
 released (solved) or flat again on the new ceiling (choked again).
-Each finding category contributes up to five
-sites, then those slides are ordered by the daytime throughput step,
-largest first:
-
-- throughput and data volume both improved significantly
-- throughput improved significantly, data volume held or rose only a little
-- a smaller gain, with neither KPI down
-
-Sites where both throughput and data volume fell are left out.
+Choked again keeps every site. Each other finding keeps the 10
+largest daytime throughput gains. Within a finding, the largest gain
+comes first.
 """
 
 from __future__ import annotations
@@ -37,7 +31,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v13.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v14.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -71,11 +65,23 @@ CATEGORY_ORDER = (
 BUCKET_BOTH = "both"
 BUCKET_HOLD = "hold"
 BUCKET_SMALL = "small"
+BUCKET_OTHER = "other"
+BUCKET_DAY = "day"
 BUCKET_LABEL = {
     BUCKET_BOTH: "Both throughput and data volume improved",
     BUCKET_HOLD: "Throughput improved, data volume held",
     BUCKET_SMALL: "Small improvement, KPIs did not fall",
+    BUCKET_DAY: "Daytime throughput improved",
+    BUCKET_OTHER: "Included with every choked-again site",
 }
+# Choked again is shown in full. Each other finding shows this many,
+# largest daytime gain first.
+OTHER_LIMIT = 10
+DECK_ORDER = (
+    fege.FINDING_SOLVED_UP,
+    fege.FINDING_AGAIN,
+    fege.FINDING_SOLVED,
+)
 
 
 def _num(value: object) -> float:
@@ -168,84 +174,54 @@ def _profiles(pre: dict, post: dict) -> dict[str, dict]:
     return out
 
 
-def select_sites(rows: list[dict], profiles: dict[str, dict]) -> list[dict]:
-    """Up to five sites in each finding category, in the requested mix.
+def _rank_key(site: dict) -> tuple[float, float]:
+    delta = site.get("busy_tp_delta", float("nan"))
+    pct = site.get("busy_tp_pct", float("nan"))
+    return (
+        delta if np.isfinite(delta) else -1e9,
+        pct if np.isfinite(pct) else -1e9,
+    )
 
-    A site is kept only when the hourly curve does not contradict the note:
-    daytime throughput must not have fallen, and a very small data volume
-    is left out so a percent change is not an empty-site artefact.
-    Sites whose daytime throughput actually stepped up are taken first,
-    because that is what the chart shows.
+
+def select_sites(rows: list[dict], profiles: dict[str, dict]) -> list[dict]:
+    """Every choked-again site, and the 10 largest gains in each other finding.
+
+    Order inside a finding is the daytime throughput step, largest first.
     """
-    grouped: dict[str, list[dict]] = {name: [] for name in CATEGORY_ORDER}
+    grouped: dict[str, list[dict]] = {name: [] for name in DECK_ORDER}
     for row in rows:
+        finding = row.get("finding")
+        if finding not in grouped:
+            continue
         metrics = _metrics(row)
         profile = profiles.get(row["site"])
-        if metrics is None or profile is None or row["finding"] not in grouped:
+        if metrics is None or profile is None:
             continue
         bucket = _bucket(metrics)
         if not bucket:
-            continue
-        if metrics["vol0"] < 10 or metrics["vol1"] < 10:
-            continue
-        if profile["min_hours"] < 20:
-            continue
-        if not np.isfinite(profile["busy_tp_pct"]) or profile["busy_tp_pct"] <= -5:
-            continue
-        if bucket == BUCKET_BOTH and (
-            not np.isfinite(profile["busy_vol_pct"]) or profile["busy_vol_pct"] <= -5
-        ):
-            continue
-        grouped[row["finding"]].append(
-            {**row, "metrics": metrics, "bucket": bucket, **profile}
-        )
+            bucket = BUCKET_OTHER if finding == fege.FINDING_AGAIN else BUCKET_DAY
+        grouped[finding].append({**row, "metrics": metrics, "bucket": bucket, **profile})
 
-    quotas = ((BUCKET_BOTH, 2), (BUCKET_HOLD, 2), (BUCKET_SMALL, 1))
     picked: list[dict] = []
-    for finding in CATEGORY_ORDER:
-        pool = grouped[finding]
-        chosen: list[dict] = []
-        used: set[str] = set()
-        for bucket, quota in quotas:
-            options = [
-                site for site in pool if site["bucket"] == bucket and site["site"] not in used
-            ]
-            options.sort(
-                key=lambda site: (
-                    site["busy_tp_delta"] >= 0.8 and site["busy_tp_pct"] >= 5,
-                    site["busy_tp_delta"],
-                    site["metrics"]["tp_delta"],
-                    site["site"],
-                ),
-                reverse=True,
-            )
-            for site in options[:quota]:
-                chosen.append(site)
-                used.add(site["site"])
-        # Largest visible daytime throughput step first, in every category.
-        chosen.sort(
-            key=lambda site: (
-                site["busy_tp_delta"] if np.isfinite(site["busy_tp_delta"]) else -1e9,
-                site["busy_tp_pct"] if np.isfinite(site["busy_tp_pct"]) else -1e9,
-            ),
-            reverse=True,
-        )
+    for finding in DECK_ORDER:
+        pool = sorted(grouped[finding], key=_rank_key, reverse=True)
+        chosen = pool if finding == fege.FINDING_AGAIN else pool[:OTHER_LIMIT]
         for index, site in enumerate(chosen, start=1):
             site["pick_index"] = index
             site["pick_total"] = len(chosen)
             picked.append(site)
-        print(f"{finding}: {len(chosen)} sites", flush=True)
-        for site in chosen:
+        print(f"{finding}: {len(chosen)} of {len(pool)} sites", flush=True)
+        for site in chosen[:12]:
             m = site["metrics"]
             print(
                 f"  {site['pick_index']}. {site['site']}  {site['bucket']}"
-                f"  1H TP {m['tp0']:.2f}->{m['tp1']:.2f} ({m['tp_pct']:+.1f}%)"
-                f"  Vol {m['vol0']:.1f}->{m['vol1']:.1f} ({m['vol_pct']:+.1f}%)"
                 f"  daytime {site['busy_tp0']:.1f}->{site['busy_tp1']:.1f}"
                 f" ({site['busy_tp_pct']:+.0f}%)"
-                f"  Rx {site['old_rx']:.0f}->{site['new_rx']:.0f}",
+                f"  1H TP {m['tp0']:.2f}->{m['tp1']:.2f}",
                 flush=True,
             )
+        if len(chosen) > 12:
+            print(f"  … {len(chosen) - 12} more", flush=True)
     return picked
 
 
@@ -605,6 +581,12 @@ def _sentence(site: dict) -> list[str]:
         lead = "Throughput improved significantly and data volume was held. The Tx ceiling did not meet the step-up test."
     elif bucket == BUCKET_HOLD:
         lead = "The congested busy hour is faster and data volume was held. The Tx ceiling did not meet the step-up test."
+    elif site.get("busy_tp_pct", 0) >= 8 and site.get("bw_up"):
+        lead = "After the Tx BW increase, daytime throughput improved."
+    elif site.get("busy_tp_pct", 0) >= 8:
+        lead = "Daytime throughput improved. The Tx ceiling did not meet the step-up test."
+    elif site.get("finding") == fege.FINDING_AGAIN:
+        lead = "Still choked on the new ceiling."
     else:
         lead = "A small throughput gain, and data volume did not fall. The Tx ceiling did not meet the step-up test."
     return [lead, ceiling, tp, vol, choke]
@@ -647,7 +629,9 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page
         BUCKET_BOTH: RGBColor(0x54, 0x82, 0x35),
         BUCKET_HOLD: RGBColor(0x2F, 0x54, 0x96),
         BUCKET_SMALL: RGBColor(0xC6, 0x59, 0x11),
-    }[site["bucket"]]
+        BUCKET_OTHER: RGBColor(0x83, 0x3C, 0x0C),
+        BUCKET_DAY: RGBColor(0x1F, 0x4E, 0x79),
+    }.get(site["bucket"], RGBColor(0x1F, 0x4E, 0x79))
 
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.78))
     bar.fill.solid()
@@ -756,95 +740,175 @@ def _set_cell_border(cell, color: str = "D0D7E2", width_pt: float = 0.75) -> Non
         tc_pr.append(line)
 
 
-def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> None:
-    """One row per site, with the Tx bandwidth result in its own column."""
+def _category_brief(rows: list[dict], profiles: dict[str, dict], finding: str) -> dict:
+    """Overall result for one finding, across every comparison_v1 site."""
+    group = [row for row in rows if row.get("finding") == finding]
+    deltas = []
+    ceilings = []
+    for row in group:
+        profile = profiles.get(row["site"])
+        if profile is not None and np.isfinite(profile.get("busy_tp_delta", float("nan"))):
+            deltas.append(profile["busy_tp_delta"])
+        step = _num(row.get("delta_rx"))
+        if np.isfinite(step):
+            ceilings.append(step)
+    return {
+        "n": len(group),
+        "tp_up": sum(1 for row in group if row.get("throughput_impact") == "Improved"),
+        "vol_up": sum(1 for row in group if row.get("volume_impact") == "Improved"),
+        "day": float(np.median(deltas)) if deltas else float("nan"),
+        "ceiling": float(np.median(ceilings)) if ceilings else float("nan"),
+    }
+
+
+def _summary_box(
+    slide,
+    left: float,
+    accent: str,
+    tint: str,
+    title: str,
+    story: str,
+    brief: dict,
+    shown: str,
+) -> None:
+    """One category panel: a count, then the overall finding."""
+    top, width, height = 1.28, 4.12, 5.45
+    card = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height)
+    )
+    card.fill.solid()
+    card.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    card.line.color.rgb = RGBColor.from_string(accent)
+    card.line.width = Pt(1.75)
+
+    head = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE, Inches(left + 0.06), Inches(top + 0.10), Inches(width - 0.12), Inches(1.62)
+    )
+    head.fill.solid()
+    head.fill.fore_color.rgb = RGBColor.from_string(tint)
+    head.line.fill.background()
+
+    title_box = slide.shapes.add_textbox(Inches(left + 0.20), Inches(top + 0.18), Inches(width - 0.40), Inches(0.62))
+    title_frame = title_box.text_frame
+    title_frame.word_wrap = True
+    _set_run(title_frame.paragraphs[0], title, 16, RGBColor.from_string(accent), True)
+
+    count_box = slide.shapes.add_textbox(Inches(left + 0.20), Inches(top + 0.86), Inches(width - 0.40), Inches(0.72))
+    count_frame = count_box.text_frame
+    count_frame.word_wrap = False
+    count_run = count_frame.paragraphs[0]
+    _set_run(count_run, str(brief["n"]), 36, RGBColor.from_string(accent), True)
+    _add_run(count_run, "  sites", 14, RGBColor(0x59, 0x59, 0x59), False)
+
+    body = slide.shapes.add_textbox(Inches(left + 0.20), Inches(top + 1.88), Inches(width - 0.40), Inches(3.35))
+    frame = body.text_frame
+    frame.word_wrap = True
+    day = f"{brief['day']:+.1f} Mbps" if np.isfinite(brief["day"]) else "—"
+    ceiling = f"{brief['ceiling']:+.0f} Mbit/s" if np.isfinite(brief["ceiling"]) else "—"
+    lines = (
+        (story, True),
+        (f"Throughput improved    {brief['tp_up']} of {brief['n']}", False),
+        (f"Data volume improved    {brief['vol_up']} of {brief['n']}", False),
+        (f"Median daytime gain    {day}", False),
+        (f"Median Rx ceiling    {ceiling}", False),
+        (shown, True),
+    )
+    for index, (text, strong) in enumerate(lines):
+        paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+        paragraph.space_before = Pt(10 if index else 0)
+        paragraph.space_after = Pt(2)
+        color = RGBColor.from_string(accent) if strong else RGBColor(0x33, 0x33, 0x33)
+        _set_run(paragraph, text, 13 if strong else 14, color, strong)
+
+
+def _add_summary_slide(
+    prs: Presentation,
+    rows: list[dict],
+    selected: list[dict],
+    profiles: dict[str, dict],
+    pages: int,
+) -> None:
+    """Three category panels. Each one states the full finding, not only the slides."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
-    ink = RGBColor(0x33, 0x33, 0x33)
     white = RGBColor(0xFF, 0xFF, 0xFF)
-    green = RGBColor(0x37, 0x56, 0x23)
-    stepped = [site for site in selected if site.get("bw_up")]
-    held = [site for site in selected if not site.get("bw_up")]
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = RGBColor(0xF4, 0xF7, 0xFB)
+    bg.line.fill.background()
 
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.62))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(1.05))
     bar.fill.solid()
     bar.fill.fore_color.rgb = navy
     bar.line.fill.background()
-    title = slide.shapes.add_textbox(Inches(0.32), Inches(0.08), Inches(8.4), Inches(0.42))
-    _set_run(title.text_frame.paragraphs[0], "Management summary", 24, white, True)
-    side = slide.shapes.add_textbox(Inches(8.6), Inches(0.14), Inches(4.4), Inches(0.36))
-    side_p = side.text_frame.paragraphs[0]
-    side_p.alignment = PP_ALIGN.RIGHT
-    _set_run(side_p, f"{len(stepped)} ceiling up   ·   {len(held)} ceiling held", 13, white, False)
-
-    headers = ("#", "Site", "Finding", "Daytime throughput", "Rx ceiling")
-    widths = (0.50, 1.45, 4.05, 3.45, 3.33)
-    header_h = 0.32
-    table_top = 0.78
-    body_h = min(0.36, (6.15 - header_h) / max(len(selected), 1))
-    table_h = header_h + body_h * len(selected)
-    table_shape = slide.shapes.add_table(
-        1 + len(selected), 5, Inches(0.28), Inches(table_top), Inches(12.78), Inches(table_h)
-    )
-    table = table_shape.table
-    for index, width in enumerate(widths):
-        table.columns[index].width = Inches(width)
-    tbl_pr = table._tbl.tblPr
-    if tbl_pr is not None:
-        tbl_pr.set("bandRow", "0")
-        tbl_pr.set("firstRow", "0")
-
-    for col, text in enumerate(headers):
-        cell = table.cell(0, col)
-        _set_cell_fill(cell, "1F4E79")
-        _set_cell_border(cell, "1F4E79", 0.6)
-        cell.margin_left = Inches(0.08)
-        cell.margin_right = Inches(0.06)
-        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
-        paragraph = cell.text_frame.paragraphs[0]
-        paragraph.alignment = PP_ALIGN.CENTER if col == 0 else PP_ALIGN.LEFT
-        _set_run(paragraph, text, 12, white, True)
-    table.rows[0].height = Inches(header_h)
-
-    for index, site in enumerate(selected, start=1):
-        table.rows[index].height = Inches(body_h)
-        rx0, rx1 = _num(site.get("old_rx")), _num(site.get("new_rx"))
-        rose = bool(site.get("bw_up"))
-        values = (
-            str(index),
-            site["site"],
-            site["finding"],
-            f"{site['busy_tp0']:.1f} → {site['busy_tp1']:.1f}   ({site['busy_tp_delta']:+.1f})",
-            f"{rx0:.0f} → {rx1:.0f}" if np.isfinite(rx0) and np.isfinite(rx1) else "",
-        )
-        zebra = "F7F9FB" if index % 2 else "FFFFFF"
-        for col, text in enumerate(values):
-            cell = table.cell(index, col)
-            if col == 4 and rose:
-                _set_cell_fill(cell, "E2EFDA")
-            elif col == 4:
-                _set_cell_fill(cell, "FCE4D6")
-            else:
-                _set_cell_fill(cell, zebra)
-            _set_cell_border(cell, "D0D7E2", 0.5)
-            cell.margin_left = Inches(0.08)
-            cell.margin_right = Inches(0.06)
-            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
-            cell.text_frame.word_wrap = False
-            paragraph = cell.text_frame.paragraphs[0]
-            paragraph.alignment = PP_ALIGN.CENTER if col == 0 else PP_ALIGN.LEFT
-            color = green if col == 4 and rose else (ink if col != 4 else RGBColor(0xC6, 0x59, 0x11))
-            _set_run(paragraph, text, 11, navy if col in (0, 1) else color, col in (1, 4))
-
-    foot = slide.shapes.add_textbox(Inches(0.32), Inches(7.08), Inches(10.4), Inches(0.28))
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.12), Inches(8.6), Inches(0.42))
+    _set_run(title.text_frame.paragraphs[0], "Management summary", 26, white, True)
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.54), Inches(9.2), Inches(0.36))
     _set_run(
-        foot.text_frame.paragraphs[0],
-        "Rx ceiling is busy-hour RxMaxSpeed p90. Green rose by at least 40 Mbit/s or 12%. Amber did not. A flat trace can still be choked.",
-        11,
+        sub.text_frame.paragraphs[0],
+        "5–7 Oct versus 6–8 Nov    ·    sites that were choked",
+        14,
+        RGBColor(0xD6, 0xE3, 0xF0),
+        False,
+    )
+    total = slide.shapes.add_textbox(Inches(9.4), Inches(0.28), Inches(3.55), Inches(0.50))
+    total_p = total.text_frame.paragraphs[0]
+    total_p.alignment = PP_ALIGN.RIGHT
+    _set_run(total_p, f"{len(rows)} sites", 22, white, True)
+
+    shown = {finding: 0 for finding in DECK_ORDER}
+    for site in selected:
+        shown[site["finding"]] = shown.get(site["finding"], 0) + 1
+    panels = (
+        (
+            fege.FINDING_SOLVED_UP,
+            "1F4E79",
+            "E8F0FA",
+            "Solved — Tx BW increased",
+            "The ceiling rose and the port is no longer choked.",
+            "Next slides: 10 largest daytime gains",
+        ),
+        (
+            fege.FINDING_AGAIN,
+            "833C0C",
+            "FDEFE6",
+            "Choked again",
+            "The ceiling rose, and the port is flat again on the new ceiling.",
+            "Next slides: every site, largest gain first",
+        ),
+        (
+            fege.FINDING_SOLVED,
+            "375623",
+            "E7F2E4",
+            "Solved",
+            "Choked before, and clear now. The Rx step is under 40 Mbit/s or 12%.",
+            "Next slides: 10 largest daytime gains",
+        ),
+    )
+    for index, (finding, accent, tint, title_text, story, slide_line) in enumerate(panels):
+        brief = _category_brief(rows, profiles, finding)
+        _summary_box(
+            slide,
+            0.28 + index * 4.32,
+            accent,
+            tint,
+            title_text,
+            story,
+            brief,
+            slide_line,
+        )
+
+    foot = slide.shapes.add_textbox(Inches(0.36), Inches(6.90), Inches(10.6), Inches(0.42))
+    foot_frame = foot.text_frame
+    foot_frame.word_wrap = True
+    _set_run(
+        foot_frame.paragraphs[0],
+        "Daytime gain is the 09:00–22:00 median. Throughput and data volume use the Data BusyHour 1H block.",
+        12,
         RGBColor(0x80, 0x80, 0x80),
         False,
     )
-    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.08), Inches(1.65), Inches(0.28))
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(6.90), Inches(1.7), Inches(0.32))
     page_p = page_box.text_frame.paragraphs[0]
     page_p.alignment = PP_ALIGN.RIGHT
     _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
@@ -884,7 +948,8 @@ def main() -> None:
     post_oss_all, _ = _prepare_oss(
         Path("/tmp/oss_nov_capacity.csv"), all_sites, fege.LATEST_START, fege.LATEST_END
     )
-    selected = select_sites(rows, _profiles(pre_oss_all, post_oss_all))
+    profiles = _profiles(pre_oss_all, post_oss_all)
+    selected = select_sites(rows, profiles)
     if not selected:
         raise SystemExit("No sites matched the finding selection")
 
@@ -903,7 +968,7 @@ def main() -> None:
     prs.core_properties.subject = "comparison_v1 site findings, 5–7 Oct versus 6–8 Nov"
 
     pages = len(selected) + 1
-    _add_summary_slide(prs, selected, pages)
+    _add_summary_slide(prs, rows, selected, profiles, pages)
     for page, site in enumerate(selected, start=2):
         name = site["site"]
         rx = _concat(pre_feg[name]["rx"], post_feg[name]["rx"])
