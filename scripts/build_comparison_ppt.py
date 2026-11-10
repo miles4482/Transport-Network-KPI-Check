@@ -34,7 +34,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v7.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v8.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -280,9 +280,9 @@ def _prepare_feg(work: pd.DataFrame, sites: set[str], start, end):
         work["eNodeB Name"].astype(str).isin(sites)
         & (work["Date"] >= start)
         & (work["Date"] <= end),
-        ["eNodeB Name", "Date", "Hour", "Rx"],
+        ["eNodeB Name", "Date", "Hour", "Rx", "TxBW"],
     ].copy()
-    return _hour_matrix(part, sites, {"rx": "Rx"}, start, end)
+    return _hour_matrix(part, sites, {"rx": "Rx", "tx": "TxBW"}, start, end)
 
 
 def _prepare_oss(path: Path, sites: set[str], start, end):
@@ -375,7 +375,7 @@ def _sharp_limits(values: np.ndarray) -> tuple[float, float]:
     return ymin, ymax
 
 
-def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_peak: float) -> None:
+def _draw_feg(path: Path, rx: np.ndarray, tx: np.ndarray, pre_peak: float, pre_avg: float, post_peak: float) -> None:
     fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
     x = np.arange(len(rx))
     _style_time_axis(ax, len(rx))
@@ -383,26 +383,28 @@ def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_
     post = np.where(x >= 72, rx, np.nan)
     ax.plot(x, pre, color=BLUE, linewidth=1.8, label="RxMaxSpeed 5–7 Oct", zorder=3)
     ax.plot(x, post, color=GREEN, linewidth=1.8, label="RxMaxSpeed 6–8 Nov", zorder=3)
+    ax.plot(x, tx, color="#843C0C", linewidth=2.0, label="Tx total BW", zorder=4)
     if np.isfinite(pre_peak):
         ax.plot(x[:72], np.full(72, pre_peak), color=RED, linewidth=1.1, linestyle="--", label=f"Peak 5–7 Oct ({pre_peak:.0f})", zorder=2)
     if np.isfinite(pre_avg):
         ax.plot(x[:72], np.full(72, pre_avg), color=ORANGE, linewidth=1.1, linestyle="--", label=f"Avg peak 5–7 Oct ({pre_avg:.0f})", zorder=2)
     if np.isfinite(post_peak):
         ax.plot(x[72:], np.full(len(rx) - 72, post_peak), color=PURPLE, linewidth=1.1, linestyle="--", label=f"Peak 6–8 Nov ({post_peak:.0f})", zorder=2)
-    finite = rx[np.isfinite(rx)]
+    finite = np.concatenate([rx, tx])
+    finite = finite[np.isfinite(finite)]
     ymax, _step = fege._chart_y_scale(finite.tolist() if finite.size else [50])
     ax.set_ylim(0, ymax)
     ax.set_ylabel("Mbit/s", fontsize=8, color=GREY)
-    fig.text(0.08, 0.98, "FEGE RxMaxSpeed", ha="left", va="top", fontsize=12, color=NAVY, fontweight="bold")
+    fig.text(0.08, 0.98, "FEGE RxMaxSpeed and Tx total BW", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
     ax.legend(
         loc="lower left",
         bbox_to_anchor=(0.0, 1.02),
         ncol=3,
         frameon=False,
-        fontsize=7,
+        fontsize=6.5,
         borderaxespad=0,
     )
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.70, bottom=0.22)
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.68, bottom=0.22)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -551,19 +553,25 @@ def _peaks(rx: np.ndarray, on_cap: np.ndarray | None, center: float) -> tuple[fl
 def _sentence(site: dict) -> list[str]:
     m = site["metrics"]
     bucket = site["bucket"]
+    tx0, tx1 = _num(site.get("prev_tx")), _num(site.get("latest_tx"))
     rx0, rx1 = _num(site.get("old_rx")), _num(site.get("new_rx"))
-    if site.get("bw_up") and np.isfinite(rx0) and np.isfinite(rx1):
+    if np.isfinite(tx0) and np.isfinite(tx1) and site.get("bw_up"):
         ceiling = (
-            f"Tx ceiling rose from {rx0:.0f} to {rx1:.0f} Mbit/s "
-            f"({rx1 - rx0:+.0f} Mbit/s, busy-hour RxMaxSpeed p90)."
+            f"Tx total BW rose from {tx0:.0f} to {tx1:.0f} Mbit/s "
+            f"({tx1 - tx0:+.0f} Mbit/s, VS.FEGE.TxTotalBW)."
         )
-    elif np.isfinite(rx0) and np.isfinite(rx1):
+    elif np.isfinite(tx0) and np.isfinite(tx1) and tx1 < tx0 - 1:
         ceiling = (
-            f"Busy-hour RxMaxSpeed p90 moved from {rx0:.0f} to {rx1:.0f} Mbit/s. "
-            "That is below the Tx BW step-up test of 40 Mbit/s or 12%."
+            f"Tx total BW fell from {tx0:.0f} to {tx1:.0f} Mbit/s (VS.FEGE.TxTotalBW)."
+        )
+    elif np.isfinite(tx0) and np.isfinite(tx1):
+        ceiling = (
+            f"Tx total BW stayed at {tx0:.0f} Mbit/s (VS.FEGE.TxTotalBW). It did not increase."
         )
     else:
-        ceiling = "Busy-hour RxMaxSpeed ceiling could not be compared."
+        ceiling = "Tx total BW could not be compared."
+    if np.isfinite(rx0) and np.isfinite(rx1):
+        ceiling += f" Busy-hour RxMaxSpeed p90 {rx0:.0f} → {rx1:.0f} Mbit/s."
     daytime = (
         f" Daytime 09:00–22:00 median {site['busy_tp0']:.1f} → {site['busy_tp1']:.1f} Mbps."
     )
@@ -595,15 +603,15 @@ def _sentence(site: dict) -> list[str]:
     elif site.get("bw_up"):
         lead = "After the Tx BW increase, throughput is higher and data volume did not fall."
     elif bucket == BUCKET_BOTH and day_clear:
-        lead = "Throughput and data volume both improved. The Tx ceiling did not meet the step-up test."
+        lead = "Throughput and data volume both improved. Tx total BW did not increase."
     elif bucket == BUCKET_BOTH:
-        lead = "The congested busy hour is faster and data volume increased. The Tx ceiling did not meet the step-up test."
+        lead = "The congested busy hour is faster and data volume increased. Tx total BW did not increase."
     elif bucket == BUCKET_HOLD and day_clear:
-        lead = "Throughput improved significantly and data volume was held. The Tx ceiling did not meet the step-up test."
+        lead = "Throughput improved significantly and data volume was held. Tx total BW did not increase."
     elif bucket == BUCKET_HOLD:
-        lead = "The congested busy hour is faster and data volume was held. The Tx ceiling did not meet the step-up test."
+        lead = "The congested busy hour is faster and data volume was held. Tx total BW did not increase."
     else:
-        lead = "A small throughput gain, and data volume did not fall. The Tx ceiling did not meet the step-up test."
+        lead = "A small throughput gain, and data volume did not fall. Tx total BW did not increase."
     return [lead, ceiling, tp, vol, choke]
 
 
@@ -761,11 +769,11 @@ def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> N
     grey = RGBColor(0x60, 0x60, 0x60)
     white = RGBColor(0xFF, 0xFF, 0xFF)
     readings = {
-        fege.FINDING_UP_CHOKED: "Ceiling stepped up. Newly choked on 6–8 Nov.",
-        fege.FINDING_SOLVED_UP: "Ceiling stepped up. Off the choke list.",
-        fege.FINDING_UP: "Ceiling stepped up. Not choked in either window.",
-        fege.FINDING_AGAIN: "Still choked. The gain is on the new ceiling.",
-        fege.FINDING_SOLVED: "Off the choke list. No Tx BW step-up.",
+        fege.FINDING_UP_CHOKED: "Tx total BW stepped up. Newly choked on 6–8 Nov.",
+        fege.FINDING_SOLVED_UP: "Tx total BW stepped up. Off the choke list.",
+        fege.FINDING_UP: "Tx total BW stepped up. Not choked in either window.",
+        fege.FINDING_AGAIN: "Tx total BW stepped up. Still choked.",
+        fege.FINDING_SOLVED: "Off the choke list. Tx total BW did not increase.",
     }
     rows = []
     for finding in CATEGORY_ORDER:
@@ -781,10 +789,10 @@ def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> N
     _set_run(title.text_frame.paragraphs[0], "Management summary", 26, white, True)
 
     intro = slide.shapes.add_textbox(Inches(0.32), Inches(0.72), Inches(12.7), Inches(0.36))
-    intro.text_frame.word_wrap = False
+    intro.text_frame.word_wrap = True
     _set_run(
         intro.text_frame.paragraphs[0],
-        "Pre 5–7 Oct versus post 6–8 Nov. Sites in each row run from the largest daytime throughput step to the smallest.",
+        "Pre 5–7 Oct versus post 6–8 Nov. Tx BW increased means Tx total BW stepped up. Sites run from the largest daytime throughput step.",
         14,
         navy,
         False,
@@ -855,10 +863,16 @@ def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> N
             paragraph.space_after = Pt(0)
             paragraph.space_before = Pt(0)
             _set_run(paragraph, site["site"], 12, navy, True)
+            tx0, tx1 = _num(site.get("prev_tx")), _num(site.get("latest_tx"))
+            tx_text = (
+                f"    Tx BW {tx0:.0f}→{tx1:.0f}"
+                if np.isfinite(tx0) and np.isfinite(tx1)
+                else ""
+            )
             _add_run(
                 paragraph,
                 f"    {site['busy_tp0']:.1f} → {site['busy_tp1']:.1f} Mbps"
-                f"    ({site['busy_tp_delta']:+.1f})",
+                f"    ({site['busy_tp_delta']:+.1f}){tx_text}",
                 12,
                 ink,
                 False,
@@ -869,7 +883,7 @@ def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> N
     foot = slide.shapes.add_textbox(Inches(0.32), Inches(foot_top), Inches(10.4), Inches(0.28))
     _set_run(
         foot.text_frame.paragraphs[0],
-        "Daytime throughput is the 09:00–22:00 median. The following pages are one site each, in this order.",
+        "Daytime throughput is the 09:00–22:00 median. Tx BW increased is a step in VS.FEGE.TxTotalBW, not in RxMaxSpeed.",
         11,
         RGBColor(0x80, 0x80, 0x80),
         False,
@@ -900,9 +914,32 @@ def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
     return out
 
 
+def _confirm_tx_bw(rows: list[dict]) -> list[dict]:
+    """Keep a finding only when Tx total BW, not RxMaxSpeed, supports it.
+
+    A rise in RxMaxSpeed can be demand filling the same bandwidth. Tx BW
+    increased means VS.FEGE.TxTotalBW itself stepped up.
+    """
+    kept = []
+    for row in rows:
+        prev_tx = _num(row.get("prev_tx"))
+        latest_tx = _num(row.get("latest_tx"))
+        bw_up = fege._bw_increased(prev_tx, latest_tx)
+        finding = fege._comparison_finding(
+            bool(row.get("prev_choked")),
+            bool(row.get("latest_choked")),
+            bw_up,
+            True,
+        )
+        if not finding:
+            continue
+        kept.append({**row, "bw_up": bw_up, "finding": finding})
+    return kept
+
+
 def main() -> None:
     cached = pickle.loads(ROW_CACHE.read_bytes())
-    rows = cached["rows"]
+    rows = _confirm_tx_bw(cached["rows"])
     latest_work = cached["latest_work"]
     pre_cache = pickle.loads(Path("/tmp/fege_report_cache.pkl").read_bytes())
     pre_work = pre_cache["work"]
@@ -937,13 +974,14 @@ def main() -> None:
     for page, site in enumerate(selected, start=2):
         name = site["site"]
         rx = _concat(pre_feg[name]["rx"], post_feg[name]["rx"])
+        tx = _concat(pre_feg[name]["tx"], post_feg[name]["tx"])
         pre_on = _on_cap_vector(pre_work, name, fege.ANALYSIS_START, fege.ANALYSIS_END)
         post_on = _on_cap_vector(latest_work, name, fege.LATEST_START, fege.LATEST_END)
         pre_peak, pre_avg = _peaks(rx[:72], pre_on, _num(site.get("prev_center")))
         post_peak, _post_avg = _peaks(rx[72:], post_on, _num(site.get("latest_center")))
         feg_png = CHART_DIR / f"{page:02d}_{name}_feg.png"
         oss_png = CHART_DIR / f"{page:02d}_{name}_oss.png"
-        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak)
+        _draw_feg(feg_png, rx, tx, pre_peak, pre_avg, post_peak)
         _draw_oss(
             oss_png,
             _concat(pre_oss[name]["tp"], post_oss[name]["tp"]),
