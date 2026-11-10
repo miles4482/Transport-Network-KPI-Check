@@ -83,6 +83,14 @@ FINDING_RANK = {
 }
 BW_UP_MBPS = 40.0
 BW_UP_FRAC = 0.12
+# How the October peak sits against Tx total BW.
+# Near: DHUTTM5 / DHRMN65. Above: NGSNG78. Below: GPSRPM9.
+NEAR_TX_MBPS = 40.0
+# Above-TxBW solved sites whose daily peaks disagree by more than this
+# are the jagged minority and are left out.
+ABOVE_PEAK_GAP = 25.0
+# A Tx BW step counts as the old ceiling when the daily peaks are this tight.
+TX_STEP_PEAK_GAP = 15.0
 # Almost-choked October trace (GPSDR38 / DHNMK02). The busy-hour median
 # stays close to the p90, most hours sit near that ceiling, and few hours
 # fall well below it. TNMZP92 / NGRPGF4 / MNTGB03 fail this and are dropped.
@@ -424,7 +432,7 @@ def _build_bw_comparison(
 
 
 def _window_stats(work: pd.DataFrame) -> dict[str, dict[str, float]]:
-    """Busy-hour RxMaxSpeed p90 and median Tx Total BW for every site."""
+    """Busy-hour RxMaxSpeed p90, daily peaks, and median Tx Total BW."""
     out: dict[str, dict[str, float]] = {}
     for site, g in work.groupby("eNodeB Name", sort=False):
         stats: dict[str, float] = {}
@@ -437,9 +445,32 @@ def _window_stats(work: pd.DataFrame) -> dict[str, dict[str, float]]:
         tx = tx[np.isfinite(tx)]
         if tx.size:
             stats["tx_median"] = float(np.median(tx))
+        all_rx = g["Rx"].to_numpy(dtype=float)
+        all_rx = all_rx[np.isfinite(all_rx)]
+        if all_rx.size:
+            stats["peak"] = float(np.max(all_rx))
+        daily: list[float] = []
+        for _, day in g.groupby(g["Date"].dt.normalize(), sort=False):
+            vals = day["Rx"].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                daily.append(float(np.max(vals)))
+        if daily:
+            stats["avg_peak"] = float(np.mean(daily))
         if stats:
             out[str(site)] = stats
     return out
+
+
+def _peak_band(peak: float, tx: float) -> str:
+    """Where the October peak sits relative to Tx total BW."""
+    if not (np.isfinite(peak) and np.isfinite(tx)):
+        return ""
+    if peak < tx - NEAR_TX_MBPS:
+        return "below"
+    if peak <= tx + NEAR_TX_MBPS:
+        return "near"
+    return "above"
 
 
 def _comparison_finding(
@@ -643,11 +674,12 @@ def _build_comparison_v1(
     tech_by_site: dict[str, str] | None,
     geo: pd.DataFrame | None,
 ) -> list[dict]:
-    """Flat October ceiling, then a higher November ceiling.
+    """October was choked, then 6–8 Nov is solved or choked again.
 
-    Solved when 6–8 Nov is no longer choked (GPSDR38). Choked again when
-    the port is flat on the new ceiling as well (DHSVRI8). A jagged
-    October trace is not listed.
+    A flat ceiling counts (GPSDR38, DHSVRI8). So does a peak pressed
+    against Tx total BW (DHUTTM5, DHRMN65) and a peak that sits below it
+    (GPSRPM9). Peaks above Tx total BW are kept when the daily peaks
+    agree (NGSNG78) and left out when one day spikes far above the others.
     """
     prev_stats = _window_stats(prev_work)
     latest_stats = _window_stats(latest_work)
@@ -674,15 +706,37 @@ def _build_comparison_v1(
         prev_listed = site in prev_by
         latest_choked = site in latest_by
         has_latest = site in latest_sites
-        # October was already flat, and the ceiling stepped up. November
-        # may be released (solved) or flat again on the new ceiling.
-        # Tx Total BW is not part of this test.
-        if not (bw_up and has_latest and (site in almost or prev_listed)):
+        tx0 = old.get("tx_median", float("nan"))
+        tx1 = new.get("tx_median", float("nan"))
+        peak0 = old.get("peak", float("nan"))
+        avg0 = old.get("avg_peak", float("nan"))
+        gap = peak0 - avg0 if np.isfinite(peak0) and np.isfinite(avg0) else float("nan")
+        band = _peak_band(peak0, tx0)
+        tx_up = (
+            np.isfinite(tx0) and np.isfinite(tx1) and (tx1 - tx0) >= BW_UP_MBPS
+        )
+        pinned = (
+            band == "near"
+            and np.isfinite(gap)
+            and gap <= TX_STEP_PEAK_GAP
+        )
+        if not has_latest:
             continue
-        if latest_choked:
+        if bw_up and latest_choked and (site in almost or prev_listed):
+            # Flat before, and flat again on the higher ceiling.
             finding = FINDING_AGAIN
-        elif site in almost:
+        elif bw_up and not latest_choked and (site in almost or prev_listed):
             finding = FINDING_SOLVED_UP
+        elif prev_listed and not latest_choked:
+            # Solved without a 40 Mbit/s Rx step. Keep a peak near or below
+            # Tx BW, and most peaks above it. Drop the jagged minority.
+            if band == "above" and (not np.isfinite(gap) or gap > ABOVE_PEAK_GAP):
+                continue
+            finding = FINDING_SOLVED
+        elif tx_up and not latest_choked and pinned:
+            # Peaks were pinned on the old Tx BW, then that BW stepped up.
+            finding = FINDING_SOLVED_UP
+            bw_up = True
         else:
             continue
         prev_choked = True
@@ -2890,13 +2944,15 @@ def _write_method(book, styles, source_name, period_txt, n_sites, records):
             f"{ANALYSIS_END.strftime('%-d %b')} ({PREV_FEG_FILE}). "
             f"Latest FEGE is {LATEST_START.strftime('%-d %b')}–"
             f"{LATEST_END.strftime('%-d %b')} ({LATEST_FEG_FILE}). "
-            "Listed when 5–7 Oct RxMaxSpeed was already choked or flat on a "
-            "ceiling and the busy-hour p90 then rises by at least "
-            f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}%. "
-            "Solved — Tx BW increased: November is no longer choked (GPSDR38). "
-            "Choked again: November is flat on the new ceiling (DHSVRI8). "
-            "A jagged October trace that only goes flat later is left out. "
-            "Tx Total BW is not used. "
+            "Listed when 5–7 Oct was choked. A flat ceiling counts "
+            "(GPSDR38, DHSVRI8). A peak pressed against Tx total BW counts "
+            "(DHUTTM5), including when that BW itself steps up (DHRMN65). "
+            "A peak below Tx total BW counts (GPSRPM9). A peak above Tx total "
+            "BW is kept when the daily peaks agree (NGSNG78) and left out when "
+            "one day spikes far above the others. "
+            f"Tx BW increased means the busy-hour Rx p90 rises by at least "
+            f"{BW_UP_MBPS:g} Mbit/s or {100 * BW_UP_FRAC:.0f}%, or Tx total BW "
+            "itself steps up by that amount. "
             "OSS columns are the 1 BusyHour block only (top hour by Data Volume and "
             "by Max User): DL Throughput N/D, DLPRBUtilization,% from PRB N/D, "
             "average Data Volume, average Max User, Hours matched %, last-day match. "
@@ -3354,7 +3410,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="FEGE_Choked_Flat_Sites_v90.xlsx",
+        default="FEGE_Choked_Flat_Sites_v91.xlsx",
         help="Report workbook to write",
     )
     parser.add_argument(
@@ -4004,19 +4060,19 @@ def _write_comparison_v1(book, styles, rows: list[dict], chart_index: dict[str, 
     ws.set_row(0, 28)
     ws.merge_range(
         0, 0, 0, last_col,
-        "comparison_v1 — flat on 5–7 Oct, then solved or choked again",
+        "comparison_v1 — choked on 5–7 Oct, then solved or choked again",
         styles["title"],
     )
-    ws.set_row(1, 36)
+    ws.set_row(1, 48)
     ws.merge_range(
         1, 0, 1, last_col,
         f"{prev_lbl} {PREV_FEG_FILE}    ·    {new_lbl} {LATEST_FEG_FILE}    ·    "
         f"{len(rows)} sites    ·    Solved — Tx BW increased: {n_solved}    ·    "
         f"Choked again: {n_again}    ·    "
-        "October was already flat. The ceiling then rose. "
-        "Solved means November is off that ceiling (GPSDR38). "
-        "Choked again means November is flat on the new ceiling (DHSVRI8). "
-        "Tx Total BW is not used. "
+        f"Solved: {sum(1 for row in rows if row['finding'] == FINDING_SOLVED)}    ·    "
+        "October was choked: flat ceiling, peak against Tx BW (DHUTTM5 / DHRMN65), "
+        "peak below Tx BW (GPSRPM9), or a steady peak above Tx BW (NGSNG78). "
+        "A jagged spike above Tx BW is left out. "
         f"Data BusyHour 1H impact, {new_lbl} versus {prev_lbl}: "
         "Improved when the latest value is higher.",
         styles["subtitle"],
