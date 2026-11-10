@@ -2,11 +2,12 @@
 """Management PPT: one slide per site for comparison_v1 findings.
 
 Pre window is 5–7 Oct. Post window is 6–8 Nov. Each finding category
-contributes up to five sites:
+contributes up to five sites, then those slides are ordered by the
+daytime throughput step, largest first:
 
-1–2  throughput and data volume both improved significantly
-3–4  throughput improved significantly, data volume held or rose only a little
-5    a smaller gain, with neither KPI down
+- throughput and data volume both improved significantly
+- throughput improved significantly, data volume held or rose only a little
+- a smaller gain, with neither KPI down
 
 Sites where both throughput and data volume fell are left out.
 """
@@ -33,7 +34,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v5.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v6.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -218,6 +219,14 @@ def select_sites(rows: list[dict], profiles: dict[str, dict]) -> list[dict]:
             for site in options[:quota]:
                 chosen.append(site)
                 used.add(site["site"])
+        # Largest visible daytime throughput step first, in every category.
+        chosen.sort(
+            key=lambda site: (
+                site["busy_tp_delta"] if np.isfinite(site["busy_tp_delta"]) else -1e9,
+                site["busy_tp_pct"] if np.isfinite(site["busy_tp_pct"]) else -1e9,
+            ),
+            reverse=True,
+        )
         for index, site in enumerate(chosen, start=1):
             site["pick_index"] = index
             site["pick_total"] = len(chosen)
@@ -413,20 +422,39 @@ def _daily_peak_low(tp: np.ndarray) -> tuple[float, float]:
     return peak, low
 
 
-def _guide(ax, xspan: np.ndarray, level: float, color: str, style: str):
+def _guide(ax, xspan: np.ndarray, level: float, color: str, style: str, width: float = 1.3):
     if not np.isfinite(level) or xspan.size == 0:
         return None
     line, = ax.plot(
-        xspan, np.full(xspan.size, level), color=color, linewidth=1.3, linestyle=style, zorder=4,
+        xspan,
+        np.full(xspan.size, level),
+        color=color,
+        linewidth=width,
+        linestyle=style,
+        zorder=4,
     )
     return line
 
 
-def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
-    """Hourly throughput, volume bars, and pre/post peak and low guides.
+def _evening_volume_mean(vol: np.ndarray) -> float:
+    """Mean data volume at 20:00, 21:00, 22:00 and 23:00 across this window."""
+    picked = []
+    for day in range(vol.size // 24):
+        chunk = vol[day * 24 : (day + 1) * 24]
+        for hour in (20, 21, 22, 23):
+            value = chunk[hour]
+            if np.isfinite(value):
+                picked.append(float(value))
+    return float(np.mean(picked)) if picked else float("nan")
 
-    Each guide is the mean of that window's daily peaks or daily lows, drawn
-    only across its own days. The pre and post daytime levels stay as a note.
+
+def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
+    """Hourly throughput, volume bars, and pre/post guides.
+
+    Throughput guides are the mean daily peak and the mean daily low, each
+    drawn only across its own days. Data volume has one mean line per window,
+    the average of hours 20–23. The pre and post daytime throughput levels
+    stay as a note.
     """
     fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
     x = np.arange(len(tp))
@@ -440,6 +468,10 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     _guide(ax, x[72:], post_peak, "#203864", "--")
     _guide(ax, x[:72], pre_low, "#7F7F7F", "--")
     _guide(ax, x[72:], post_low, "#000000", "--")
+    # One volume average per window: mean of 20:00–23:00, not a peak and a low.
+    # Darker than the bars so the line stays readable on top of them.
+    _guide(ax2, x[:72], _evening_volume_mean(vol[:72]), "#843C0C", "--", 1.8)
+    _guide(ax2, x[72:], _evening_volume_mean(vol[72:]), "#5C2E0A", "--", 1.8)
     levels = [value for value in (pre_peak, post_peak, pre_low, post_low) if np.isfinite(value)]
     tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
     vol_min, vol_max = _sharp_limits(vol)
