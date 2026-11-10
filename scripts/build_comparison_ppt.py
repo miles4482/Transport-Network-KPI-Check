@@ -34,7 +34,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v8.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v9.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -467,13 +467,13 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     pre_peak, pre_low = _daily_peak_low(tp[:72])
     post_peak, post_low = _daily_peak_low(tp[72:])
     guides = (
-        (_guide(ax, x[:72], pre_peak, "#548235", "--"), "TP peak pre"),
-        (_guide(ax, x[72:], post_peak, "#203864", "--"), "TP peak post"),
-        (_guide(ax, x[:72], pre_low, "#7F7F7F", "--"), "TP low pre"),
-        (_guide(ax, x[72:], post_low, "#000000", "--"), "TP low post"),
-        # One volume average per window: mean of 20:00–23:00, not a peak and a low.
-        (_guide(ax2, x[:72], _evening_volume_mean(vol[:72]), "#843C0C", (0, (6, 2)), 1.8), "Vol 20–23 pre"),
-        (_guide(ax2, x[72:], _evening_volume_mean(vol[72:]), "#C65911", (0, (1, 1)), 2.0), "Vol 20–23 post"),
+        (_guide(ax, x[:72], pre_peak, "#548235", "--", 1.6), "TP peak pre"),
+        (_guide(ax, x[72:], post_peak, "#203864", "--", 1.6), "TP peak post"),
+        (_guide(ax, x[:72], pre_low, "#7F7F7F", ":", 1.6), "TP low pre"),
+        (_guide(ax, x[72:], post_low, "#000000", ":", 1.6), "TP low post"),
+        # Volume average of hours 20–23. Purple, not orange, so it is not the bars.
+        (_guide(ax2, x[:72], _evening_volume_mean(vol[:72]), "#7030A0", "-.", 2.0), "Vol 20–23 pre"),
+        (_guide(ax2, x[72:], _evening_volume_mean(vol[72:]), "#C00000", "-.", 2.0), "Vol 20–23 post"),
     )
     levels = [value for value in (pre_peak, post_peak, pre_low, post_low) if np.isfinite(value)]
     tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
@@ -506,11 +506,11 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
         bbox_to_anchor=(0.08, 0.955),
         ncol=4,
         frameon=False,
-        fontsize=6.5,
+        fontsize=7.5,
         borderaxespad=0,
-        columnspacing=0.9,
-        handlelength=1.7,
-        handletextpad=0.35,
+        columnspacing=1.0,
+        handlelength=2.2,
+        handletextpad=0.4,
     )
     fig.subplots_adjust(left=0.10, right=0.90, top=0.74, bottom=0.18)
     fig.savefig(path, dpi=140)
@@ -761,25 +761,37 @@ def _set_cell_border(cell, color: str = "D0D7E2", width_pt: float = 0.75) -> Non
         tc_pr.append(line)
 
 
+def _summary_card(slide, left, top, width, height, fill, title, value, note) -> None:
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height)
+    )
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor.from_string(fill)
+    shape.line.color.rgb = RGBColor.from_string("D0D7E2")
+    frame = shape.text_frame
+    frame.word_wrap = True
+    frame.margin_left = Inches(0.16)
+    frame.margin_right = Inches(0.12)
+    frame.margin_top = Inches(0.10)
+    value_run = frame.paragraphs[0]
+    _set_run(value_run, value, 28, RGBColor.from_string("1F4E79"), True)
+    title_run = frame.add_paragraph()
+    title_run.space_before = Pt(2)
+    _set_run(title_run, title, 13, RGBColor.from_string("1F4E79"), True)
+    note_run = frame.add_paragraph()
+    note_run.space_before = Pt(1)
+    _set_run(note_run, note, 12, RGBColor.from_string("595959"), False)
+
+
 def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> None:
-    """Ranked table: finding, then sites from the largest daytime step down."""
+    """One row per site, with the Tx bandwidth result in its own column."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     ink = RGBColor(0x33, 0x33, 0x33)
-    grey = RGBColor(0x60, 0x60, 0x60)
     white = RGBColor(0xFF, 0xFF, 0xFF)
-    readings = {
-        fege.FINDING_UP_CHOKED: "Tx total BW stepped up. Newly choked on 6–8 Nov.",
-        fege.FINDING_SOLVED_UP: "Tx total BW stepped up. Off the choke list.",
-        fege.FINDING_UP: "Tx total BW stepped up. Not choked in either window.",
-        fege.FINDING_AGAIN: "Tx total BW stepped up. Still choked.",
-        fege.FINDING_SOLVED: "Off the choke list. Tx total BW did not increase.",
-    }
-    rows = []
-    for finding in CATEGORY_ORDER:
-        sites = [site for site in selected if site["finding"] == finding]
-        if sites:
-            rows.append((finding, sites))
+    green = RGBColor(0x37, 0x56, 0x23)
+    stepped = [site for site in selected if site.get("bw_up")]
+    held = [site for site in selected if not site.get("bw_up")]
 
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.62))
     bar.fill.solid()
@@ -788,110 +800,90 @@ def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> N
     title = slide.shapes.add_textbox(Inches(0.32), Inches(0.10), Inches(10.5), Inches(0.42))
     _set_run(title.text_frame.paragraphs[0], "Management summary", 26, white, True)
 
-    intro = slide.shapes.add_textbox(Inches(0.32), Inches(0.72), Inches(12.7), Inches(0.36))
-    intro.text_frame.word_wrap = True
-    _set_run(
-        intro.text_frame.paragraphs[0],
-        "Pre 5–7 Oct versus post 6–8 Nov. Tx BW increased means Tx total BW stepped up. Sites run from the largest daytime throughput step.",
-        14,
-        navy,
-        False,
+    _summary_card(
+        slide, 0.28, 0.78, 6.20, 1.15, "E2EFDA",
+        "Tx total BW stepped up",
+        str(len(stepped)),
+        "VS.FEGE.TxTotalBW rose. These are the real bandwidth increases.",
+    )
+    _summary_card(
+        slide, 6.64, 0.78, 6.42, 1.15, "F7F9FB",
+        "Throughput rose, Tx BW did not",
+        str(len(held)),
+        "RxMaxSpeed can rise while Tx total BW stays flat.",
     )
 
-    row_heights = [0.36]
-    for _, sites in rows:
-        row_heights.append(0.18 + 0.22 * len(sites))
-    table_height = sum(row_heights)
+    headers = ("#", "Site", "Finding", "Daytime throughput", "Tx total BW")
+    widths = (0.55, 1.55, 3.70, 3.55, 3.43)
+    header_h = 0.38
+    body_h = min(0.52, (4.55 - header_h) / max(len(selected), 1))
+    table_top = 2.12
+    table_h = header_h + body_h * len(selected)
     table_shape = slide.shapes.add_table(
-        1 + len(rows), 3, Inches(0.28), Inches(1.16), Inches(12.78), Inches(table_height)
+        1 + len(selected), 5, Inches(0.28), Inches(table_top), Inches(12.78), Inches(table_h)
     )
     table = table_shape.table
-    table.columns[0].width = Inches(0.62)
-    table.columns[1].width = Inches(4.35)
-    table.columns[2].width = Inches(7.81)
+    for index, width in enumerate(widths):
+        table.columns[index].width = Inches(width)
     tbl_pr = table._tbl.tblPr
     if tbl_pr is not None:
         tbl_pr.set("bandRow", "0")
         tbl_pr.set("firstRow", "0")
 
-    headers = ("#", "Finding", "Sites — largest daytime gain first")
     for col, text in enumerate(headers):
         cell = table.cell(0, col)
         _set_cell_fill(cell, "1F4E79")
-        _set_cell_border(cell, "1F4E79", 0.75)
+        _set_cell_border(cell, "1F4E79", 0.6)
         cell.margin_left = Inches(0.08)
         cell.margin_right = Inches(0.06)
-        cell.margin_top = Inches(0.04)
-        cell.margin_bottom = Inches(0.04)
         cell.vertical_anchor = MSO_ANCHOR.MIDDLE
         paragraph = cell.text_frame.paragraphs[0]
         paragraph.alignment = PP_ALIGN.CENTER if col == 0 else PP_ALIGN.LEFT
         _set_run(paragraph, text, 12, white, True)
+    table.rows[0].height = Inches(header_h)
 
-    for index, ((finding, sites), height) in enumerate(zip(rows, row_heights[1:]), start=1):
-        table.rows[index].height = Inches(height)
-        rank = table.cell(index, 0)
-        name = table.cell(index, 1)
-        detail = table.cell(index, 2)
-        fill = "F7F9FB" if index % 2 else "FFFFFF"
-        for cell in (rank, name, detail):
-            _set_cell_fill(cell, "E8EEF4" if cell is rank else fill)
-            _set_cell_border(cell, "D0D7E2", 0.6)
+    for index, site in enumerate(selected, start=1):
+        table.rows[index].height = Inches(body_h)
+        tx0, tx1 = _num(site.get("prev_tx")), _num(site.get("latest_tx"))
+        rose = np.isfinite(tx0) and np.isfinite(tx1) and tx1 > tx0 + 1
+        values = (
+            str(index),
+            site["site"],
+            site["finding"],
+            f"{site['busy_tp0']:.1f} → {site['busy_tp1']:.1f}    ({site['busy_tp_delta']:+.1f})",
+            f"{tx0:.0f} → {tx1:.0f}" if np.isfinite(tx0) and np.isfinite(tx1) else "",
+        )
+        zebra = "F7F9FB" if index % 2 else "FFFFFF"
+        for col, text in enumerate(values):
+            cell = table.cell(index, col)
+            if col == 4 and rose:
+                _set_cell_fill(cell, "E2EFDA")
+            elif col == 4:
+                _set_cell_fill(cell, "FCE4D6")
+            else:
+                _set_cell_fill(cell, zebra)
+            _set_cell_border(cell, "D0D7E2", 0.5)
             cell.margin_left = Inches(0.08)
-            cell.margin_right = Inches(0.08)
-            cell.margin_top = Inches(0.05)
-            cell.margin_bottom = Inches(0.04)
+            cell.margin_right = Inches(0.06)
             cell.vertical_anchor = MSO_ANCHOR.MIDDLE
-            cell.text_frame.word_wrap = True
-        rank_p = rank.text_frame.paragraphs[0]
-        rank_p.alignment = PP_ALIGN.CENTER
-        _set_run(rank_p, str(index), 18, navy, True)
+            cell.text_frame.word_wrap = False
+            paragraph = cell.text_frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.CENTER if col == 0 else PP_ALIGN.LEFT
+            color = green if col == 4 and rose else (ink if col != 4 else RGBColor(0xC6, 0x59, 0x11))
+            _set_run(paragraph, text, 13 if col == 1 else 12, navy if col in (0, 1) else color, col in (1, 4))
 
-        name_p = name.text_frame.paragraphs[0]
-        name_p.space_after = Pt(1)
-        _set_run(name_p, finding, 13, navy, True)
-        meaning = name.text_frame.add_paragraph()
-        meaning.space_before = Pt(1)
-        _set_run(meaning, readings[finding], 11, grey, False)
-        count = name.text_frame.add_paragraph()
-        count.space_before = Pt(2)
-        label = f"{len(sites)} site" + ("s" if len(sites) != 1 else "")
-        _set_run(count, label, 11, ink, False)
-
-        for site_index, site in enumerate(sites):
-            paragraph = detail.text_frame.paragraphs[0] if site_index == 0 else detail.text_frame.add_paragraph()
-            paragraph.space_after = Pt(0)
-            paragraph.space_before = Pt(0)
-            _set_run(paragraph, site["site"], 12, navy, True)
-            tx0, tx1 = _num(site.get("prev_tx")), _num(site.get("latest_tx"))
-            tx_text = (
-                f"    Tx BW {tx0:.0f}→{tx1:.0f}"
-                if np.isfinite(tx0) and np.isfinite(tx1)
-                else ""
-            )
-            _add_run(
-                paragraph,
-                f"    {site['busy_tp0']:.1f} → {site['busy_tp1']:.1f} Mbps"
-                f"    ({site['busy_tp_delta']:+.1f}){tx_text}",
-                12,
-                ink,
-                False,
-            )
-    table.rows[0].height = Inches(row_heights[0])
-
-    foot_top = 1.16 + table_height + 0.10
-    foot = slide.shapes.add_textbox(Inches(0.32), Inches(foot_top), Inches(10.4), Inches(0.28))
+    foot = slide.shapes.add_textbox(Inches(0.32), Inches(7.05), Inches(10.4), Inches(0.28))
     _set_run(
         foot.text_frame.paragraphs[0],
-        "Daytime throughput is the 09:00–22:00 median. Tx BW increased is a step in VS.FEGE.TxTotalBW, not in RxMaxSpeed.",
-        11,
+        "Daytime throughput is the 09:00–22:00 median. Green Tx BW stepped up. Amber Tx BW did not.",
+        12,
         RGBColor(0x80, 0x80, 0x80),
         False,
     )
-    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(foot_top), Inches(1.65), Inches(0.28))
+    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.05), Inches(1.65), Inches(0.28))
     page_p = page_box.text_frame.paragraphs[0]
     page_p.alignment = PP_ALIGN.RIGHT
-    _set_run(page_p, f"1 / {pages}", 11, RGBColor(0x80, 0x80, 0x80), False)
+    _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
 
 
 def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
