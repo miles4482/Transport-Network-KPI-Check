@@ -27,14 +27,14 @@ import pandas as pd
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v6.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v7.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -464,14 +464,15 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, zorder=3)
     pre_peak, pre_low = _daily_peak_low(tp[:72])
     post_peak, post_low = _daily_peak_low(tp[72:])
-    _guide(ax, x[:72], pre_peak, "#548235", "--")
-    _guide(ax, x[72:], post_peak, "#203864", "--")
-    _guide(ax, x[:72], pre_low, "#7F7F7F", "--")
-    _guide(ax, x[72:], post_low, "#000000", "--")
-    # One volume average per window: mean of 20:00–23:00, not a peak and a low.
-    # Darker than the bars so the line stays readable on top of them.
-    _guide(ax2, x[:72], _evening_volume_mean(vol[:72]), "#843C0C", "--", 1.8)
-    _guide(ax2, x[72:], _evening_volume_mean(vol[72:]), "#5C2E0A", "--", 1.8)
+    guides = (
+        (_guide(ax, x[:72], pre_peak, "#548235", "--"), "TP peak pre"),
+        (_guide(ax, x[72:], post_peak, "#203864", "--"), "TP peak post"),
+        (_guide(ax, x[:72], pre_low, "#7F7F7F", "--"), "TP low pre"),
+        (_guide(ax, x[72:], post_low, "#000000", "--"), "TP low post"),
+        # One volume average per window: mean of 20:00–23:00, not a peak and a low.
+        (_guide(ax2, x[:72], _evening_volume_mean(vol[:72]), "#843C0C", (0, (6, 2)), 1.8), "Vol 20–23 pre"),
+        (_guide(ax2, x[72:], _evening_volume_mean(vol[72:]), "#C65911", (0, (1, 1)), 2.0), "Vol 20–23 post"),
+    )
     levels = [value for value in (pre_peak, post_peak, pre_low, post_low) if np.isfinite(value)]
     tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
     vol_min, vol_max = _sharp_limits(vol)
@@ -490,19 +491,26 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
         note.append(f"Post {post_level:.1f} Mbps")
     if note:
         fig.text(0.98, 0.985, "    ".join(note), ha="right", va="top", fontsize=8, color=GREY)
+    handles = [line_tp, bars]
+    labels = ["Throughput", "Data volume"]
+    for line, label in guides:
+        if line is not None:
+            handles.append(line)
+            labels.append(label)
     fig.legend(
-        [line_tp, bars],
-        ["Throughput", "Data volume"],
+        handles,
+        labels,
         loc="upper left",
-        bbox_to_anchor=(0.10, 0.95),
-        ncol=2,
+        bbox_to_anchor=(0.08, 0.955),
+        ncol=4,
         frameon=False,
-        fontsize=8,
+        fontsize=6.5,
         borderaxespad=0,
-        columnspacing=1.2,
-        handlelength=1.8,
+        columnspacing=0.9,
+        handlelength=1.7,
+        handletextpad=0.35,
     )
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.86, bottom=0.18)
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.74, bottom=0.18)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -599,10 +607,7 @@ def _sentence(site: dict) -> list[str]:
     return [lead, ceiling, tp, vol, choke]
 
 
-def _set_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = False) -> None:
-    paragraph.clear()
-    run = paragraph.add_run()
-    run.text = text
+def _style_run(run, size: int, color: RGBColor, bold: bool) -> None:
     run.font.name = "Calibri"
     run.font.size = Pt(size)
     run.font.bold = bold
@@ -615,6 +620,19 @@ def _set_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = Fals
             node = rpr.makeelement(qn(f"a:{tag}"), {})
             rpr.append(node)
         node.set("typeface", "Calibri")
+
+
+def _set_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = False) -> None:
+    paragraph.clear()
+    run = paragraph.add_run()
+    run.text = text
+    _style_run(run, size, color, bold)
+
+
+def _add_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = False) -> None:
+    run = paragraph.add_run()
+    run.text = text
+    _style_run(run, size, color, bold)
 
 
 def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page: int, pages: int) -> None:
@@ -709,123 +727,157 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page
     _set_run(pp, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
 
 
-def _join_sites(sites: list[dict]) -> str:
-    names = [site["site"] for site in sites]
-    if len(names) <= 1:
-        return names[0] if names else ""
-    if len(names) == 2:
-        return f"{names[0]} and {names[1]}"
-    return ", ".join(names[:-1]) + " and " + names[-1]
+def _set_cell_fill(cell, hex_color: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    for child in list(tc_pr):
+        if child.tag == qn("a:solidFill"):
+            tc_pr.remove(child)
+    solid = tc_pr.makeelement(qn("a:solidFill"), {})
+    solid.append(solid.makeelement(qn("a:srgbClr"), {"val": hex_color}))
+    tc_pr.append(solid)
 
 
-def _summary_blocks(selected: list[dict]) -> list[tuple[str, str]]:
-    """One heading and one observation for each finding that has slides."""
-    leads = {
-        fege.FINDING_SOLVED_UP: (
-            "Choked on 5–7 Oct, the Tx ceiling stepped up, and the port is off the choke list on 6–8 Nov."
-        ),
-        fege.FINDING_UP: (
-            "The Tx ceiling stepped up. The port was not choked in either window."
-        ),
-        fege.FINDING_AGAIN: (
-            "The Tx ceiling stepped up and the port is still choked, so the gain is already on the new ceiling."
-        ),
-        fege.FINDING_UP_CHOKED: (
-            "The Tx ceiling stepped up and the port is newly choked on 6–8 Nov."
-        ),
-        fege.FINDING_SOLVED: (
-            "Off the choke list without a ceiling step-up, so this gain is not from a Tx BW increase."
-        ),
-    }
-    blocks = []
-    for finding in CATEGORY_ORDER:
-        sites = [site for site in selected if site["finding"] == finding]
-        if not sites:
-            continue
-        both = [site for site in sites if site["bucket"] == BUCKET_BOTH]
-        hold = [site for site in sites if site["bucket"] == BUCKET_HOLD]
-        small = [site for site in sites if site["bucket"] == BUCKET_SMALL]
-        parts = [leads[finding]]
-        if both:
-            shown = []
-            for site in both:
-                metrics = site["metrics"]
-                shown.append(
-                    f"{site['site']} ({metrics['tp_pct']:+.0f}% throughput, {metrics['vol_pct']:+.0f}% volume)"
-                )
-            parts.append("Both rose at " + " and ".join(shown) + ".")
-        if hold:
-            parts.append(f"Throughput rose and volume held at {_join_sites(hold)}.")
-        if small:
-            site = small[0]
-            metrics = site["metrics"]
-            parts.append(
-                f"{site['site']} is a smaller gain ({metrics['tp_pct']:+.0f}% throughput) and volume did not fall."
-            )
-        heading = f"{finding}   ·   {len(sites)} site" + ("s" if len(sites) != 1 else "")
-        blocks.append((heading, " ".join(parts)))
-    return blocks
+def _set_cell_border(cell, color: str = "D0D7E2", width_pt: float = 0.75) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    width = str(int(width_pt * 12700))
+    for edge in ("lnL", "lnR", "lnT", "lnB"):
+        for child in list(tc_pr):
+            if child.tag == qn(f"a:{edge}"):
+                tc_pr.remove(child)
+        line = tc_pr.makeelement(
+            qn(f"a:{edge}"), {"w": width, "cap": "flat", "cmpd": "sng", "algn": "ctr"}
+        )
+        fill = line.makeelement(qn("a:solidFill"), {})
+        fill.append(fill.makeelement(qn("a:srgbClr"), {"val": color}))
+        line.append(fill)
+        tc_pr.append(line)
 
 
 def _add_summary_slide(prs: Presentation, selected: list[dict], pages: int) -> None:
+    """Ranked table: finding, then sites from the largest daytime step down."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     ink = RGBColor(0x33, 0x33, 0x33)
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.72))
+    grey = RGBColor(0x60, 0x60, 0x60)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    readings = {
+        fege.FINDING_UP_CHOKED: "Ceiling stepped up. Newly choked on 6–8 Nov.",
+        fege.FINDING_SOLVED_UP: "Ceiling stepped up. Off the choke list.",
+        fege.FINDING_UP: "Ceiling stepped up. Not choked in either window.",
+        fege.FINDING_AGAIN: "Still choked. The gain is on the new ceiling.",
+        fege.FINDING_SOLVED: "Off the choke list. No Tx BW step-up.",
+    }
+    rows = []
+    for finding in CATEGORY_ORDER:
+        sites = [site for site in selected if site["finding"] == finding]
+        if sites:
+            rows.append((finding, sites))
+
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.62))
     bar.fill.solid()
     bar.fill.fore_color.rgb = navy
     bar.line.fill.background()
-    title = slide.shapes.add_textbox(Inches(0.32), Inches(0.14), Inches(10.5), Inches(0.46))
-    _set_run(title.text_frame.paragraphs[0], "Management summary", 26, RGBColor(0xFF, 0xFF, 0xFF), True)
+    title = slide.shapes.add_textbox(Inches(0.32), Inches(0.10), Inches(10.5), Inches(0.42))
+    _set_run(title.text_frame.paragraphs[0], "Management summary", 26, white, True)
 
-    intro = slide.shapes.add_textbox(Inches(0.32), Inches(0.84), Inches(12.7), Inches(0.48))
-    intro.text_frame.word_wrap = True
+    intro = slide.shapes.add_textbox(Inches(0.32), Inches(0.72), Inches(12.7), Inches(0.36))
+    intro.text_frame.word_wrap = False
     _set_run(
         intro.text_frame.paragraphs[0],
-        "Pre 5–7 Oct versus post 6–8 Nov. Where the Tx ceiling stepped up, throughput is higher. "
-        "Data volume rising or holding is an acceptable result. Each following page is one site.",
+        "Pre 5–7 Oct versus post 6–8 Nov. Sites in each row run from the largest daytime throughput step to the smallest.",
         14,
         navy,
         False,
     )
 
-    blocks = _summary_blocks(selected)
-    top = 1.40
-    height = 1.05
-    gap = 0.08
-    for index, (heading, body) in enumerate(blocks):
-        y = top + index * (height + gap)
-        shape = slide.shapes.add_shape(
-            MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.28), Inches(y), Inches(12.78), Inches(height)
-        )
-        shape.fill.solid()
-        shape.fill.fore_color.rgb = RGBColor(0xF7, 0xF9, 0xFB)
-        shape.line.color.rgb = RGBColor(0xD0, 0xD7, 0xE2)
-        frame = shape.text_frame
-        frame.word_wrap = True
-        frame.margin_left = Inches(0.14)
-        frame.margin_right = Inches(0.12)
-        frame.margin_top = Inches(0.06)
-        frame.margin_bottom = Inches(0.04)
-        head = frame.paragraphs[0]
-        head.space_after = Pt(2)
-        _set_run(head, heading, 14, navy, True)
-        paragraph = frame.add_paragraph()
-        paragraph.space_after = Pt(0)
-        _set_run(paragraph, body, 12, ink, False)
+    row_heights = [0.36]
+    for _, sites in rows:
+        row_heights.append(0.18 + 0.22 * len(sites))
+    table_height = sum(row_heights)
+    table_shape = slide.shapes.add_table(
+        1 + len(rows), 3, Inches(0.28), Inches(1.16), Inches(12.78), Inches(table_height)
+    )
+    table = table_shape.table
+    table.columns[0].width = Inches(0.62)
+    table.columns[1].width = Inches(4.35)
+    table.columns[2].width = Inches(7.81)
+    tbl_pr = table._tbl.tblPr
+    if tbl_pr is not None:
+        tbl_pr.set("bandRow", "0")
+        tbl_pr.set("firstRow", "0")
 
-    foot = slide.shapes.add_textbox(Inches(0.32), Inches(7.18), Inches(10.2), Inches(0.26))
+    headers = ("#", "Finding", "Sites — largest daytime gain first")
+    for col, text in enumerate(headers):
+        cell = table.cell(0, col)
+        _set_cell_fill(cell, "1F4E79")
+        _set_cell_border(cell, "1F4E79", 0.75)
+        cell.margin_left = Inches(0.08)
+        cell.margin_right = Inches(0.06)
+        cell.margin_top = Inches(0.04)
+        cell.margin_bottom = Inches(0.04)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        paragraph = cell.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER if col == 0 else PP_ALIGN.LEFT
+        _set_run(paragraph, text, 12, white, True)
+
+    for index, ((finding, sites), height) in enumerate(zip(rows, row_heights[1:]), start=1):
+        table.rows[index].height = Inches(height)
+        rank = table.cell(index, 0)
+        name = table.cell(index, 1)
+        detail = table.cell(index, 2)
+        fill = "F7F9FB" if index % 2 else "FFFFFF"
+        for cell in (rank, name, detail):
+            _set_cell_fill(cell, "E8EEF4" if cell is rank else fill)
+            _set_cell_border(cell, "D0D7E2", 0.6)
+            cell.margin_left = Inches(0.08)
+            cell.margin_right = Inches(0.08)
+            cell.margin_top = Inches(0.05)
+            cell.margin_bottom = Inches(0.04)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.text_frame.word_wrap = True
+        rank_p = rank.text_frame.paragraphs[0]
+        rank_p.alignment = PP_ALIGN.CENTER
+        _set_run(rank_p, str(index), 18, navy, True)
+
+        name_p = name.text_frame.paragraphs[0]
+        name_p.space_after = Pt(1)
+        _set_run(name_p, finding, 13, navy, True)
+        meaning = name.text_frame.add_paragraph()
+        meaning.space_before = Pt(1)
+        _set_run(meaning, readings[finding], 11, grey, False)
+        count = name.text_frame.add_paragraph()
+        count.space_before = Pt(2)
+        label = f"{len(sites)} site" + ("s" if len(sites) != 1 else "")
+        _set_run(count, label, 11, ink, False)
+
+        for site_index, site in enumerate(sites):
+            paragraph = detail.text_frame.paragraphs[0] if site_index == 0 else detail.text_frame.add_paragraph()
+            paragraph.space_after = Pt(0)
+            paragraph.space_before = Pt(0)
+            _set_run(paragraph, site["site"], 12, navy, True)
+            _add_run(
+                paragraph,
+                f"    {site['busy_tp0']:.1f} → {site['busy_tp1']:.1f} Mbps"
+                f"    ({site['busy_tp_delta']:+.1f})",
+                12,
+                ink,
+                False,
+            )
+    table.rows[0].height = Inches(row_heights[0])
+
+    foot_top = 1.16 + table_height + 0.10
+    foot = slide.shapes.add_textbox(Inches(0.32), Inches(foot_top), Inches(10.4), Inches(0.28))
     _set_run(
         foot.text_frame.paragraphs[0],
-        "Data BusyHour 1H    ·    Throughput up at least 1 Mbps and 10% is a significant gain",
-        10,
+        "Daytime throughput is the 09:00–22:00 median. The following pages are one site each, in this order.",
+        11,
         RGBColor(0x80, 0x80, 0x80),
         False,
     )
-    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.18), Inches(1.65), Inches(0.26))
-    paragraph = page_box.text_frame.paragraphs[0]
-    paragraph.alignment = PP_ALIGN.RIGHT
-    _set_run(paragraph, f"1 / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
+    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(foot_top), Inches(1.65), Inches(0.28))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"1 / {pages}", 11, RGBColor(0x80, 0x80, 0x80), False)
 
 
 def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
