@@ -33,7 +33,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v2.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -397,14 +397,31 @@ def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_
     plt.close(fig)
 
 
-def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray) -> None:
+def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
+    """Hourly throughput, bars for data volume, and two level lines for the impact.
+
+    The dashed lines are the 09:00–22:00 median before and after, drawn across
+    the whole window so the pre versus post step can be read off the gap.
+    """
     fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
     x = np.arange(len(tp))
     _style_time_axis(ax, len(tp))
     ax2 = ax.twinx()
-    line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.8, label="Throughput", zorder=3)
-    line_vol, = ax2.plot(x, vol, color="#C65911", linewidth=1.8, label="Data volume", zorder=3)
-    tp_min, tp_max = _sharp_limits(tp)
+    ax2.bar(x, vol, width=0.85, color="#C65911", alpha=0.45, zorder=1, label="Data volume")
+    line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, label="Throughput", zorder=3)
+    pre_line = post_line = None
+    if np.isfinite(pre_level):
+        pre_line, = ax.plot(
+            x, np.full(len(x), pre_level), color="#5B9BD5", linewidth=1.3, linestyle="--",
+            label=f"Pre {pre_level:.1f} Mbps", zorder=4,
+        )
+    if np.isfinite(post_level):
+        post_line, = ax.plot(
+            x, np.full(len(x), post_level), color="#548235", linewidth=1.3, linestyle="--",
+            label=f"Post {post_level:.1f} Mbps", zorder=4,
+        )
+    levels = [value for value in (pre_level, post_level) if np.isfinite(value)]
+    tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
     vol_min, vol_max = _sharp_limits(vol)
     ax.set_ylim(tp_min, tp_max)
     ax2.set_ylim(vol_min, vol_max)
@@ -414,17 +431,27 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray) -> None:
     ax2.tick_params(axis="y", labelsize=8, colors="#C65911")
     ax2.spines["right"].set_color("#C65911")
     fig.text(0.09, 0.98, "OSS throughput and data volume", ha="left", va="top", fontsize=12, color=NAVY, fontweight="bold")
+    handles = [line_tp]
+    labels = ["Throughput"]
+    if pre_line is not None:
+        handles.append(pre_line)
+        labels.append(f"Pre {pre_level:.1f} Mbps")
+    if post_line is not None:
+        handles.append(post_line)
+        labels.append(f"Post {post_level:.1f} Mbps")
+    handles.append(ax2.containers[0])
+    labels.append("Data volume")
     ax.legend(
-        [line_tp, line_vol],
-        ["Throughput", "Data volume"],
+        handles,
+        labels,
         loc="lower left",
         bbox_to_anchor=(0.0, 1.02),
         ncol=2,
         frameon=False,
-        fontsize=8,
+        fontsize=7.5,
         borderaxespad=0,
     )
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.74, bottom=0.22)
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.68, bottom=0.22)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -818,6 +845,8 @@ def main() -> None:
             oss_png,
             _concat(pre_oss[name]["tp"], post_oss[name]["tp"]),
             _concat(pre_oss[name]["vol"], post_oss[name]["vol"]),
+            site["busy_tp0"],
+            site["busy_tp1"],
         )
         _add_slide(prs, site, feg_png, oss_png, page, pages)
         print(f"  slide {page}/{pages} {name}", flush=True)
