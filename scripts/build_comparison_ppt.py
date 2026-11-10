@@ -32,7 +32,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v17.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v18.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -1114,15 +1114,22 @@ def _draw_trend_chart(
         ax.set_ylim(0, max(finite_bars) * 1.22)
     elif len(finite_bars):
         low, high = float(np.min(finite_bars)), float(np.max(finite_bars))
-        pad = max((high - low) * 0.45, 1.0)
-        ax.set_ylim(low - pad, high + pad)
+        if pre_on == "bar" and np.isfinite(pre_value):
+            low, high = min(low, pre_value), max(high, pre_value)
+        span = max(high - low, 1.0)
+        # Keep the floor well under the shortest bar so the column is not clipped.
+        ax.set_ylim(max(0.0, low - max(span * 1.4, 8.0)), high + span * 0.45)
     finite_line = line_values[np.isfinite(line_values)]
     if len(finite_line):
         low, high = float(np.min(finite_line)), float(np.max(finite_line))
         if pre_on == "line" and np.isfinite(pre_value):
             low, high = min(low, pre_value), max(high, pre_value)
-        pad = max((high - low) * 0.3, 0.4)
-        ax2.set_ylim(low - pad, high + pad)
+        if pre_on == "line":
+            # User throughput starts at zero, so the line sits clear of the axis.
+            ax2.set_ylim(0, high * 1.18 if high > 0 else 1)
+        else:
+            span = max(high - low, 0.5)
+            ax2.set_ylim(max(0.0, low - max(span * 1.6, 6.0)), high + span * 0.55)
     span_days = max((dates[-1] - dates[0]).days, 1) if len(dates) else 1
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=4 if span_days < 40 else 7))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
