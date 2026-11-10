@@ -32,7 +32,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v18.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v19.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -803,8 +803,27 @@ def _category_brief(rows: list[dict], profiles: dict[str, dict], finding: str) -
     }
 
 
-def _summary_box(slide, left: float, top: float, width: float, height: float, title: str, story: str, brief: dict) -> None:
-    """One rounded finding box, in the open layout from the summary sketch."""
+def _chart_delta(group: dict, frame_key: str, column: str) -> float:
+    """Post minus pre on the combined chart for one category."""
+    before = _window_mean(group[frame_key], TREND_PRE, column)
+    after = _window_mean(group[frame_key], TREND_POST, column)
+    if not (np.isfinite(before) and np.isfinite(after)):
+        return float("nan")
+    return after - before
+
+
+def _summary_box(
+    slide,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    title: str,
+    story: str,
+    brief: dict,
+    trend: dict | None,
+) -> None:
+    """One rounded finding box: median gain, then the combined-chart change."""
     card = slide.shapes.add_shape(
         MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height)
     )
@@ -813,21 +832,48 @@ def _summary_box(slide, left: float, top: float, width: float, height: float, ti
     card.line.color.rgb = RGBColor(0x8F, 0xA8, 0xC4)
     card.line.width = Pt(1.25)
     body = slide.shapes.add_textbox(
-        Inches(left + 0.28), Inches(top + 0.18), Inches(width - 0.52), Inches(height - 0.32)
+        Inches(left + 0.22), Inches(top + 0.10), Inches(width - 0.40), Inches(height - 0.18)
     )
     frame = body.text_frame
     frame.word_wrap = True
-    _set_run(frame.paragraphs[0], title, 18, RGBColor(0x1F, 0x4E, 0x79), True)
-    lines = (
-        (story, False, 12),
-        (f"Throughput, 24h avg    {_signed(brief['tp24'], 'Mbps', 1)}", False, 14),
-        (f"Throughput, 20–22    {_signed(brief['tp_bh'], 'Mbps', 1)}", False, 14),
-        (f"Data volume, 24h avg    {_signed(brief['vol24'], 'GB', 1)}", False, 14),
-        (f"Data volume, 20–22    {_signed(brief['vol_bh'], 'GB', 1)}", False, 14),
-    )
+    _set_run(frame.paragraphs[0], title, 16, RGBColor(0x1F, 0x4E, 0x79), True)
+    lines: list[tuple[str, bool, int]] = [
+        (story, False, 11),
+        (f"Throughput, 24h avg    {_signed(brief['tp24'], 'Mbps', 1)}", False, 12),
+        (f"Throughput, 20–22    {_signed(brief['tp_bh'], 'Mbps', 1)}", False, 12),
+        (f"Data volume, 24h avg    {_signed(brief['vol24'], 'GB', 1)}", False, 12),
+        (f"Data volume, 20–22    {_signed(brief['vol_bh'], 'GB', 1)}", False, 12),
+    ]
+    if trend is not None:
+        prb = _chart_delta(trend, "daily", "prb")
+        prb_text = f"{prb:+.1f} pp" if np.isfinite(prb) else "—"
+        n = len(trend["sites"])
+        lines.extend(
+            (
+                (f"Combined chart, {n} sites, 11–12 Oct to 8–9 Nov", True, 12),
+                (
+                    f"BH throughput {_signed(_chart_delta(trend, 'bh', 'tp'), 'Mbps', 1)}"
+                    f"    ·    volume {_signed(_chart_delta(trend, 'bh', 'vol'), 'GB', 0)}",
+                    False,
+                    12,
+                ),
+                (
+                    f"Daily throughput {_signed(_chart_delta(trend, 'daily', 'tp'), 'Mbps', 1)}"
+                    f"    ·    volume {_signed(_chart_delta(trend, 'daily', 'vol'), 'GB', 0)}",
+                    False,
+                    12,
+                ),
+                (
+                    f"Cell throughput {_signed(_chart_delta(trend, 'daily', 'cell'), 'Mbps', 1)}"
+                    f"    ·    DL PRB {prb_text}",
+                    False,
+                    12,
+                ),
+            )
+        )
     for text, strong, size in lines:
         paragraph = frame.add_paragraph()
-        paragraph.space_before = Pt(4)
+        paragraph.space_before = Pt(1)
         color = RGBColor(0x1F, 0x4E, 0x79) if strong else RGBColor(0x33, 0x33, 0x33)
         _set_run(paragraph, text, size, color, strong)
 
@@ -844,20 +890,21 @@ def _combined_note(rows: list[dict], profiles: dict[str, dict]) -> str:
     )
 
 
-def _summary_table(slide, left: float, top: float, width: float, briefs: list[tuple[str, dict]]) -> None:
+def _summary_table(slide, left: float, top: float, width: float, height: float, briefs: list[tuple[str, dict]]) -> None:
     """Combined count table, beside the third finding box."""
     headers = ("Finding", "Sites", "Throughput improved", "Data volume improved")
     shape = slide.shapes.add_table(
-        1 + len(briefs), 4, Inches(left), Inches(top), Inches(width), Inches(2.42)
+        1 + len(briefs), 4, Inches(left), Inches(top), Inches(width), Inches(height)
     )
     table = shape.table
-    for index, col_width in enumerate((2.20, 0.85, 1.60, 1.59)):
+    for index, col_width in enumerate((2.28, 0.84, 1.60, 1.60)):
         table.columns[index].width = Inches(col_width)
     tbl_pr = table._tbl.tblPr
     if tbl_pr is not None:
         tbl_pr.set("bandRow", "0")
         tbl_pr.set("firstRow", "0")
-    table.rows[0].height = Inches(0.58)
+    row_height = Inches(height / (1 + len(briefs)))
+    table.rows[0].height = row_height
     for col, text in enumerate(headers):
         cell = table.cell(0, col)
         _set_cell_fill(cell, "1F4E79")
@@ -869,7 +916,7 @@ def _summary_table(slide, left: float, top: float, width: float, briefs: list[tu
         paragraph.alignment = PP_ALIGN.CENTER if col else PP_ALIGN.LEFT
         _set_run(paragraph, text, 11, RGBColor(0xFF, 0xFF, 0xFF), True)
     for index, (title, brief) in enumerate(briefs, start=1):
-        table.rows[index].height = Inches(0.58)
+        table.rows[index].height = row_height
         values = (title, str(brief["n"]), f"{brief['tp_up']} of {brief['n']}", f"{brief['vol_up']} of {brief['n']}")
         for col, text in enumerate(values):
             cell = table.cell(index, col)
@@ -889,9 +936,10 @@ def _add_summary_slide(
     rows: list[dict],
     selected: list[dict],
     profiles: dict[str, dict],
+    trends: list[dict],
     pages: int,
 ) -> None:
-    """Open summary: combined daily and 20–22 gain, then three finding boxes."""
+    """Open summary: median gain, then each category's combined-chart change."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
@@ -900,40 +948,41 @@ def _add_summary_slide(
     bg.fill.fore_color.rgb = white
     bg.line.fill.background()
 
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(1.12))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.92))
     bar.fill.solid()
     bar.fill.fore_color.rgb = navy
     bar.line.fill.background()
-    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.12), Inches(12.4), Inches(0.40))
-    _set_run(title.text_frame.paragraphs[0], "Management summary", 26, white, True)
-    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.54), Inches(12.5), Inches(0.48))
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.06), Inches(12.4), Inches(0.36))
+    _set_run(title.text_frame.paragraphs[0], "Management summary", 24, white, True)
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.5), Inches(0.44))
     sub_frame = sub.text_frame
     sub_frame.word_wrap = True
-    _set_run(sub_frame.paragraphs[0], _combined_note(rows, profiles), 13, RGBColor(0xD6, 0xE3, 0xF0), False)
+    _set_run(sub_frame.paragraphs[0], _combined_note(rows, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
 
+    trend_by = {group["finding"]: group for group in trends}
     panels = (
-        (0.32, 1.38, 6.28, 2.42, fege.FINDING_AGAIN, "Choked again", "The ceiling rose, and the port is flat again on the new ceiling."),
-        (6.76, 1.38, 6.24, 2.42, fege.FINDING_SOLVED_UP, "Solved — Tx BW increased", "The ceiling rose and the port is no longer choked."),
-        (0.32, 4.00, 6.28, 2.42, fege.FINDING_SOLVED, "Solved", "Choked before, and clear now. The Rx step is under 40 Mbit/s or 12%."),
+        (0.28, 1.04, 6.32, 2.72, fege.FINDING_AGAIN, "Choked again", "The ceiling rose, and the port is flat again on the new ceiling."),
+        (6.72, 1.04, 6.32, 2.72, fege.FINDING_SOLVED_UP, "Solved — Tx BW increased", "The ceiling rose and the port is no longer choked."),
+        (0.28, 3.88, 6.32, 2.72, fege.FINDING_SOLVED, "Solved", "Choked before, and clear now."),
     )
     briefs = []
     for left, top, width, height, finding, title_text, story in panels:
         brief = _category_brief(rows, profiles, finding)
         briefs.append((title_text, brief))
-        _summary_box(slide, left, top, width, height, title_text, story, brief)
-    _summary_table(slide, 6.76, 4.00, 6.24, briefs)
+        _summary_box(slide, left, top, width, height, title_text, story, brief, trend_by.get(finding))
+    _summary_table(slide, 6.72, 3.88, 6.32, 2.72, briefs)
 
-    foot = slide.shapes.add_textbox(Inches(0.36), Inches(6.95), Inches(10.6), Inches(0.40))
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(6.68), Inches(10.7), Inches(0.58))
     foot_frame = foot.text_frame
     foot_frame.word_wrap = True
     _set_run(
         foot_frame.paragraphs[0],
-        "Median change, 6–8 Nov versus 5–7 Oct. 24h avg uses every hour. 20–22 is the mean of those three hours.",
-        12,
+        "Median lines are 6–8 Nov versus 5–7 Oct. Combined chart sums the uploaded trend sites, 11–12 Oct to 8–9 Nov.",
+        11,
         RGBColor(0x80, 0x80, 0x80),
         False,
     )
-    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(6.95), Inches(1.7), Inches(0.32))
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(6.72), Inches(1.7), Inches(0.32))
     page_p = page_box.text_frame.paragraphs[0]
     page_p.alignment = PP_ALIGN.RIGHT
     _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
@@ -1252,7 +1301,7 @@ def main() -> None:
 
     trends = _trend_groups(rows)
     pages = len(selected) + 1 + len(trends)
-    _add_summary_slide(prs, rows, selected, profiles, pages)
+    _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
         page = 2 + offset
         _add_trend_slide(prs, group, CHART_DIR, page, pages)
