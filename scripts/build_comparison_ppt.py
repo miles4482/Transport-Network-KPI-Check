@@ -33,7 +33,7 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v3.pptx")
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v4.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -412,32 +412,37 @@ def _daily_peak_low(tp: np.ndarray) -> tuple[float, float]:
     return peak, low
 
 
-def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
-    """Hourly throughput, volume bars, and two throughput guide lines.
+def _guide(ax, xspan: np.ndarray, level: float, color: str, style: str):
+    if not np.isfinite(level) or xspan.size == 0:
+        return None
+    line, = ax.plot(
+        xspan, np.full(xspan.size, level), color=color, linewidth=1.3, linestyle=style, zorder=4,
+    )
+    return line
 
-    The guides are the average daily peak and the average daily low. The
-    pre and post daytime levels stay as a note and are not drawn.
+
+def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
+    """Hourly throughput, volume bars, and pre/post peak and low guides.
+
+    Each guide is the mean of that window's daily peaks or daily lows, drawn
+    only across its own days. The pre and post daytime levels stay as a note.
     """
     fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
     x = np.arange(len(tp))
     _style_time_axis(ax, len(tp))
     ax2 = ax.twinx()
-    ax2.bar(x, vol, width=0.85, color="#C65911", alpha=0.45, zorder=1, label="Data volume")
-    line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, label="Throughput", zorder=3)
-    avg_peak, avg_low = _daily_peak_low(tp)
-    peak_line = low_line = None
-    if np.isfinite(avg_peak):
-        peak_line, = ax.plot(
-            x, np.full(len(x), avg_peak), color="#548235", linewidth=1.3, linestyle="--",
-            label=f"Avg peak {avg_peak:.1f}", zorder=4,
-        )
-    if np.isfinite(avg_low):
-        low_line, = ax.plot(
-            x, np.full(len(x), avg_low), color="#595959", linewidth=1.3, linestyle="--",
-            label=f"Avg low {avg_low:.1f}", zorder=4,
-        )
-    guides = [value for value in (avg_peak, avg_low) if np.isfinite(value)]
-    tp_min, tp_max = _sharp_limits(np.concatenate([tp, guides]) if guides else tp)
+    bars = ax2.bar(x, vol, width=0.85, color="#C65911", alpha=0.45, zorder=1)
+    line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, zorder=3)
+    pre_peak, pre_low = _daily_peak_low(tp[:72])
+    post_peak, post_low = _daily_peak_low(tp[72:])
+    guides = (
+        (_guide(ax, x[:72], pre_peak, "#548235", "--"), f"Peak pre {pre_peak:.1f}"),
+        (_guide(ax, x[72:], post_peak, "#203864", "--"), f"Peak post {post_peak:.1f}"),
+        (_guide(ax, x[:72], pre_low, "#7F7F7F", "--"), f"Low pre {pre_low:.1f}"),
+        (_guide(ax, x[72:], post_low, "#000000", "--"), f"Low post {post_low:.1f}"),
+    )
+    levels = [value for value in (pre_peak, post_peak, pre_low, post_low) if np.isfinite(value)]
+    tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
     vol_min, vol_max = _sharp_limits(vol)
     ax.set_ylim(tp_min, tp_max)
     ax2.set_ylim(vol_min, vol_max)
@@ -446,35 +451,33 @@ def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, pos
     ax.tick_params(axis="y", colors="#2F5496")
     ax2.tick_params(axis="y", labelsize=8, colors="#C65911")
     ax2.spines["right"].set_color("#C65911")
-    fig.text(0.09, 0.98, "OSS throughput and data volume", ha="left", va="top", fontsize=12, color=NAVY, fontweight="bold")
+    fig.text(0.10, 0.985, "OSS throughput and data volume", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
     note = []
     if np.isfinite(pre_level):
         note.append(f"Pre {pre_level:.1f} Mbps")
     if np.isfinite(post_level):
         note.append(f"Post {post_level:.1f} Mbps")
     if note:
-        fig.text(0.98, 0.98, "    ".join(note), ha="right", va="top", fontsize=8, color=GREY)
-    handles = [line_tp]
-    labels = ["Throughput"]
-    if peak_line is not None:
-        handles.append(peak_line)
-        labels.append(f"Avg peak {avg_peak:.1f}")
-    if low_line is not None:
-        handles.append(low_line)
-        labels.append(f"Avg low {avg_low:.1f}")
-    handles.append(ax2.containers[0])
-    labels.append("Data volume")
-    ax.legend(
+        fig.text(0.98, 0.985, "    ".join(note), ha="right", va="top", fontsize=8, color=GREY)
+    handles = [line_tp, bars]
+    labels = ["Throughput", "Data volume"]
+    for line, label in guides:
+        if line is not None and "nan" not in label:
+            handles.append(line)
+            labels.append(label)
+    fig.legend(
         handles,
         labels,
-        loc="lower left",
-        bbox_to_anchor=(0.0, 1.02),
-        ncol=4,
+        loc="upper left",
+        bbox_to_anchor=(0.10, 0.94),
+        ncol=3,
         frameon=False,
         fontsize=7.5,
         borderaxespad=0,
+        columnspacing=1.0,
+        handlelength=1.6,
     )
-    fig.subplots_adjust(left=0.10, right=0.90, top=0.70, bottom=0.22)
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.80, bottom=0.20)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
