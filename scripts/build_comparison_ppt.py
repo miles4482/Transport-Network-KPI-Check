@@ -35,7 +35,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v26_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v27_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -199,8 +199,12 @@ def _profiles(pre: dict, post: dict) -> dict[str, dict]:
             "busy_vol0": vol0,
             "busy_vol1": vol1,
             "busy_vol_pct": (100.0 * (vol1 - vol0) / vol0) if vol0 else float("nan"),
+            "tp24_0": tp24_0,
+            "tp24_1": tp24_1,
             "tp24": _step(tp24_0, tp24_1),
             "vol24": _step(vol24_0, vol24_1),
+            "tp_bh_0": tp_bh_0,
+            "tp_bh_1": tp_bh_1,
             "tp_bh": _step(tp_bh_0, tp_bh_1),
             "vol_bh": _step(vol_bh_0, vol_bh_1),
             "min_hours": min(_min_day_hours(pre[site]["tp"]), _min_day_hours(post[site]["tp"])),
@@ -1037,19 +1041,12 @@ def _feg_speed_rows(rows: list[dict]) -> list[dict]:
     return table
 
 
-def _day_step(site: dict) -> str:
-    before, after = _num(site.get("busy_tp0")), _num(site.get("busy_tp1"))
-    delta = _num(site.get("busy_tp_delta"))
-    if not (np.isfinite(before) and np.isfinite(after) and np.isfinite(delta)):
+def _tp_step(before: object, after: object) -> str:
+    """Pre to post user throughput, in Mbps."""
+    before_n, after_n = _num(before), _num(after)
+    if not (np.isfinite(before_n) and np.isfinite(after_n)):
         return "—"
-    return f"{before:.1f} → {after:.1f} ({delta:+.1f})"
-
-
-def _rx_step(site: dict) -> str:
-    before, after = _num(site.get("old_rx")), _num(site.get("new_rx"))
-    if not (np.isfinite(before) and np.isfinite(after)):
-        return "—"
-    return f"{before:.0f} → {after:.0f}"
+    return f"{before_n:.1f} → {after_n:.1f} ({after_n - before_n:+.1f})"
 
 
 # Row tint follows the finding, matching the sample table.
@@ -1089,13 +1086,13 @@ def _add_feg_summary_slide(
 
     # Only the sites that have a slide. Slide 1 is this summary, so the table
     # stops at the last site slide.
-    site_headers = ("#", "Site", "Finding", "Daytime throughput", "Rx ceiling")
+    site_headers = ("#", "Site", "Findings", "Daily Throughput", "BH Throughput")
     site_count = len(selected)
     site_shape = slide.shapes.add_table(
         1 + site_count, 5, Inches(0.16), Inches(1.04), Inches(6.28), Inches(6.16)
     )
     site_table = site_shape.table
-    for index, col_width in enumerate((0.32, 0.86, 1.72, 1.92, 1.46)):
+    for index, col_width in enumerate((0.30, 0.82, 1.56, 1.80, 1.80)):
         site_table.columns[index].width = Inches(col_width)
     site_pr = site_table._tbl.tblPr
     if site_pr is not None:
@@ -1121,7 +1118,13 @@ def _add_feg_summary_slide(
         site_table.rows[index].height = body_h
         finding = str(site.get("finding") or "")
         fill = _FINDING_FILL.get(finding, "FFFFFF")
-        values = (str(index), str(site["site"]), finding, _day_step(site), _rx_step(site))
+        values = (
+            str(index),
+            str(site["site"]),
+            finding,
+            _tp_step(site.get("tp24_0"), site.get("tp24_1")),
+            _tp_step(site.get("tp_bh_0"), site.get("tp_bh_1")),
+        )
         for col, text in enumerate(values):
             cell = site_table.cell(index, col)
             _set_cell_fill(cell, fill)
