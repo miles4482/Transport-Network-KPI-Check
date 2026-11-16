@@ -35,7 +35,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v24_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -1000,6 +1000,221 @@ def _add_summary_slide(
     _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
 
 
+def _rose_pairs(group: list[dict]) -> list[tuple[float, float]]:
+    """Busy-hour RxMaxSpeed p90 before and after, for sites whose ceiling rose."""
+    pairs = []
+    for row in group:
+        before, after = _num(row.get("old_rx")), _num(row.get("new_rx"))
+        if np.isfinite(before) and np.isfinite(after) and after > before:
+            pairs.append((before, after))
+    return pairs
+
+
+def _feg_speed_rows(rows: list[dict]) -> list[dict]:
+    """One table row per finding. Speed is the choked-hour ceiling, in Mbit/s."""
+    order = (
+        (fege.FINDING_AGAIN, "Choked again"),
+        (fege.FINDING_SOLVED_UP, "Solved — Tx BW increased"),
+        (fege.FINDING_SOLVED, "Solved"),
+    )
+    table = []
+    for finding, label in order:
+        group = [row for row in rows if row.get("finding") == finding]
+        pairs = _rose_pairs(group)
+        pre = float(np.mean([before for before, _ in pairs])) if pairs else float("nan")
+        post = float(np.mean([after for _, after in pairs])) if pairs else float("nan")
+        n_up = len(pairs)
+        if n_up == len(group):
+            comment = f"Avg of all {len(group)} sites at the previous choked hour."
+        else:
+            comment = f"Avg of {n_up} sites that rose, at the previous choked hour."
+        table.append({"label": label, "n": len(group), "pre": pre, "post": post, "comment": comment})
+    return table
+
+
+def _top_feg_gains(rows: list[dict]) -> list[tuple[float, str]]:
+    """Sites whose ceiling rose by 40 Mbit/s or 12%, largest step first."""
+    ranked = []
+    for row in rows:
+        if not row.get("bw_up"):
+            continue
+        before, after = _num(row.get("old_rx")), _num(row.get("new_rx"))
+        if not (np.isfinite(before) and np.isfinite(after)):
+            continue
+        ranked.append((after - before, str(row["site"])))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def _add_feg_summary_slide(
+    prs: Presentation, rows: list[dict], profiles: dict[str, dict], pages: int
+) -> None:
+    """FEG opening slide: top ceiling gains, then pre and post speed by finding."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = white
+    bg.line.fill.background()
+
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.92))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.06), Inches(12.4), Inches(0.36))
+    _set_run(title.text_frame.paragraphs[0], "Summary of Observations", 24, white, True)
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.5), Inches(0.44))
+    sub_frame = sub.text_frame
+    sub_frame.word_wrap = True
+    _set_run(sub_frame.paragraphs[0], _combined_note(rows, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
+
+    panel = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.22), Inches(1.06), Inches(6.22), Inches(6.08)
+    )
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = RGBColor(0xD6, 0xEA, 0xF8)
+    panel.line.color.rgb = RGBColor(0x5B, 0x9B, 0xD5)
+    panel.line.width = Pt(1.25)
+    head = slide.shapes.add_textbox(Inches(0.40), Inches(1.18), Inches(5.86), Inches(0.78))
+    head_frame = head.text_frame
+    head_frame.word_wrap = True
+    gains = _top_feg_gains(rows)
+    _set_run(
+        head_frame.paragraphs[0],
+        "Top site list where post FEGE speed increased significantly.",
+        15,
+        navy,
+        True,
+    )
+    follow = head_frame.add_paragraph()
+    follow.space_before = Pt(2)
+    _set_run(
+        follow,
+        f"All {len(gains)} sites whose ceiling rose by 40 Mbit/s or 12%. Largest step first.",
+        11,
+        RGBColor(0x33, 0x33, 0x33),
+        False,
+    )
+
+    columns = 4
+    per_col = (len(gains) + columns - 1) // columns if gains else 1
+    col_w = 1.46
+    for col in range(columns):
+        chunk = gains[col * per_col : (col + 1) * per_col]
+        box = slide.shapes.add_textbox(
+            Inches(0.40 + col * col_w), Inches(2.02), Inches(col_w), Inches(4.95)
+        )
+        frame = box.text_frame
+        frame.word_wrap = False
+        for index, (delta, site) in enumerate(chunk):
+            paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+            paragraph.space_before = Pt(0)
+            paragraph.space_after = Pt(0)
+            paragraph.line_spacing = Pt(13)
+            _set_run(paragraph, f"{site}  {delta:+.0f}", 10, RGBColor(0x1F, 0x4E, 0x79), False)
+
+    speed_rows = _feg_speed_rows(rows)
+    headers = (
+        "Finding Category",
+        "Sites",
+        "Pre FEG Throughput (Speed, Mbps)",
+        "Post FEG Throughput (Speed, Mbps)",
+        "Comment",
+    )
+    shape = slide.shapes.add_table(
+        1 + len(speed_rows), 5, Inches(6.58), Inches(1.06), Inches(6.52), Inches(3.20)
+    )
+    table = shape.table
+    for index, col_width in enumerate((1.42, 0.58, 1.42, 1.48, 1.62)):
+        table.columns[index].width = Inches(col_width)
+    tbl_pr = table._tbl.tblPr
+    if tbl_pr is not None:
+        tbl_pr.set("bandRow", "0")
+        tbl_pr.set("firstRow", "0")
+    row_height = Inches(3.20 / (1 + len(speed_rows)))
+    table.rows[0].height = row_height
+    for col, text in enumerate(headers):
+        cell = table.cell(0, col)
+        _set_cell_fill(cell, "1F4E79")
+        _set_cell_border(cell, "1F4E79", 0.6)
+        cell.margin_left = Inches(0.05)
+        cell.margin_right = Inches(0.04)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        cell.text_frame.word_wrap = True
+        paragraph = cell.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER
+        _set_run(paragraph, text, 10, white, True)
+    for index, row in enumerate(speed_rows, start=1):
+        table.rows[index].height = row_height
+        pre = f"{row['pre']:.0f}" if np.isfinite(row["pre"]) else "—"
+        post = f"{row['post']:.0f}" if np.isfinite(row["post"]) else "—"
+        values = (row["label"], str(row["n"]), pre, post, row["comment"])
+        for col, text in enumerate(values):
+            cell = table.cell(index, col)
+            _set_cell_fill(cell, "F7F9FB" if index % 2 else "FFFFFF")
+            _set_cell_border(cell, "D0D7E2", 0.5)
+            cell.margin_left = Inches(0.05)
+            cell.margin_right = Inches(0.04)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.text_frame.word_wrap = True
+            paragraph = cell.text_frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.LEFT if col in (0, 4) else PP_ALIGN.CENTER
+            _set_run(
+                paragraph,
+                text,
+                10 if col == 4 else 11,
+                navy if col == 0 else RGBColor(0x33, 0x33, 0x33),
+                col == 0,
+            )
+
+    note = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.58), Inches(4.40), Inches(6.52), Inches(1.22)
+    )
+    note.fill.solid()
+    note.fill.fore_color.rgb = RGBColor(0xE7, 0xE6, 0xE6)
+    note.line.color.rgb = RGBColor(0xBF, 0xBF, 0xBF)
+    note_box = slide.shapes.add_textbox(Inches(6.74), Inches(4.50), Inches(6.20), Inches(1.02))
+    note_frame = note_box.text_frame
+    note_frame.word_wrap = True
+    _set_run(note_frame.paragraphs[0], "Additional notes", 13, navy, True)
+    note_line = note_frame.add_paragraph()
+    note_line.space_before = Pt(3)
+    _set_run(
+        note_line,
+        "Pre and post speed are the busy-hour RxMaxSpeed p90. The average is the sites whose ceiling rose, at the previous choked hour.",
+        11,
+        RGBColor(0x33, 0x33, 0x33),
+        False,
+    )
+
+    link = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.58), Inches(5.76), Inches(6.52), Inches(1.10)
+    )
+    link.fill.solid()
+    link.fill.fore_color.rgb = RGBColor(0xDE, 0xEB, 0xF7)
+    link.line.color.rgb = RGBColor(0x5B, 0x9B, 0xD5)
+    link_box = slide.shapes.add_textbox(Inches(6.74), Inches(5.90), Inches(6.20), Inches(0.84))
+    link_frame = link_box.text_frame
+    link_frame.word_wrap = True
+    _set_run(link_frame.paragraphs[0], "Attached Excel of all sites list", 13, navy, True)
+    file_line = link_frame.add_paragraph()
+    file_line.space_before = Pt(2)
+    file_run = file_line.add_run()
+    file_run.text = "FEGE_Choked_Flat_Sites_v91.xlsx"
+    _style_run(file_run, 12, RGBColor(0x2F, 0x54, 0x96), False)
+    file_run.font.underline = True
+    file_run.hyperlink.address = (
+        "https://github.com/miles4482/Transport-Network-KPI-Check/blob/"
+        "cursor/comparison-v1-nov-ed53/FEGE_Choked_Flat_Sites_v91.xlsx"
+    )
+
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(7.05), Inches(1.75), Inches(0.28))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
+
+
 def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
     out = np.zeros(72, dtype=bool)
     if "OnCap" not in work.columns:
@@ -1314,7 +1529,10 @@ def main(feg_only: bool = False) -> None:
 
     trends = [] if feg_only else _trend_groups(rows)
     pages = len(selected) + 1 + len(trends)
-    _add_summary_slide(prs, rows, selected, profiles, trends, pages)
+    if feg_only:
+        _add_feg_summary_slide(prs, rows, profiles, pages)
+    else:
+        _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
         page = 2 + offset
         _add_trend_slide(prs, group, CHART_DIR, page, pages)
