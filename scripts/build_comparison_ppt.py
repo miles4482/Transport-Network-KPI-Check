@@ -32,9 +32,10 @@ from pptx.util import Inches, Pt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
-OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v20.pptx")
-# Separate deck. Site slides show the FEGE chart only. v20 stays as it is.
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v22_FEG.pptx")
+# Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
+# _FEG keeps the FEGE chart only. Earlier files stay as they are.
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
