@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
 
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v20.pptx")
+# Separate deck. Site slides show the FEGE chart only. v20 stays as it is.
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v21_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -397,8 +399,8 @@ def _sharp_limits(values: np.ndarray) -> tuple[float, float]:
     return ymin, ymax
 
 
-def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_peak: float) -> None:
-    fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
+def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_peak: float, *, wide: bool = False) -> None:
+    fig, ax = plt.subplots(figsize=(12.8, 4.15) if wide else (7.4, 3.55), dpi=140)
     x = np.arange(len(rx))
     _style_time_axis(ax, len(rx))
     pre = np.where(x < 72, rx, np.nan)
@@ -419,12 +421,12 @@ def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_
     ax.legend(
         loc="lower left",
         bbox_to_anchor=(0.0, 1.02),
-        ncol=3,
+        ncol=5 if wide else 3,
         frameon=False,
-        fontsize=7,
+        fontsize=9 if wide else 7,
         borderaxespad=0,
     )
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.70, bottom=0.22)
+    fig.subplots_adjust(left=0.06 if wide else 0.08, right=0.985, top=0.78 if wide else 0.70, bottom=0.16 if wide else 0.22)
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -663,7 +665,7 @@ def _add_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = Fals
     _style_run(run, size, color, bold)
 
 
-def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page: int, pages: int) -> None:
+def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path | None, page: int, pages: int) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
@@ -714,8 +716,11 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page
         False,
     )
 
-    slide.shapes.add_picture(str(feg_png), Inches(0.18), Inches(0.98), Inches(6.45), Inches(4.15))
-    slide.shapes.add_picture(str(oss_png), Inches(6.70), Inches(0.98), Inches(6.45), Inches(4.15))
+    if oss_png is None:
+        slide.shapes.add_picture(str(feg_png), Inches(0.22), Inches(0.98), Inches(12.90), Inches(4.15))
+    else:
+        slide.shapes.add_picture(str(feg_png), Inches(0.18), Inches(0.98), Inches(6.45), Inches(4.15))
+        slide.shapes.add_picture(str(oss_png), Inches(6.70), Inches(0.98), Inches(6.45), Inches(4.15))
 
     notes = slide.shapes.add_shape(
         MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.22), Inches(5.22), Inches(12.90), Inches(1.95)
@@ -745,7 +750,9 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path, page
     ff = foot.text_frame
     _set_run(
         ff.paragraphs[0],
-        "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H",
+        "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly    ·    Notes use Data BusyHour 1H"
+        if oss_png is None
+        else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H",
         10,
         RGBColor(0x80, 0x80, 0x80),
         False,
@@ -1267,7 +1274,7 @@ def _add_trend_slide(prs: Presentation, group: dict, chart_dir: Path, page: int,
     _set_run(page_p, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
 
 
-def main() -> None:
+def main(feg_only: bool = False) -> None:
     cached = pickle.loads(ROW_CACHE.read_bytes())
     rows = cached["rows"]
     latest_work = cached["latest_work"]
@@ -1300,7 +1307,7 @@ def main() -> None:
     prs.core_properties.title = "Tx BW increase: throughput and data volume"
     prs.core_properties.subject = "comparison_v1 site findings, 5–7 Oct versus 6–8 Nov"
 
-    trends = _trend_groups(rows)
+    trends = [] if feg_only else _trend_groups(rows)
     pages = len(selected) + 1 + len(trends)
     _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
@@ -1316,22 +1323,25 @@ def main() -> None:
         post_on = _on_cap_vector(latest_work, name, fege.LATEST_START, fege.LATEST_END)
         pre_peak, pre_avg = _peaks(rx[:72], pre_on, _num(site.get("prev_center")))
         post_peak, _post_avg = _peaks(rx[72:], post_on, _num(site.get("latest_center")))
-        feg_png = CHART_DIR / f"{page:02d}_{name}_feg.png"
-        oss_png = CHART_DIR / f"{page:02d}_{name}_oss.png"
-        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak)
-        _draw_oss(
-            oss_png,
-            _concat(pre_oss[name]["tp"], post_oss[name]["tp"]),
-            _concat(pre_oss[name]["vol"], post_oss[name]["vol"]),
-            site["busy_tp0"],
-            site["busy_tp1"],
-        )
+        feg_png = CHART_DIR / f"{page:02d}_{name}_feg{'_wide' if feg_only else ''}.png"
+        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=feg_only)
+        oss_png = None
+        if not feg_only:
+            oss_png = CHART_DIR / f"{page:02d}_{name}_oss.png"
+            _draw_oss(
+                oss_png,
+                _concat(pre_oss[name]["tp"], post_oss[name]["tp"]),
+                _concat(pre_oss[name]["vol"], post_oss[name]["vol"]),
+                site["busy_tp0"],
+                site["busy_tp1"],
+            )
         _add_slide(prs, site, feg_png, oss_png, page, pages)
         print(f"  slide {page}/{pages} {name}", flush=True)
 
-    prs.save(OUT)
-    print(f"Wrote {OUT} ({pages} slides)", flush=True)
+    out = OUT_FEG if feg_only else OUT
+    prs.save(out)
+    print(f"Wrote {out} ({pages} slides)", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    main(feg_only=True)
