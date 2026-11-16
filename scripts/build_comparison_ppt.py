@@ -34,7 +34,7 @@ import fege_choke_check as fege
 
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v20.pptx")
 # Separate deck. Site slides show the FEGE chart only. v20 stays as it is.
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v21_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v22_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -572,7 +572,7 @@ def _peaks(rx: np.ndarray, on_cap: np.ndarray | None, center: float) -> tuple[fl
     return peak, avg
 
 
-def _sentence(site: dict) -> list[str]:
+def _sentence(site: dict, include_oss: bool = True) -> list[str]:
     m = site["metrics"]
     bucket = site["bucket"]
     rx0, rx1 = _num(site.get("old_rx")), _num(site.get("new_rx"))
@@ -634,7 +634,11 @@ def _sentence(site: dict) -> list[str]:
         lead = "Still choked on the new ceiling."
     else:
         lead = "A small throughput gain, and data volume did not fall. The Tx ceiling did not meet the step-up test."
-    return [lead, ceiling, tp, vol, choke]
+    lines = [lead, ceiling]
+    if include_oss:
+        lines.extend((tp, vol))
+    lines.append(choke)
+    return lines
 
 
 def _style_run(run, size: int, color: RGBColor, bold: bool) -> None:
@@ -739,7 +743,7 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path | Non
         ntf._txBody.bodyPr.set("anchor", "t")
     except Exception:
         pass
-    lines = _sentence(site)
+    lines = _sentence(site, include_oss=oss_png is not None)
     for i, line in enumerate(lines):
         paragraph = ntf.paragraphs[0] if i == 0 else ntf.add_paragraph()
         paragraph.alignment = PP_ALIGN.LEFT
@@ -750,7 +754,7 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path | Non
     ff = foot.text_frame
     _set_run(
         ff.paragraphs[0],
-        "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly    ·    Notes use Data BusyHour 1H"
+        "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
         if oss_png is None
         else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H",
         10,
