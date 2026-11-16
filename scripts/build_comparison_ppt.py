@@ -35,7 +35,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v27_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v28_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -1042,11 +1042,25 @@ def _feg_speed_rows(rows: list[dict]) -> list[dict]:
 
 
 def _tp_step(before: object, after: object) -> str:
-    """Pre to post user throughput, in Mbps."""
+    """Pre to post FEGE RxMaxSpeed, in Mbit/s."""
     before_n, after_n = _num(before), _num(after)
     if not (np.isfinite(before_n) and np.isfinite(after_n)):
         return "—"
-    return f"{before_n:.1f} → {after_n:.1f} ({after_n - before_n:+.1f})"
+    delta = int(round(after_n - before_n))
+    step = f"{delta:+d}" if delta else "0"
+    return f"{before_n:.0f} → {after_n:.0f} ({step})"
+
+
+def _attach_feg_speed(selected: list[dict], pre_feg: dict, post_feg: dict) -> None:
+    """Daily is every hour. BH is 20:00, 21:00 and 22:00. Both are RxMaxSpeed."""
+    for site in selected:
+        name = str(site["site"])
+        pre = pre_feg.get(name, {}).get("rx")
+        post = post_feg.get(name, {}).get("rx")
+        site["feg24_0"] = _hour_mean(pre) if pre is not None else float("nan")
+        site["feg24_1"] = _hour_mean(post) if post is not None else float("nan")
+        site["feg_bh_0"] = _hour_mean(pre, BH_HOURS) if pre is not None else float("nan")
+        site["feg_bh_1"] = _hour_mean(post, BH_HOURS) if post is not None else float("nan")
 
 
 # Row tint follows the finding, matching the sample table.
@@ -1122,8 +1136,8 @@ def _add_feg_summary_slide(
             str(index),
             str(site["site"]),
             finding,
-            _tp_step(site.get("tp24_0"), site.get("tp24_1")),
-            _tp_step(site.get("tp_bh_0"), site.get("tp_bh_1")),
+            _tp_step(site.get("feg24_0"), site.get("feg24_1")),
+            _tp_step(site.get("feg_bh_0"), site.get("feg_bh_1")),
         )
         for col, text in enumerate(values):
             cell = site_table.cell(index, col)
@@ -1207,7 +1221,7 @@ def _add_feg_summary_slide(
     note_line.space_before = Pt(3)
     _set_run(
         note_line,
-        "Pre and post speed are the busy-hour RxMaxSpeed p90. The average is the sites whose ceiling rose, at the previous choked hour.",
+        "Daily and BH throughput are FEGE RxMaxSpeed, in Mbit/s. Daily is the mean of every hour. BH is the mean of 20, 21 and 22. The table on the right is the busy-hour p90.",
         11,
         RGBColor(0x33, 0x33, 0x33),
         False,
@@ -1542,6 +1556,7 @@ def main(feg_only: bool = False) -> None:
     print(f"Building charts for {len(selected)} slides...", flush=True)
     pre_feg, _ = _prepare_feg(pre_work, sites, fege.ANALYSIS_START, fege.ANALYSIS_END)
     post_feg, _ = _prepare_feg(latest_work, sites, fege.LATEST_START, fege.LATEST_END)
+    _attach_feg_speed(selected, pre_feg, post_feg)
     pre_oss = {name: pre_oss_all[name] for name in sites}
     post_oss = {name: post_oss_all[name] for name in sites}
 
