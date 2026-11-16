@@ -35,7 +35,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v24_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v25_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -79,8 +79,10 @@ BUCKET_LABEL = {
     BUCKET_OTHER: "Included with every choked-again site",
 }
 # Choked again is shown in full. Each other finding shows this many,
-# largest daytime gain first.
+# largest daytime gain first. The FEGE deck keeps two Solved slides,
+# which drops the previous slides 40–47.
 OTHER_LIMIT = 10
+FEG_SOLVED_LIMIT = 2
 # Choked again opens the deck. The other findings follow.
 DECK_ORDER = (
     fege.FINDING_AGAIN,
@@ -229,8 +231,8 @@ def _rank_key(site: dict) -> tuple[float, float]:
     )
 
 
-def select_sites(rows: list[dict], profiles: dict[str, dict]) -> list[dict]:
-    """Every choked-again site, and the 10 largest gains in each other finding.
+def select_sites(rows: list[dict], profiles: dict[str, dict], solved_limit: int = OTHER_LIMIT) -> list[dict]:
+    """Every choked-again site, then the largest daytime gains in each other finding.
 
     Order inside a finding is the daytime throughput step, largest first.
     """
@@ -251,7 +253,10 @@ def select_sites(rows: list[dict], profiles: dict[str, dict]) -> list[dict]:
     picked: list[dict] = []
     for finding in DECK_ORDER:
         pool = sorted(grouped[finding], key=_rank_key, reverse=True)
-        chosen = pool if finding == fege.FINDING_AGAIN else pool[:OTHER_LIMIT]
+        limit = None if finding == fege.FINDING_AGAIN else (
+            solved_limit if finding == fege.FINDING_SOLVED else OTHER_LIMIT
+        )
+        chosen = pool if limit is None else pool[:limit]
         for index, site in enumerate(chosen, start=1):
             site["pick_index"] = index
             site["pick_total"] = len(chosen)
@@ -1032,22 +1037,40 @@ def _feg_speed_rows(rows: list[dict]) -> list[dict]:
     return table
 
 
-def _top_feg_gains(rows: list[dict]) -> list[tuple[float, str]]:
-    """Sites whose ceiling rose by 40 Mbit/s or 12%, largest step first."""
-    ranked = []
+def _rx_delta(row: dict) -> float:
+    before, after = _num(row.get("old_rx")), _num(row.get("new_rx"))
+    if np.isfinite(before) and np.isfinite(after):
+        return after - before
+    return float("nan")
+
+
+def _summary_gains(rows: list[dict], selected: list[dict]) -> list[tuple[float, str, bool]]:
+    """Deck sites first, in slide order, then the other large ceiling steps."""
+    by_name = {str(row["site"]): row for row in rows}
+    ordered: list[tuple[float, str, bool]] = []
+    seen: set[str] = set()
+    for site in selected:
+        name = str(site["site"])
+        seen.add(name)
+        ordered.append((_rx_delta(by_name.get(name, site)), name, True))
+    rest: list[tuple[float, str, bool]] = []
     for row in rows:
-        if not row.get("bw_up"):
+        name = str(row["site"])
+        if name in seen or not row.get("bw_up"):
             continue
-        before, after = _num(row.get("old_rx")), _num(row.get("new_rx"))
-        if not (np.isfinite(before) and np.isfinite(after)):
-            continue
-        ranked.append((after - before, str(row["site"])))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return ranked
+        delta = _rx_delta(row)
+        if np.isfinite(delta):
+            rest.append((delta, name, False))
+    rest.sort(key=lambda item: item[0], reverse=True)
+    return ordered + rest
 
 
 def _add_feg_summary_slide(
-    prs: Presentation, rows: list[dict], profiles: dict[str, dict], pages: int
+    prs: Presentation,
+    rows: list[dict],
+    profiles: dict[str, dict],
+    selected: list[dict],
+    pages: int,
 ) -> None:
     """FEG opening slide: top ceiling gains, then pre and post speed by finding."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -1079,7 +1102,8 @@ def _add_feg_summary_slide(
     head = slide.shapes.add_textbox(Inches(0.40), Inches(1.18), Inches(5.86), Inches(0.78))
     head_frame = head.text_frame
     head_frame.word_wrap = True
-    gains = _top_feg_gains(rows)
+    gains = _summary_gains(rows, selected)
+    deck_n = sum(1 for _delta, _name, in_deck in gains if in_deck)
     _set_run(
         head_frame.paragraphs[0],
         "Top site list where post FEGE speed increased significantly.",
@@ -1091,7 +1115,7 @@ def _add_feg_summary_slide(
     follow.space_before = Pt(2)
     _set_run(
         follow,
-        f"All {len(gains)} sites whose ceiling rose by 40 Mbit/s or 12%. Largest step first.",
+        f"The {deck_n} sites in this deck come first, in slide order. Then the other ceiling steps of 40 Mbit/s or 12%.",
         11,
         RGBColor(0x33, 0x33, 0x33),
         False,
@@ -1107,12 +1131,23 @@ def _add_feg_summary_slide(
         )
         frame = box.text_frame
         frame.word_wrap = False
-        for index, (delta, site) in enumerate(chunk):
+        for index, (delta, site, in_deck) in enumerate(chunk):
             paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
             paragraph.space_before = Pt(0)
             paragraph.space_after = Pt(0)
             paragraph.line_spacing = Pt(13)
-            _set_run(paragraph, f"{site}  {delta:+.0f}", 10, RGBColor(0x1F, 0x4E, 0x79), False)
+            if not np.isfinite(delta):
+                step = "—"
+            else:
+                rounded = int(round(delta))
+                step = f"{rounded:+d}" if rounded else "0"
+            _set_run(
+                paragraph,
+                f"{site}  {step}",
+                10,
+                navy if in_deck else RGBColor(0x5B, 0x6B, 0x7A),
+                in_deck,
+            )
 
     speed_rows = _feg_speed_rows(rows)
     headers = (
@@ -1509,7 +1544,7 @@ def main(feg_only: bool = False) -> None:
         Path("/tmp/oss_nov_capacity.csv"), all_sites, fege.LATEST_START, fege.LATEST_END
     )
     profiles = _profiles(pre_oss_all, post_oss_all)
-    selected = select_sites(rows, profiles)
+    selected = select_sites(rows, profiles, solved_limit=FEG_SOLVED_LIMIT if feg_only else OTHER_LIMIT)
     if not selected:
         raise SystemExit("No sites matched the finding selection")
 
@@ -1530,7 +1565,7 @@ def main(feg_only: bool = False) -> None:
     trends = [] if feg_only else _trend_groups(rows)
     pages = len(selected) + 1 + len(trends)
     if feg_only:
-        _add_feg_summary_slide(prs, rows, profiles, pages)
+        _add_feg_summary_slide(prs, rows, profiles, selected, pages)
     else:
         _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
