@@ -35,7 +35,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v25_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v26_FEG.pptx")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -1037,32 +1037,27 @@ def _feg_speed_rows(rows: list[dict]) -> list[dict]:
     return table
 
 
-def _rx_delta(row: dict) -> float:
-    before, after = _num(row.get("old_rx")), _num(row.get("new_rx"))
-    if np.isfinite(before) and np.isfinite(after):
-        return after - before
-    return float("nan")
+def _day_step(site: dict) -> str:
+    before, after = _num(site.get("busy_tp0")), _num(site.get("busy_tp1"))
+    delta = _num(site.get("busy_tp_delta"))
+    if not (np.isfinite(before) and np.isfinite(after) and np.isfinite(delta)):
+        return "—"
+    return f"{before:.1f} → {after:.1f} ({delta:+.1f})"
 
 
-def _summary_gains(rows: list[dict], selected: list[dict]) -> list[tuple[float, str, bool]]:
-    """Deck sites first, in slide order, then the other large ceiling steps."""
-    by_name = {str(row["site"]): row for row in rows}
-    ordered: list[tuple[float, str, bool]] = []
-    seen: set[str] = set()
-    for site in selected:
-        name = str(site["site"])
-        seen.add(name)
-        ordered.append((_rx_delta(by_name.get(name, site)), name, True))
-    rest: list[tuple[float, str, bool]] = []
-    for row in rows:
-        name = str(row["site"])
-        if name in seen or not row.get("bw_up"):
-            continue
-        delta = _rx_delta(row)
-        if np.isfinite(delta):
-            rest.append((delta, name, False))
-    rest.sort(key=lambda item: item[0], reverse=True)
-    return ordered + rest
+def _rx_step(site: dict) -> str:
+    before, after = _num(site.get("old_rx")), _num(site.get("new_rx"))
+    if not (np.isfinite(before) and np.isfinite(after)):
+        return "—"
+    return f"{before:.0f} → {after:.0f}"
+
+
+# Row tint follows the finding, matching the sample table.
+_FINDING_FILL = {
+    fege.FINDING_AGAIN: "D6EAF8",
+    fege.FINDING_SOLVED_UP: "E2EFDA",
+    fege.FINDING_SOLVED: "FDE9D9",
+}
 
 
 def _add_feg_summary_slide(
@@ -1092,62 +1087,54 @@ def _add_feg_summary_slide(
     sub_frame.word_wrap = True
     _set_run(sub_frame.paragraphs[0], _combined_note(rows, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
 
-    panel = slide.shapes.add_shape(
-        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.22), Inches(1.06), Inches(6.22), Inches(6.08)
+    # Only the sites that have a slide. Slide 1 is this summary, so the table
+    # stops at the last site slide.
+    site_headers = ("#", "Site", "Finding", "Daytime throughput", "Rx ceiling")
+    site_count = len(selected)
+    site_shape = slide.shapes.add_table(
+        1 + site_count, 5, Inches(0.16), Inches(1.04), Inches(6.28), Inches(6.16)
     )
-    panel.fill.solid()
-    panel.fill.fore_color.rgb = RGBColor(0xD6, 0xEA, 0xF8)
-    panel.line.color.rgb = RGBColor(0x5B, 0x9B, 0xD5)
-    panel.line.width = Pt(1.25)
-    head = slide.shapes.add_textbox(Inches(0.40), Inches(1.18), Inches(5.86), Inches(0.78))
-    head_frame = head.text_frame
-    head_frame.word_wrap = True
-    gains = _summary_gains(rows, selected)
-    deck_n = sum(1 for _delta, _name, in_deck in gains if in_deck)
-    _set_run(
-        head_frame.paragraphs[0],
-        "Top site list where post FEGE speed increased significantly.",
-        15,
-        navy,
-        True,
-    )
-    follow = head_frame.add_paragraph()
-    follow.space_before = Pt(2)
-    _set_run(
-        follow,
-        f"The {deck_n} sites in this deck come first, in slide order. Then the other ceiling steps of 40 Mbit/s or 12%.",
-        11,
-        RGBColor(0x33, 0x33, 0x33),
-        False,
-    )
-
-    columns = 4
-    per_col = (len(gains) + columns - 1) // columns if gains else 1
-    col_w = 1.46
-    for col in range(columns):
-        chunk = gains[col * per_col : (col + 1) * per_col]
-        box = slide.shapes.add_textbox(
-            Inches(0.40 + col * col_w), Inches(2.02), Inches(col_w), Inches(4.95)
-        )
-        frame = box.text_frame
-        frame.word_wrap = False
-        for index, (delta, site, in_deck) in enumerate(chunk):
-            paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
-            paragraph.space_before = Pt(0)
-            paragraph.space_after = Pt(0)
-            paragraph.line_spacing = Pt(13)
-            if not np.isfinite(delta):
-                step = "—"
-            else:
-                rounded = int(round(delta))
-                step = f"{rounded:+d}" if rounded else "0"
-            _set_run(
-                paragraph,
-                f"{site}  {step}",
-                10,
-                navy if in_deck else RGBColor(0x5B, 0x6B, 0x7A),
-                in_deck,
-            )
+    site_table = site_shape.table
+    for index, col_width in enumerate((0.32, 0.86, 1.72, 1.92, 1.46)):
+        site_table.columns[index].width = Inches(col_width)
+    site_pr = site_table._tbl.tblPr
+    if site_pr is not None:
+        site_pr.set("bandRow", "0")
+        site_pr.set("firstRow", "0")
+    header_h = Inches(0.26)
+    body_h = Inches((6.16 - 0.26) / site_count) if site_count else Inches(0.2)
+    site_table.rows[0].height = header_h
+    for col, text in enumerate(site_headers):
+        cell = site_table.cell(0, col)
+        _set_cell_fill(cell, "1F4E79")
+        _set_cell_border(cell, "1F4E79", 0.4)
+        cell.margin_left = Inches(0.03)
+        cell.margin_right = Inches(0.02)
+        cell.margin_top = Inches(0.01)
+        cell.margin_bottom = Inches(0.0)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        cell.text_frame.word_wrap = False
+        paragraph = cell.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER if col != 2 else PP_ALIGN.LEFT
+        _set_run(paragraph, text, 8, white, True)
+    for index, site in enumerate(selected, start=1):
+        site_table.rows[index].height = body_h
+        finding = str(site.get("finding") or "")
+        fill = _FINDING_FILL.get(finding, "FFFFFF")
+        values = (str(index), str(site["site"]), finding, _day_step(site), _rx_step(site))
+        for col, text in enumerate(values):
+            cell = site_table.cell(index, col)
+            _set_cell_fill(cell, fill)
+            _set_cell_border(cell, "D0D7E2", 0.4)
+            cell.margin_left = Inches(0.03)
+            cell.margin_right = Inches(0.02)
+            cell.margin_top = Inches(0.0)
+            cell.margin_bottom = Inches(0.0)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.text_frame.word_wrap = False
+            paragraph = cell.text_frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.LEFT if col in (2,) else PP_ALIGN.CENTER
+            _set_run(paragraph, text, 8, RGBColor(0x1F, 0x29, 0x37), False)
 
     speed_rows = _feg_speed_rows(rows)
     headers = (
