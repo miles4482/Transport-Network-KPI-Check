@@ -35,8 +35,9 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v29_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v30_FEG.pptx")
 CELL_DIR = Path("/tmp/new_kpi/oss")
+FEG_DAILY = Path("/tmp/new_kpi/feg/FEG_KPI_DHAKA_Daily.csv")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -776,7 +777,7 @@ def _add_slide(
         "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
         if oss_png is None
         else (
-            "FEGE chart is hourly, 5–7 Oct and 6–8 Nov. OSS chart is daily, 1 Sep–15 Nov, cells summed to the site."
+            "FEGE chart is daily RxMaxSpeed and RxMeanSpeed, 1 Sep–15 Nov. OSS chart is daily, cells summed to the site."
             if daily_oss
             else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H"
         ),
@@ -1645,6 +1646,52 @@ def _draw_radio(path: Path, daily: pd.DataFrame) -> None:
     plt.close(fig)
 
 
+def _load_feg_daily(sites: set[str]) -> dict[str, pd.DataFrame]:
+    """One row per site per day. Speeds are converted from bit/s to Mbit/s."""
+    if not FEG_DAILY.exists():
+        raise SystemExit(f"Daily FEGE file not found: {FEG_DAILY}")
+    frame = pd.read_csv(
+        FEG_DAILY,
+        usecols=["Date", "eNodeB Name", "VS.FEGE.RxMaxSpeed(bit/s)", "VS.FEGE.RxMeanSpeed(bit/s)"],
+    )
+    frame = frame.loc[frame["eNodeB Name"].astype(str).isin(sites)].copy()
+    frame["day"] = pd.to_datetime(frame["Date"].astype(str) + "-2026", format="%d-%b-%Y")
+    frame["rx_max"] = pd.to_numeric(frame["VS.FEGE.RxMaxSpeed(bit/s)"], errors="coerce") / 1_000_000.0
+    frame["rx_mean"] = pd.to_numeric(frame["VS.FEGE.RxMeanSpeed(bit/s)"], errors="coerce") / 1_000_000.0
+    return {
+        str(site): part.sort_values("day")
+        for site, part in frame.groupby("eNodeB Name", sort=False)
+    }
+
+
+def _draw_site_feg_daily(path: Path, frame: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
+    _mark_compare_windows(ax)
+    mean_ax = ax.twinx()
+    max_line, = ax.plot(frame["day"], frame["rx_max"], color=BLUE, linewidth=1.6, zorder=3)
+    mean_line, = mean_ax.plot(frame["day"], frame["rx_mean"], color=ORANGE, linewidth=1.6, zorder=3)
+    ax.set_ylim(*_raised_limits(float(np.nanmin(frame["rx_max"])), float(np.nanmax(frame["rx_max"]))))
+    mean_ax.set_ylim(*_raised_limits(float(np.nanmin(frame["rx_mean"])), float(np.nanmax(frame["rx_mean"]))))
+    ax.set_ylabel("RxMaxSpeed, Mbit/s", fontsize=8, color=BLUE)
+    mean_ax.set_ylabel("RxMeanSpeed, Mbit/s", fontsize=8, color=ORANGE)
+    ax.tick_params(axis="y", colors=BLUE, labelsize=8)
+    mean_ax.tick_params(axis="y", colors=ORANGE, labelsize=8)
+    _date_axis(ax)
+    fig.text(0.08, 0.98, "Daily FEGE", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
+    fig.legend(
+        [max_line, mean_line],
+        ["RxMaxSpeed", "RxMeanSpeed"],
+        loc="upper left",
+        bbox_to_anchor=(0.08, 0.93),
+        ncol=2,
+        frameon=False,
+        fontsize=8,
+    )
+    fig.subplots_adjust(left=0.10, right=0.88, top=0.76, bottom=0.16)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
 def _draw_site_daily(path: Path, frame: pd.DataFrame) -> None:
     fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
     _mark_compare_windows(ax)
@@ -1747,7 +1794,9 @@ def main(feg_only: bool = False) -> None:
     cell_network = cell_sites = None
     if feg_only:
         print(f"Summing daily cell OSS for {len(selected)} sites...", flush=True)
-        cell_network, cell_sites = _load_cell_daily({site["site"] for site in selected})
+        names = {site["site"] for site in selected}
+        cell_network, cell_sites = _load_cell_daily(names)
+        feg_daily = _load_feg_daily(names)
     pages = len(selected) + (2 if feg_only else 1) + len(trends)
     if feg_only:
         _add_feg_summary_slide(prs, rows, profiles, selected, pages)
@@ -1772,7 +1821,10 @@ def main(feg_only: bool = False) -> None:
         post_peak, _post_avg = _peaks(rx[72:], post_on, _num(site.get("latest_center")))
         wide = feg_only and name not in cell_sites
         feg_png = CHART_DIR / f"{page:02d}_{name}_feg{'_wide' if wide else ''}.png"
-        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=wide)
+        if feg_only and name in feg_daily:
+            _draw_site_feg_daily(feg_png, feg_daily[name])
+        else:
+            _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=wide)
         oss_png = None
         daily_oss = False
         if feg_only and name in cell_sites:
