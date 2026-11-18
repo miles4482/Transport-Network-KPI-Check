@@ -11,8 +11,11 @@ comes first.
 
 from __future__ import annotations
 
+import math
 import pickle
 import sys
+from copy import deepcopy
+from datetime import date, timedelta
 from pathlib import Path
 
 import matplotlib
@@ -22,10 +25,15 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from lxml import etree
 from pptx import Presentation
+from pptx.chart.axis import ValueAxis
+from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
@@ -35,7 +43,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v30_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v31_FEG.pptx")
 CELL_DIR = Path("/tmp/new_kpi/oss")
 FEG_DAILY = Path("/tmp/new_kpi/feg/FEG_KPI_DHAKA_Daily.csv")
 CHART_DIR = Path("/tmp/ppt_charts")
@@ -51,6 +59,14 @@ HOLD_VOL_MIN = -5.0
 HOLD_VOL_MAX = SIG_VOL_PCT
 # Small throughput gain still has to be visible.
 SMALL_TP_MBPS = 0.30
+
+# Both daily charts share this calendar, this label format, and this tick step.
+CHART_START = date(2026, 9, 1)
+CHART_END = date(2026, 11, 15)
+CHART_DATES = [CHART_START + timedelta(days=offset) for offset in range((CHART_END - CHART_START).days + 1)]
+DATE_STEP_DAYS = 7
+EXCEL_EPOCH = date(1899, 12, 30)
+DATE_FORMAT = "dd mmm"
 
 NAVY = "#1F4E79"
 BLUE = "#5B9BD5"
@@ -681,14 +697,64 @@ def _add_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = Fals
     _style_run(run, size, color, bold)
 
 
+def _add_daily_pair(slide, feg_frame: pd.DataFrame, oss_frame: pd.DataFrame) -> None:
+    """Site slide charts: daily FEGE on the left, daily OSS on the right."""
+    _chart_caption(slide, 0.20, 0.88, 6.3, "Daily FEGE")
+    _add_chart(
+        slide,
+        Inches(0.08),
+        Inches(1.30),
+        Inches(6.58),
+        Inches(3.82),
+        {
+            "name": "RxMaxSpeed",
+            "values": _on_calendar(feg_frame, "rx_max"),
+            "color": "2F5496",
+            "axis": "Mbit/s",
+            "kind": "line",
+        },
+        {
+            "name": "RxMeanSpeed",
+            "values": _on_calendar(feg_frame, "rx_mean"),
+            "color": "C65911",
+            "axis": "Mbit/s",
+            "kind": "line",
+        },
+    )
+    _chart_caption(slide, 6.78, 0.88, 6.3, "Site level OSS KPI, daily", "Data volume vs DL user throughput")
+    _add_chart(
+        slide,
+        Inches(6.68),
+        Inches(1.30),
+        Inches(6.58),
+        Inches(3.82),
+        {
+            "name": "Data volume",
+            "values": _on_calendar(oss_frame, "vol"),
+            "color": "C65911",
+            "axis": "GB",
+            "kind": "column",
+        },
+        {
+            "name": "DL user throughput",
+            "values": _on_calendar(oss_frame, "tp"),
+            "color": "2F5496",
+            "axis": "Mbps",
+            "kind": "line",
+        },
+    )
+
+
 def _add_slide(
     prs: Presentation,
     site: dict,
-    feg_png: Path,
+    feg_png: Path | None,
     oss_png: Path | None,
     page: int,
     pages: int,
     daily_oss: bool = False,
+    feg_daily: pd.DataFrame | None = None,
+    oss_daily: pd.DataFrame | None = None,
 ) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
@@ -740,7 +806,10 @@ def _add_slide(
         False,
     )
 
-    if oss_png is None:
+    if feg_daily is not None and oss_daily is not None:
+        _add_daily_pair(slide, feg_daily, oss_daily)
+        daily_oss = True
+    elif oss_png is None:
         slide.shapes.add_picture(str(feg_png), Inches(0.22), Inches(0.98), Inches(12.90), Inches(4.15))
     else:
         slide.shapes.add_picture(str(feg_png), Inches(0.18), Inches(0.98), Inches(6.45), Inches(4.15))
@@ -774,11 +843,11 @@ def _add_slide(
     ff = foot.text_frame
     _set_run(
         ff.paragraphs[0],
-        "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
-        if oss_png is None
+        "Dates are the same on both charts, every 7 days, 1 Sep–15 Nov. Cells are summed to the site."
+        if daily_oss
         else (
-            "FEGE chart is daily RxMaxSpeed and RxMeanSpeed, 1 Sep–15 Nov. OSS chart is daily, cells summed to the site."
-            if daily_oss
+            "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
+            if oss_png is None
             else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H"
         ),
         10,
@@ -1403,6 +1472,263 @@ def _trend_note(group: dict) -> list[str]:
     return lines
 
 
+def _nice_step(span: float) -> float:
+    """A round tick step that puts about five intervals across the axis."""
+    if span <= 0:
+        return 1.0
+    raw = span / 6.0
+    exponent = math.floor(math.log10(raw))
+    base = 10 ** exponent
+    for multiplier in (1, 2, 2.5, 5, 10):
+        if raw <= multiplier * base:
+            return multiplier * base
+    return 10 * base
+
+
+def _dynamic_axis(values) -> tuple[float, float, float]:
+    """Raise the floor so a change is visible, then round to a clean tick.
+
+    The floor sits about one data-span under the lowest point. A series that
+    runs 40,000–48,000 therefore starts near 30,000 rather than at zero.
+    A series that already swings down toward zero keeps a floor of zero.
+    """
+    finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    if not finite:
+        return 0.0, 1.0, 0.2
+    low = min(finite)
+    high = max(finite)
+    span = high - low
+    if span <= 0:
+        span = max(abs(high) * 0.08, 1.0)
+    # About half a span under the lowest point, so the series fills the chart
+    # and a 40,000–48,000 series starts near 35,000 rather than at zero.
+    target_min = low - 0.55 * span
+    target_max = high + 0.22 * span
+    if low >= 0 and target_min < 0:
+        target_min = 0.0
+    step = _nice_step(span)
+    ymin = math.floor(target_min / step) * step
+    ymax = math.ceil(target_max / step) * step
+    if ymin < 0 <= low:
+        ymin = 0.0
+    if ymin >= low:
+        ymin -= step
+    if ymax <= high:
+        ymax += step
+    return ymin, ymax, step
+
+
+def _on_calendar(frame: pd.DataFrame, column: str) -> list[float | None]:
+    """One value per day from 1 Sep through 15 Nov. Missing days stay blank."""
+    indexed = frame.set_index(pd.to_datetime(frame["day"]).dt.normalize())[column]
+    indexed = indexed[~indexed.index.duplicated(keep="last")]
+    values: list[float | None] = []
+    for day in CHART_DATES:
+        value = indexed.get(pd.Timestamp(day), np.nan)
+        if value is None or not np.isfinite(value):
+            values.append(None)
+        else:
+            values.append(float(value))
+    return values
+
+
+def _excel_serial(day: date) -> float:
+    return float((day - EXCEL_EPOCH).days)
+
+
+def _set_date_scale(date_axis) -> None:
+    """Same start, end, format, and 7-day step on every daily chart."""
+    element = date_axis._element
+    date_axis.minimum_scale = _excel_serial(CHART_START)
+    date_axis.maximum_scale = _excel_serial(CHART_END + timedelta(days=1))
+    date_axis.tick_labels.number_format = DATE_FORMAT
+    date_axis.tick_labels.font.size = Pt(9)
+    date_axis.tick_labels.font.name = "Calibri"
+    date_axis.tick_labels.font.color.rgb = RGBColor(0x59, 0x59, 0x59)
+    auto = element.find(qn("c:auto"))
+    if auto is not None:
+        auto.set("val", "0")
+    base = element.find(qn("c:baseTimeUnit"))
+    major = element.find(qn("c:majorUnit"))
+    if major is None:
+        major = etree.Element(qn("c:majorUnit"))
+        if base is not None:
+            base.addnext(major)
+        else:
+            element.append(major)
+    major.set("val", str(DATE_STEP_DAYS))
+    unit = element.find(qn("c:majorTimeUnit"))
+    if unit is None:
+        unit = etree.Element(qn("c:majorTimeUnit"))
+        major.addnext(unit)
+    unit.set("val", "days")
+    body = element.find(qn("c:txPr"))
+    if body is not None:
+        props = body.find(qn("a:bodyPr"))
+        if props is not None:
+            props.set("rot", "-2700000")
+
+
+def _style_value_axis(element, values, title: str, color: str, *, grid: bool) -> tuple[float, float, float]:
+    axis = ValueAxis(element)
+    ymin, ymax, step = _dynamic_axis(values)
+    axis.minimum_scale = ymin
+    axis.maximum_scale = ymax
+    axis.major_unit = step
+    axis.has_major_gridlines = grid
+    if grid:
+        axis.major_gridlines.format.line.color.rgb = RGBColor(0xD9, 0xD9, 0xD9)
+        axis.major_gridlines.format.line.width = Pt(0.75)
+    number_format = "#,##0" if step >= 1 else "0.0"
+    axis.tick_labels.number_format = number_format
+    axis.tick_labels.font.size = Pt(9)
+    axis.tick_labels.font.name = "Calibri"
+    axis.tick_labels.font.color.rgb = RGBColor.from_string(color)
+    axis.has_title = True
+    paragraph = axis.axis_title.text_frame.paragraphs[0]
+    paragraph.text = title
+    paragraph.font.size = Pt(9)
+    paragraph.font.name = "Calibri"
+    paragraph.font.color.rgb = RGBColor.from_string(color)
+    paragraph.font.bold = False
+    try:
+        axis.format.line.color.rgb = RGBColor.from_string(color)
+    except Exception:
+        pass
+    return ymin, ymax, step
+
+
+def _color_line(series_element, color: str, width_pt: float = 2.0) -> None:
+    existing = series_element.find(qn("c:spPr"))
+    if existing is not None:
+        series_element.remove(existing)
+    width = int(width_pt * 12700)
+    line = parse_xml(
+        f'<c:spPr xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        f'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f'<a:ln w="{width}" cap="rnd"><a:solidFill><a:srgbClr val="{color}"/></a:solidFill></a:ln>'
+        f"</c:spPr>"
+    )
+    series_element.find(qn("c:tx")).addnext(line)
+    if series_element.find(qn("c:marker")) is None:
+        marker = parse_xml(
+            '<c:marker xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:symbol val="none"/></c:marker>'
+        )
+        line.addnext(marker)
+    else:
+        symbol = series_element.find(qn("c:marker")).find(qn("c:symbol"))
+        if symbol is not None:
+            symbol.set("val", "none")
+    if series_element.find(qn("c:smooth")) is None:
+        series_element.append(parse_xml('<c:smooth xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="0"/>'))
+
+
+def _color_bars(series, color: str) -> None:
+    series.format.fill.solid()
+    series.format.fill.fore_color.rgb = RGBColor.from_string(color)
+    series.format.line.fill.background()
+
+
+def _finish_chart(chart) -> None:
+    chart.has_title = False
+    chart.has_legend = True
+    chart.legend.position = XL_LEGEND_POSITION.TOP
+    chart.legend.include_in_layout = False
+    chart.legend.font.size = Pt(10)
+    chart.legend.font.name = "Calibri"
+    text = chart._element.find(qn("c:txPr"))
+    if text is not None:
+        default = text.find(".//" + qn("a:defRPr"))
+        if default is not None:
+            default.set("sz", "900")
+    for marker in chart._element.findall(".//" + qn("c:marker")):
+        if marker.get("val") is not None:
+            marker.set("val", "0")
+
+
+def _split_right_axis(chart):
+    """Move the second series onto its own value axis on the right."""
+    plot = chart._element.chart.plotArea
+    host = plot.find(qn("c:barChart"))
+    if host is None:
+        host = plot.find(qn("c:lineChart"))
+    series = host.findall(qn("c:ser"))
+    right = series[1]
+    host.remove(right)
+    line_chart = parse_xml(
+        '<c:lineChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+        '<c:grouping val="standard"/>'
+        '<c:varyColors val="0"/>'
+        '<c:smooth val="0"/>'
+        "</c:lineChart>"
+    )
+    smooth = line_chart.find(qn("c:smooth"))
+    smooth.addprevious(right)
+    cat_id, val_id = "910001", "910002"
+    line_chart.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{cat_id}"/>'))
+    line_chart.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{val_id}"/>'))
+    host.addnext(line_chart)
+    date_axis = plot.find(qn("c:dateAx"))
+    value_axis = plot.find(qn("c:valAx"))
+    date_copy = deepcopy(date_axis)
+    value_copy = deepcopy(value_axis)
+    date_copy.find(qn("c:axId")).set("val", cat_id)
+    date_copy.find(qn("c:crossAx")).set("val", val_id)
+    date_copy.find(qn("c:delete")).set("val", "1")
+    value_copy.find(qn("c:axId")).set("val", val_id)
+    value_copy.find(qn("c:crossAx")).set("val", cat_id)
+    value_copy.find(qn("c:axPos")).set("val", "r")
+    value_copy.find(qn("c:crosses")).set("val", "max")
+    grid = value_copy.find(qn("c:majorGridlines"))
+    if grid is not None:
+        value_copy.remove(grid)
+    plot.append(date_copy)
+    plot.append(value_copy)
+    return value_axis, value_copy, right
+
+
+def _add_chart(slide, left, top, width, height, left_series: dict, right_series: dict | None = None):
+    """A real PowerPoint chart. The right series, when present, uses the right axis."""
+    data = CategoryChartData()
+    data.categories = CHART_DATES
+    data.categories.number_format = DATE_FORMAT
+    data.add_series(left_series["name"], left_series["values"])
+    chart_type = XL_CHART_TYPE.COLUMN_CLUSTERED if left_series["kind"] == "column" else XL_CHART_TYPE.LINE
+    if right_series is not None:
+        data.add_series(right_series["name"], right_series["values"])
+    graphic = slide.shapes.add_chart(chart_type, left, top, width, height, data)
+    chart = graphic.chart
+    _finish_chart(chart)
+    _set_date_scale(chart.category_axis)
+    if left_series["kind"] == "column":
+        chart.plots[0].gap_width = 35
+        _color_bars(chart.series[0], left_series["color"])
+    else:
+        _color_line(chart.series[0]._element, left_series["color"])
+    primary = chart._element.chart.plotArea.find(qn("c:valAx"))
+    limits = _style_value_axis(primary, left_series["values"], left_series["axis"], left_series["color"], grid=True)
+    # Keep the date axis on the raised floor. autoZero would sit at 0, under the plot.
+    primary.find(qn("c:crosses")).set("val", "min")
+    if right_series is None:
+        return limits
+    _primary, secondary, right_element = _split_right_axis(chart)
+    _color_line(right_element, right_series["color"])
+    right_limits = _style_value_axis(secondary, right_series["values"], right_series["axis"], right_series["color"], grid=False)
+    secondary.find(qn("c:crosses")).set("val", "max")
+    return limits, right_limits
+
+
+def _chart_caption(slide, left: float, top: float, width: float, title: str, subtitle: str | None = None) -> None:
+    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(0.46))
+    frame = box.text_frame
+    frame.word_wrap = False
+    _set_run(frame.paragraphs[0], title, 14, RGBColor(0x1F, 0x4E, 0x79), True)
+    if subtitle:
+        second = frame.add_paragraph()
+        _set_run(second, subtitle, 10, RGBColor(0x59, 0x59, 0x59), False)
+
+
 def _raised_limits(low: float, high: float) -> tuple[float, float]:
     """Place the axis floor just under the series so the movement fills the chart."""
     span = max(high - low, 0.4)
@@ -1710,7 +2036,7 @@ def _draw_site_daily(path: Path, frame: pd.DataFrame) -> None:
     plt.close(fig)
 
 
-def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, chart: Path, pages: int) -> None:
+def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, pages: int) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
@@ -1739,7 +2065,49 @@ def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, ch
         RGBColor(0xD6, 0xE3, 0xF0),
         False,
     )
-    slide.shapes.add_picture(str(chart), Inches(0.22), Inches(1.15), Inches(12.90), Inches(5.70))
+    _chart_caption(slide, 0.22, 1.02, 6.3, "Daily data volume and DL user throughput")
+    volume_limits, throughput_limits = _add_chart(
+        slide,
+        Inches(0.08),
+        Inches(1.32),
+        Inches(6.58),
+        Inches(5.45),
+        {
+            "name": "Data volume",
+            "values": _on_calendar(daily, "vol"),
+            "color": "C65911",
+            "axis": "GB",
+            "kind": "column",
+        },
+        {
+            "name": "DL user throughput",
+            "values": _on_calendar(daily, "tp"),
+            "color": "2F5496",
+            "axis": "Mbps",
+            "kind": "line",
+        },
+    )
+    _chart_caption(slide, 6.78, 1.02, 6.3, "Daily DL PRB")
+    prb_limits = _add_chart(
+        slide,
+        Inches(6.68),
+        Inches(1.32),
+        Inches(6.58),
+        Inches(5.45),
+        {
+            "name": "DL PRB",
+            "values": _on_calendar(daily, "prb"),
+            "color": "548235",
+            "axis": "DL PRB, %",
+            "kind": "column",
+        },
+    )
+    print(
+        f"Radio axes: volume {volume_limits[0]:.0f}–{volume_limits[1]:.0f}, "
+        f"throughput {throughput_limits[0]:.1f}–{throughput_limits[1]:.1f}, "
+        f"PRB {prb_limits[0]:.1f}–{prb_limits[1]:.1f}",
+        flush=True,
+    )
     foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.05), Inches(10.6), Inches(0.32))
     _set_run(
         foot.text_frame.paragraphs[0],
@@ -1800,9 +2168,7 @@ def main(feg_only: bool = False) -> None:
     pages = len(selected) + (2 if feg_only else 1) + len(trends)
     if feg_only:
         _add_feg_summary_slide(prs, rows, profiles, selected, pages)
-        radio_png = CHART_DIR / "radio_daily.png"
-        _draw_radio(radio_png, cell_network)
-        _add_radio_slide(prs, cell_network, len(selected), radio_png, pages)
+        _add_radio_slide(prs, cell_network, len(selected), pages)
     else:
         _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
@@ -1819,19 +2185,25 @@ def main(feg_only: bool = False) -> None:
         post_on = _on_cap_vector(latest_work, name, fege.LATEST_START, fege.LATEST_END)
         pre_peak, pre_avg = _peaks(rx[:72], pre_on, _num(site.get("prev_center")))
         post_peak, _post_avg = _peaks(rx[72:], post_on, _num(site.get("latest_center")))
+        if feg_only and name in feg_daily and name in cell_sites:
+            _add_slide(
+                prs,
+                site,
+                None,
+                None,
+                page,
+                pages,
+                feg_daily=feg_daily[name],
+                oss_daily=cell_sites[name],
+            )
+            print(f"  slide {page}/{pages} {name}", flush=True)
+            continue
         wide = feg_only and name not in cell_sites
         feg_png = CHART_DIR / f"{page:02d}_{name}_feg{'_wide' if wide else ''}.png"
-        if feg_only and name in feg_daily:
-            _draw_site_feg_daily(feg_png, feg_daily[name])
-        else:
-            _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=wide)
+        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=wide)
         oss_png = None
         daily_oss = False
-        if feg_only and name in cell_sites:
-            oss_png = CHART_DIR / f"{page:02d}_{name}_daily.png"
-            _draw_site_daily(oss_png, cell_sites[name])
-            daily_oss = True
-        elif not feg_only:
+        if not feg_only:
             oss_png = CHART_DIR / f"{page:02d}_{name}_oss.png"
             _draw_oss(
                 oss_png,
