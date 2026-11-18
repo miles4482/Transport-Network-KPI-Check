@@ -35,7 +35,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
-from pptx.util import Inches, Pt
+from pptx.util import Emu, Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fege_choke_check as fege
@@ -43,7 +43,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v32_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v33_FEG.pptx")
 CELL_DIR = Path("/tmp/new_kpi/oss")
 FEG_DAILY = Path("/tmp/new_kpi/feg/FEG_KPI_DHAKA_Daily.csv")
 CHART_DIR = Path("/tmp/ppt_charts")
@@ -67,6 +67,8 @@ CHART_DATES = [CHART_START + timedelta(days=offset) for offset in range((CHART_E
 DATE_STEP_DAYS = 7
 EXCEL_EPOCH = date(1899, 12, 30)
 DATE_FORMAT = "dd mmm"
+# Inner plot box, as a fraction of the chart. The step line uses the same box.
+PLOT_X, PLOT_Y, PLOT_W, PLOT_H = 0.105, 0.145, 0.775, 0.73
 # Post window is the same for every site. Pre is the 7 days before that site's step.
 POST_START = date(2026, 11, 8)
 POST_DAYS = [POST_START + timedelta(days=offset) for offset in range(7)]
@@ -1726,67 +1728,42 @@ def _split_right_axis(chart):
     return value_axis, value_copy, right
 
 
-def _series_name(series_element) -> str:
-    title = series_element.find(qn("c:tx"))
-    if title is None:
-        return ""
-    values = title.findall(".//" + qn("c:v"))
-    return values[0].text if values else ""
-
-
-def _add_step_line(chart) -> None:
-    """Thin full-height bar on the day RxMaxSpeed stepped up. Hidden from the legend."""
+def _set_inner_plot(chart) -> None:
+    """Fix the data box so a line drawn on the slide lands on the right date."""
     plot = chart._element.chart.plotArea
-    hosts = [item for item in (plot.find(qn("c:barChart")), plot.find(qn("c:lineChart"))) if item is not None]
-    step = None
-    primary = None
-    for host in hosts:
-        for series in list(host.findall(qn("c:ser"))):
-            if _series_name(series) == "RxMax step":
-                step = series
-                primary = host
-                break
-        if step is not None:
-            break
-    if step is None or primary is None:
-        return
-    primary.remove(step)
-    value_axis = plot.find(qn("c:valAx"))
-    maximum = value_axis.find(qn("c:scaling")).find(qn("c:max"))
-    if maximum is not None:
-        for point in step.find(qn("c:val")).findall(".//" + qn("c:pt")):
-            point.find(qn("c:v")).text = maximum.get("val")
-    existing = step.find(qn("c:spPr"))
-    if existing is not None:
-        step.remove(existing)
-    fill = parse_xml(
-        '<c:spPr xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
-        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        '<a:solidFill><a:srgbClr val="1A1A1A"/></a:solidFill>'
-        "<a:ln><a:noFill/></a:ln></c:spPr>"
-    )
-    step.find(qn("c:tx")).addnext(fill)
-    bar_chart = parse_xml(
-        '<c:barChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
-        '<c:barDir val="col"/>'
-        '<c:grouping val="clustered"/>'
-        '<c:varyColors val="0"/>'
-        '<c:gapWidth val="80"/>'
-        "</c:barChart>"
-    )
-    bar_chart.find(qn("c:gapWidth")).addprevious(step)
-    for axis_id in primary.findall(qn("c:axId")):
-        bar_chart.append(deepcopy(axis_id))
-    primary.addnext(bar_chart)
-    legend = chart._element.find(".//" + qn("c:legend"))
-    if legend is not None:
-        index = step.find(qn("c:idx")).get("val")
-        legend.append(
-            parse_xml(
-                '<c:legendEntry xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
-                f'<c:idx val="{index}"/><c:delete val="1"/></c:legendEntry>'
-            )
+    layout = plot.find(qn("c:layout"))
+    if layout is None:
+        layout = parse_xml('<c:layout xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>')
+        plot.insert(0, layout)
+    for child in list(layout):
+        layout.remove(child)
+    layout.append(
+        parse_xml(
+            '<c:manualLayout xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:layoutTarget val="inner"/>'
+            '<c:xMode val="edge"/>'
+            '<c:yMode val="edge"/>'
+            f'<c:x val="{PLOT_X}"/>'
+            f'<c:y val="{PLOT_Y}"/>'
+            f'<c:w val="{PLOT_W}"/>'
+            f'<c:h val="{PLOT_H}"/>'
+            "</c:manualLayout>"
         )
+    )
+
+
+def _add_step_marker(slide, graphic, mark: date) -> None:
+    """A plain line on the step date. It is not a series, so it has no legend entry."""
+    span = (CHART_END + timedelta(days=1) - CHART_START).days
+    fraction = (mark - CHART_START).days / span
+    thickness = Emu(12700)
+    x = graphic.left + int((PLOT_X + fraction * PLOT_W) * graphic.width) - thickness // 2
+    y = graphic.top + int(PLOT_Y * graphic.height)
+    height = int(PLOT_H * graphic.height)
+    line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, thickness, height)
+    line.fill.solid()
+    line.fill.fore_color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+    line.line.fill.background()
 
 
 def _add_chart(
@@ -1807,15 +1784,10 @@ def _add_chart(
     chart_type = XL_CHART_TYPE.COLUMN_CLUSTERED if left_series["kind"] == "column" else XL_CHART_TYPE.LINE
     if right_series is not None:
         data.add_series(right_series["name"], right_series["values"])
-    if mark is not None:
-        peak = max(value for value in left_series["values"] if value is not None)
-        data.add_series(
-            "RxMax step",
-            [peak if day == mark else None for day in CHART_DATES],
-        )
     graphic = slide.shapes.add_chart(chart_type, left, top, width, height, data)
     chart = graphic.chart
     _finish_chart(chart)
+    _set_inner_plot(chart)
     _set_date_scale(chart.category_axis)
     if left_series["kind"] == "column":
         chart.plots[0].gap_width = 35
@@ -1828,14 +1800,14 @@ def _add_chart(
     primary.find(qn("c:crosses")).set("val", "min")
     if right_series is None:
         if mark is not None:
-            _add_step_line(chart)
+            _add_step_marker(slide, graphic, mark)
         return limits
     _primary, secondary, right_element = _split_right_axis(chart)
     _color_line(right_element, right_series["color"])
     right_limits = _style_value_axis(secondary, right_series["values"], right_series["axis"], right_series["color"], grid=False)
     secondary.find(qn("c:crosses")).set("val", "max")
     if mark is not None:
-        _add_step_line(chart)
+        _add_step_marker(slide, graphic, mark)
     return limits, right_limits
 
 
@@ -2165,44 +2137,91 @@ def _day_row(frame: pd.DataFrame, day: date) -> pd.Series | None:
     return indexed.loc[key]
 
 
-def _pool_window(site_frames: dict[str, pd.DataFrame], days_by_site: dict[str, list[date]]) -> dict[str, float]:
-    """Sum every site on each mapped day, then average volume and apply N/D."""
-    daily_volume = []
-    numerator = denominator = prb_n = prb_d = 0.0
-    for index in range(7):
-        volume = 0.0
-        used = 0
-        for site, frame in site_frames.items():
-            row = _day_row(frame, days_by_site[site][index])
-            if row is None:
-                continue
-            volume += float(row["vol"])
-            numerator += float(row["n"])
-            denominator += float(row["d"])
-            prb_n += float(row["prb_n"])
-            prb_d += float(row["prb_d"])
-            used += 1
-        if used:
-            daily_volume.append(volume)
+def _pool_day(site_frames: dict[str, pd.DataFrame], days_by_site: dict[str, list[date]], index: int) -> dict[str, float]:
+    """One mapped day: sites summed, then throughput and PRB from N/D."""
+    volume = numerator = denominator = prb_n = prb_d = 0.0
+    used = 0
+    for site, frame in site_frames.items():
+        row = _day_row(frame, days_by_site[site][index])
+        if row is None:
+            continue
+        volume += float(row["vol"])
+        numerator += float(row["n"])
+        denominator += float(row["d"])
+        prb_n += float(row["prb_n"])
+        prb_d += float(row["prb_d"])
+        used += 1
     return {
-        "vol": float(np.mean(daily_volume)) if daily_volume else float("nan"),
+        "vol": volume if used else float("nan"),
+        "n": numerator,
+        "d": denominator,
+        "prb_n": prb_n,
+        "prb_d": prb_d,
         "tp": numerator / denominator if denominator else float("nan"),
         "prb": 100.0 * prb_n / prb_d if prb_d else float("nan"),
     }
 
 
-def _aligned_change(site_frames: dict[str, pd.DataFrame], steps: dict[str, pd.Timestamp]) -> dict[str, dict[str, float]]:
-    """Pre is the 7 days before each site's step. Post is 8–14 Nov for every site."""
+def _pool_window(days: list[dict[str, float]]) -> dict[str, float]:
+    """Mean of the seven daily volume totals. Throughput and PRB are N/D across those days."""
+    volume = [day["vol"] for day in days if np.isfinite(day["vol"])]
+    numerator = sum(day["n"] for day in days)
+    denominator = sum(day["d"] for day in days)
+    prb_n = sum(day["prb_n"] for day in days)
+    prb_d = sum(day["prb_d"] for day in days)
+    return {
+        "vol": float(np.mean(volume)) if volume else float("nan"),
+        "tp": numerator / denominator if denominator else float("nan"),
+        "prb": 100.0 * prb_n / prb_d if prb_d else float("nan"),
+    }
+
+
+def _aligned_change(site_frames: dict[str, pd.DataFrame], steps: dict[str, pd.Timestamp]) -> dict:
+    """Pre is the 7 days before each site's step. Post is 8–14 Nov for every site.
+
+    Date 1 is seven days before the step and 8 Nov. Date 7 is the day before
+    the step and 14 Nov. The best date is the mapped day where both data
+    volume and DL user throughput rise, and the smaller of those two rises
+    is the largest.
+    """
     pre_days = {
         site: [(step - pd.Timedelta(days=7 - index)).date() for index in range(7)]
         for site, step in steps.items()
     }
     post_days = {site: list(POST_DAYS) for site in steps}
     usable = {site: site_frames[site] for site in steps if site in site_frames}
+    mapped = []
+    for index in range(7):
+        pre = _pool_day(usable, pre_days, index)
+        post = _pool_day(usable, post_days, index)
+        volume_pct = (post["vol"] - pre["vol"]) / pre["vol"] * 100 if pre["vol"] else float("nan")
+        throughput_pct = (post["tp"] - pre["tp"]) / pre["tp"] * 100 if pre["tp"] else float("nan")
+        mapped.append(
+            {
+                "index": index + 1,
+                "post": POST_DAYS[index],
+                "pre": pre,
+                "post_values": post,
+                "volume_pct": volume_pct,
+                "throughput_pct": throughput_pct,
+            }
+        )
+        print(
+            f"  Date {index + 1} vs {POST_DAYS[index]:%d %b}: "
+            f"volume {pre['vol']:,.0f} → {post['vol']:,.0f} ({volume_pct:+.1f}%), "
+            f"throughput {pre['tp']:.2f} → {post['tp']:.2f} ({throughput_pct:+.1f}%)",
+            flush=True,
+        )
+    best = max(mapped, key=lambda day: min(day["volume_pct"], day["throughput_pct"]))
+    print(
+        f"Highest joint growth is Date {best['index']} versus {best['post']:%d %b}",
+        flush=True,
+    )
     return {
-        "pre": _pool_window(usable, pre_days),
-        "post": _pool_window(usable, post_days),
+        "pre": _pool_window([day["pre"] for day in mapped]),
+        "post": _pool_window([day["post_values"] for day in mapped]),
         "sites": len(usable),
+        "best": best,
     }
 
 
@@ -2216,20 +2235,22 @@ def _add_radio_slide(
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(1.18))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(1.42))
     bar.fill.solid()
     bar.fill.fore_color.rgb = navy
     bar.line.fill.background()
-    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.04), Inches(12.4), Inches(0.32))
-    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 22, white, True)
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.02), Inches(12.4), Inches(0.28))
+    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 20, white, True)
     pre, post = change["pre"], change["post"]
-    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.36), Inches(12.6), Inches(0.78))
+    best = change["best"]
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.30), Inches(12.6), Inches(1.08))
     sub.text_frame.word_wrap = True
     _set_run(
         sub.text_frame.paragraphs[0],
         (
-            f"{site_count} sites. Pre is the 7 days before each site's RxMaxSpeed step, excluding the step day. "
-            "Post is 8–14 Nov for every site. Days are aligned Date 1 to Date 7, then the sites are summed."
+            f"{site_count} sites. Date 1 to Date 7 line up the 7 days before each site's RxMaxSpeed step "
+            f"with 8–14 Nov. Highest growth in both data volume and DL user throughput is Date {best['index']}: "
+            f"the day before the step versus {best['post']:%d %b}."
         ),
         12,
         RGBColor(0xD6, 0xE3, 0xF0),
@@ -2239,21 +2260,32 @@ def _add_radio_slide(
     _set_run(
         detail,
         (
-            f"Data volume {_move(pre['vol'], post['vol'], 'GB', 0)}.  "
-            f"DL user throughput {_move(pre['tp'], post['tp'], 'Mbps', 1)}.  "
-            f"DL PRB {_move(pre['prb'], post['prb'], '%', 1, points=True)}."
+            f"Date {best['index']}: data volume {_move(best['pre']['vol'], best['post_values']['vol'], 'GB', 0)}.  "
+            f"DL user throughput {_move(best['pre']['tp'], best['post_values']['tp'], 'Mbps', 1)}."
         ),
         13,
         white,
         True,
     )
-    _chart_caption(slide, 0.22, 1.26, 6.3, "Daily data volume and DL user throughput")
+    overall = sub.text_frame.add_paragraph()
+    _set_run(
+        overall,
+        (
+            f"All 7 days: data volume {_move(pre['vol'], post['vol'], 'GB', 0)}.  "
+            f"DL user throughput {_move(pre['tp'], post['tp'], 'Mbps', 1)}.  "
+            f"DL PRB {_move(pre['prb'], post['prb'], '%', 1, points=True)}."
+        ),
+        12,
+        RGBColor(0xD6, 0xE3, 0xF0),
+        False,
+    )
+    _chart_caption(slide, 0.22, 1.48, 6.3, "Daily data volume and DL user throughput")
     volume_limits, throughput_limits = _add_chart(
         slide,
         Inches(0.08),
-        Inches(1.56),
+        Inches(1.78),
         Inches(6.58),
-        Inches(5.20),
+        Inches(5.00),
         {
             "name": "Data volume",
             "values": _on_calendar(daily, "vol"),
@@ -2269,13 +2301,13 @@ def _add_radio_slide(
             "kind": "line",
         },
     )
-    _chart_caption(slide, 6.78, 1.26, 6.3, "Daily DL PRB")
+    _chart_caption(slide, 6.78, 1.48, 6.3, "Daily DL PRB")
     prb_limits = _add_chart(
         slide,
         Inches(6.68),
-        Inches(1.56),
+        Inches(1.78),
         Inches(6.58),
-        Inches(5.20),
+        Inches(5.00),
         {
             "name": "DL PRB",
             "values": _on_calendar(daily, "prb"),
