@@ -35,7 +35,8 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v28_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v29_FEG.pptx")
+CELL_DIR = Path("/tmp/new_kpi/oss")
 CHART_DIR = Path("/tmp/ppt_charts")
 ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
 
@@ -679,7 +680,15 @@ def _add_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = Fals
     _style_run(run, size, color, bold)
 
 
-def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path | None, page: int, pages: int) -> None:
+def _add_slide(
+    prs: Presentation,
+    site: dict,
+    feg_png: Path,
+    oss_png: Path | None,
+    page: int,
+    pages: int,
+    daily_oss: bool = False,
+) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
@@ -753,7 +762,7 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path | Non
         ntf._txBody.bodyPr.set("anchor", "t")
     except Exception:
         pass
-    lines = _sentence(site, include_oss=oss_png is not None)
+    lines = _sentence(site, include_oss=oss_png is not None and not daily_oss)
     for i, line in enumerate(lines):
         paragraph = ntf.paragraphs[0] if i == 0 else ntf.add_paragraph()
         paragraph.alignment = PP_ALIGN.LEFT
@@ -766,7 +775,11 @@ def _add_slide(prs: Presentation, site: dict, feg_png: Path, oss_png: Path | Non
         ff.paragraphs[0],
         "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
         if oss_png is None
-        else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H",
+        else (
+            "FEGE chart is hourly, 5–7 Oct and 6–8 Nov. OSS chart is daily, 1 Sep–15 Nov, cells summed to the site."
+            if daily_oss
+            else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H"
+        ),
         10,
         RGBColor(0x80, 0x80, 0x80),
         False,
@@ -1020,7 +1033,7 @@ def _rose_pairs(group: list[dict]) -> list[tuple[float, float]]:
 
 
 def _feg_speed_rows(rows: list[dict]) -> list[dict]:
-    """One table row per finding. Speed is the choked-hour ceiling, in Mbit/s."""
+    """One table row per finding on this deck. Speed is the choked-hour ceiling."""
     order = (
         (fege.FINDING_AGAIN, "Choked again"),
         (fege.FINDING_SOLVED_UP, "Solved — Tx BW increased"),
@@ -1029,14 +1042,13 @@ def _feg_speed_rows(rows: list[dict]) -> list[dict]:
     table = []
     for finding, label in order:
         group = [row for row in rows if row.get("finding") == finding]
+        if not group:
+            continue
         pairs = _rose_pairs(group)
         pre = float(np.mean([before for before, _ in pairs])) if pairs else float("nan")
         post = float(np.mean([after for _, after in pairs])) if pairs else float("nan")
         n_up = len(pairs)
-        if n_up == len(group):
-            comment = f"Avg of all {len(group)} sites at the previous choked hour."
-        else:
-            comment = f"Avg of {n_up} sites that rose, at the previous choked hour."
+        comment = f"Avg of these {n_up} sites, busy-hour RxMaxSpeed p90."
         table.append({"label": label, "n": len(group), "pre": pre, "post": post, "comment": comment})
     return table
 
@@ -1096,11 +1108,11 @@ def _add_feg_summary_slide(
     sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.5), Inches(0.44))
     sub_frame = sub.text_frame
     sub_frame.word_wrap = True
-    _set_run(sub_frame.paragraphs[0], _combined_note(rows, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
+    _set_run(sub_frame.paragraphs[0], _combined_note(selected, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
 
     # Only the sites that have a slide. Slide 1 is this summary, so the table
     # stops at the last site slide.
-    site_headers = ("#", "Site", "Findings", "Daily Throughput", "BH Throughput")
+    site_headers = ("#", "Site", "Findings", "Daily FEG Speed", "BH FEG Speed")
     site_count = len(selected)
     site_shape = slide.shapes.add_table(
         1 + site_count, 5, Inches(0.16), Inches(1.04), Inches(6.28), Inches(6.16)
@@ -1153,7 +1165,7 @@ def _add_feg_summary_slide(
             paragraph.alignment = PP_ALIGN.LEFT if col in (2,) else PP_ALIGN.CENTER
             _set_run(paragraph, text, 8, RGBColor(0x1F, 0x29, 0x37), False)
 
-    speed_rows = _feg_speed_rows(rows)
+    speed_rows = _feg_speed_rows(selected)
     headers = (
         "Finding Category",
         "Sites",
@@ -1221,7 +1233,7 @@ def _add_feg_summary_slide(
     note_line.space_before = Pt(3)
     _set_run(
         note_line,
-        "Daily and BH throughput are FEGE RxMaxSpeed, in Mbit/s. Daily is the mean of every hour. BH is the mean of 20, 21 and 22. The table on the right is the busy-hour p90.",
+        "Daily FEG speed is the mean of every hour of RxMaxSpeed. BH FEG speed is the mean of 20, 21 and 22. The table on the right is the busy-hour p90 of these sites.",
         11,
         RGBColor(0x33, 0x33, 0x33),
         False,
@@ -1533,6 +1545,168 @@ def _add_trend_slide(prs: Presentation, group: dict, chart_dir: Path, page: int,
     _set_run(page_p, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
 
 
+def _load_cell_daily(sites: set[str]) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Cell rows summed to a day. Throughput is N/D. PRB is N/D times 100."""
+    paths = sorted(CELL_DIR.glob("OSS KPI Daily Cel Level_*.csv"))
+    if not paths:
+        raise SystemExit(f"Cell-level daily OSS not found in {CELL_DIR}")
+    usecols = [
+        "Date",
+        "eNodeB Name",
+        "Data Volume,GB",
+        "DL User Throughput_N",
+        "DL User Throughput_D",
+        "DL PRB Utilization_N",
+        "DL PRB Utilization_D",
+    ]
+    frames = []
+    for path in paths:
+        frame = pd.read_csv(path, usecols=usecols)
+        frame = frame.loc[frame["eNodeB Name"].astype(str).isin(sites)]
+        frames.append(frame)
+    raw = pd.concat(frames, ignore_index=True)
+    raw["day"] = pd.to_datetime(raw["Date"].astype(str) + "-2026", format="%d-%b-%Y")
+    for column in usecols[2:]:
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
+
+    def _finish(frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame.copy()
+        out["tp"] = np.where(out["d"] > 0, out["n"] / out["d"], np.nan)
+        out["prb"] = np.where(out["prb_d"] > 0, 100.0 * out["prb_n"] / out["prb_d"], np.nan)
+        return out.sort_values("day")
+
+    named = {
+        "vol": ("Data Volume,GB", "sum"),
+        "n": ("DL User Throughput_N", "sum"),
+        "d": ("DL User Throughput_D", "sum"),
+        "prb_n": ("DL PRB Utilization_N", "sum"),
+        "prb_d": ("DL PRB Utilization_D", "sum"),
+    }
+    network = _finish(raw.groupby("day", as_index=False).agg(**named))
+    site_rows = raw.groupby(["eNodeB Name", "day"], as_index=False).agg(**named)
+    site_rows = _finish(site_rows)
+    by_site = {
+        str(site): part.drop(columns="eNodeB Name")
+        for site, part in site_rows.groupby("eNodeB Name", sort=False)
+    }
+    return network, by_site
+
+
+def _daily_window_mean(frame: pd.DataFrame, start: str, end: str, column: str) -> float:
+    part = frame[(frame["day"] >= start) & (frame["day"] <= end)]
+    values = part[column].to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.mean(values)) if values.size else float("nan")
+
+
+def _mark_compare_windows(ax) -> None:
+    ax.axvspan(pd.Timestamp("2026-10-05"), pd.Timestamp("2026-10-08"), color="#D6EAF8", alpha=0.7, zorder=0)
+    ax.axvspan(pd.Timestamp("2026-11-06"), pd.Timestamp("2026-11-09"), color="#E2EFDA", alpha=0.7, zorder=0)
+
+
+def _date_axis(ax) -> None:
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.tick_params(axis="x", labelsize=7, colors=GREY)
+    for label in ax.get_xticklabels():
+        label.set_rotation(0)
+
+
+def _draw_radio(path: Path, daily: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.55), dpi=140)
+    days = daily["day"]
+    left, right = axes
+    _mark_compare_windows(left)
+    _mark_compare_windows(right)
+    volume = left.twinx()
+    volume.bar(days, daily["vol"], width=0.8, color="#C65911", alpha=0.45, zorder=1)
+    left.plot(days, daily["tp"], color="#2F5496", linewidth=1.8, zorder=3)
+    left.set_ylim(*_raised_limits(float(np.nanmin(daily["tp"])), float(np.nanmax(daily["tp"]))))
+    volume.set_ylim(0, float(np.nanmax(daily["vol"])) * 1.25)
+    left.set_ylabel("DL user throughput (Mbps)", fontsize=8, color="#2F5496")
+    volume.set_ylabel("Data volume (GB)", fontsize=8, color="#C65911")
+    left.set_title("Daily data volume and DL user throughput", fontsize=11, color=NAVY, loc="left")
+    right.bar(days, daily["prb"], width=0.8, color="#548235", alpha=0.75, zorder=1)
+    right.set_ylim(*_raised_limits(float(np.nanmin(daily["prb"])), float(np.nanmax(daily["prb"]))))
+    right.set_ylabel("DL PRB (%)", fontsize=8, color="#548235")
+    right.set_title("Daily DL PRB", fontsize=11, color=NAVY, loc="left")
+    for ax in (left, right):
+        _date_axis(ax)
+        ax.tick_params(axis="y", labelsize=8)
+    fig.text(
+        0.01,
+        0.01,
+        "Blue band is 5–7 Oct. Green band is 6–8 Nov. Throughput = sum of N / sum of D. PRB = sum of N / sum of D × 100.",
+        fontsize=8,
+        color=GREY,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _draw_site_daily(path: Path, frame: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
+    _mark_compare_windows(ax)
+    ax2 = ax.twinx()
+    ax2.bar(frame["day"], frame["vol"], width=0.8, color="#C65911", alpha=0.45, zorder=1, label="Data volume")
+    ax.plot(frame["day"], frame["tp"], color="#2F5496", linewidth=1.6, zorder=3, label="DL user throughput")
+    ax.set_ylim(*_raised_limits(float(np.nanmin(frame["tp"])), float(np.nanmax(frame["tp"]))))
+    ax2.set_ylim(0, float(np.nanmax(frame["vol"])) * 1.3)
+    ax.set_ylabel("Mbps", fontsize=8, color="#2F5496")
+    ax2.set_ylabel("GB", fontsize=8, color="#C65911")
+    _date_axis(ax)
+    fig.text(0.08, 0.98, "Site level OSS KPI, daily", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
+    fig.text(0.08, 0.90, "Data volume vs DL user throughput", ha="left", va="top", fontsize=8, color=GREY)
+    fig.subplots_adjust(left=0.10, right=0.88, top=0.78, bottom=0.18)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, chart: Path, pages: int) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.92))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.08), Inches(12.4), Inches(0.36))
+    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 24, white, True)
+    vol0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "vol")
+    vol1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "vol")
+    tp0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "tp")
+    tp1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "tp")
+    prb0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "prb")
+    prb1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "prb")
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.46), Inches(12.6), Inches(0.40))
+    sub.text_frame.word_wrap = True
+    _set_run(
+        sub.text_frame.paragraphs[0],
+        (
+            f"{site_count} sites. Daily data volume {vol0:,.0f} → {vol1:,.0f} GB, "
+            f"DL user throughput {tp0:.1f} → {tp1:.1f} Mbps, "
+            f"DL PRB {prb0:.1f} → {prb1:.1f}%.  5–7 Oct versus 6–8 Nov."
+        ),
+        13,
+        RGBColor(0xD6, 0xE3, 0xF0),
+        False,
+    )
+    slide.shapes.add_picture(str(chart), Inches(0.22), Inches(1.15), Inches(12.90), Inches(5.70))
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.05), Inches(10.6), Inches(0.32))
+    _set_run(
+        foot.text_frame.paragraphs[0],
+        "Cells summed for these sites. Daily file, 1 Sep–15 Nov. The file has no hour, so there is no busy-hour chart.",
+        11,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(7.05), Inches(1.75), Inches(0.28))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"2 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
+
+
 def main(feg_only: bool = False) -> None:
     cached = pickle.loads(ROW_CACHE.read_bytes())
     rows = cached["rows"]
@@ -1549,6 +1723,8 @@ def main(feg_only: bool = False) -> None:
     )
     profiles = _profiles(pre_oss_all, post_oss_all)
     selected = select_sites(rows, profiles, solved_limit=FEG_SOLVED_LIMIT if feg_only else OTHER_LIMIT)
+    if feg_only:
+        selected = [site for site in selected if site.get("bw_up")]
     if not selected:
         raise SystemExit("No sites matched the finding selection")
 
@@ -1568,9 +1744,16 @@ def main(feg_only: bool = False) -> None:
     prs.core_properties.subject = "comparison_v1 site findings, 5–7 Oct versus 6–8 Nov"
 
     trends = [] if feg_only else _trend_groups(rows)
-    pages = len(selected) + 1 + len(trends)
+    cell_network = cell_sites = None
+    if feg_only:
+        print(f"Summing daily cell OSS for {len(selected)} sites...", flush=True)
+        cell_network, cell_sites = _load_cell_daily({site["site"] for site in selected})
+    pages = len(selected) + (2 if feg_only else 1) + len(trends)
     if feg_only:
         _add_feg_summary_slide(prs, rows, profiles, selected, pages)
+        radio_png = CHART_DIR / "radio_daily.png"
+        _draw_radio(radio_png, cell_network)
+        _add_radio_slide(prs, cell_network, len(selected), radio_png, pages)
     else:
         _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
@@ -1579,17 +1762,24 @@ def main(feg_only: bool = False) -> None:
         print(f"  trend {page}/{pages} {group['finding']} ({len(group['sites'])} sites)", flush=True)
         for line in _trend_note(group):
             print("   ", line, flush=True)
-    for page, site in enumerate(selected, start=2 + len(trends)):
+    first_site_page = 3 if feg_only else 2 + len(trends)
+    for page, site in enumerate(selected, start=first_site_page):
         name = site["site"]
         rx = _concat(pre_feg[name]["rx"], post_feg[name]["rx"])
         pre_on = _on_cap_vector(pre_work, name, fege.ANALYSIS_START, fege.ANALYSIS_END)
         post_on = _on_cap_vector(latest_work, name, fege.LATEST_START, fege.LATEST_END)
         pre_peak, pre_avg = _peaks(rx[:72], pre_on, _num(site.get("prev_center")))
         post_peak, _post_avg = _peaks(rx[72:], post_on, _num(site.get("latest_center")))
-        feg_png = CHART_DIR / f"{page:02d}_{name}_feg{'_wide' if feg_only else ''}.png"
-        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=feg_only)
+        wide = feg_only and name not in cell_sites
+        feg_png = CHART_DIR / f"{page:02d}_{name}_feg{'_wide' if wide else ''}.png"
+        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=wide)
         oss_png = None
-        if not feg_only:
+        daily_oss = False
+        if feg_only and name in cell_sites:
+            oss_png = CHART_DIR / f"{page:02d}_{name}_daily.png"
+            _draw_site_daily(oss_png, cell_sites[name])
+            daily_oss = True
+        elif not feg_only:
             oss_png = CHART_DIR / f"{page:02d}_{name}_oss.png"
             _draw_oss(
                 oss_png,
@@ -1598,7 +1788,7 @@ def main(feg_only: bool = False) -> None:
                 site["busy_tp0"],
                 site["busy_tp1"],
             )
-        _add_slide(prs, site, feg_png, oss_png, page, pages)
+        _add_slide(prs, site, feg_png, oss_png, page, pages, daily_oss=daily_oss)
         print(f"  slide {page}/{pages} {name}", flush=True)
 
     out = OUT_FEG if feg_only else OUT
