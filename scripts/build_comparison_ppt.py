@@ -43,7 +43,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v31_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v32_FEG.pptx")
 CELL_DIR = Path("/tmp/new_kpi/oss")
 FEG_DAILY = Path("/tmp/new_kpi/feg/FEG_KPI_DHAKA_Daily.csv")
 CHART_DIR = Path("/tmp/ppt_charts")
@@ -67,6 +67,9 @@ CHART_DATES = [CHART_START + timedelta(days=offset) for offset in range((CHART_E
 DATE_STEP_DAYS = 7
 EXCEL_EPOCH = date(1899, 12, 30)
 DATE_FORMAT = "dd mmm"
+# Post window is the same for every site. Pre is the 7 days before that site's step.
+POST_START = date(2026, 11, 8)
+POST_DAYS = [POST_START + timedelta(days=offset) for offset in range(7)]
 
 NAVY = "#1F4E79"
 BLUE = "#5B9BD5"
@@ -697,15 +700,18 @@ def _add_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = Fals
     _style_run(run, size, color, bold)
 
 
-def _add_daily_pair(slide, feg_frame: pd.DataFrame, oss_frame: pd.DataFrame) -> None:
+def _add_daily_pair(slide, feg_frame: pd.DataFrame, oss_frame: pd.DataFrame) -> pd.Timestamp | None:
     """Site slide charts: daily FEGE on the left, daily OSS on the right."""
-    _chart_caption(slide, 0.20, 0.88, 6.3, "Daily FEGE")
+    step = _rx_step_date(feg_frame)
+    mark = None if step is None else step.date()
+    step_text = "No RxMaxSpeed step found" if step is None else f"Black line: RxMaxSpeed increased {step:%d %b}"
+    _chart_caption(slide, 0.20, 0.88, 6.3, "Daily FEGE", step_text)
     _add_chart(
         slide,
         Inches(0.08),
-        Inches(1.30),
+        Inches(1.38),
         Inches(6.58),
-        Inches(3.82),
+        Inches(3.74),
         {
             "name": "RxMaxSpeed",
             "values": _on_calendar(feg_frame, "rx_max"),
@@ -720,14 +726,15 @@ def _add_daily_pair(slide, feg_frame: pd.DataFrame, oss_frame: pd.DataFrame) -> 
             "axis": "Mbit/s",
             "kind": "line",
         },
+        mark=mark,
     )
-    _chart_caption(slide, 6.78, 0.88, 6.3, "Site level OSS KPI, daily", "Data volume vs DL user throughput")
+    _chart_caption(slide, 6.78, 0.88, 6.3, "Site level OSS KPI, daily", "Same step date as the FEGE chart")
     _add_chart(
         slide,
         Inches(6.68),
-        Inches(1.30),
+        Inches(1.38),
         Inches(6.58),
-        Inches(3.82),
+        Inches(3.74),
         {
             "name": "Data volume",
             "values": _on_calendar(oss_frame, "vol"),
@@ -742,7 +749,9 @@ def _add_daily_pair(slide, feg_frame: pd.DataFrame, oss_frame: pd.DataFrame) -> 
             "axis": "Mbps",
             "kind": "line",
         },
+        mark=mark,
     )
+    return step
 
 
 def _add_slide(
@@ -843,7 +852,7 @@ def _add_slide(
     ff = foot.text_frame
     _set_run(
         ff.paragraphs[0],
-        "Dates are the same on both charts, every 7 days, 1 Sep–15 Nov. Cells are summed to the site."
+        "Dates match on both charts, every 7 days. The black line is the RxMaxSpeed step, on the same date in both."
         if daily_oss
         else (
             "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
@@ -1486,11 +1495,11 @@ def _nice_step(span: float) -> float:
 
 
 def _dynamic_axis(values) -> tuple[float, float, float]:
-    """Raise the floor so a change is visible, then round to a clean tick.
+    """Put the floor as high as a round tick allows, with a little air under the data.
 
-    The floor sits about one data-span under the lowest point. A series that
-    runs 40,000–48,000 therefore starts near 30,000 rather than at zero.
-    A series that already swings down toward zero keeps a floor of zero.
+    A throughput series whose lowest point is 6.6 Mbps starts at 5, not 0.
+    A volume series whose lowest point is 821 GB starts at 700, not 500.
+    The top stays just above the highest point so a peak is not clipped.
     """
     finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
     if not finite:
@@ -1500,13 +1509,12 @@ def _dynamic_axis(values) -> tuple[float, float, float]:
     span = high - low
     if span <= 0:
         span = max(abs(high) * 0.08, 1.0)
-    # About half a span under the lowest point, so the series fills the chart
-    # and a 40,000–48,000 series starts near 35,000 rather than at zero.
-    target_min = low - 0.55 * span
-    target_max = high + 0.22 * span
+    step = _nice_step(span)
+    air = max(span * 0.08, step * 0.15)
+    target_min = low - air
+    target_max = high + max(span * 0.12, step * 0.4)
     if low >= 0 and target_min < 0:
         target_min = 0.0
-    step = _nice_step(span)
     ymin = math.floor(target_min / step) * step
     ymax = math.ceil(target_max / step) * step
     if ymin < 0 <= low:
@@ -1516,6 +1524,36 @@ def _dynamic_axis(values) -> tuple[float, float, float]:
     if ymax <= high:
         ymax += step
     return ymin, ymax, step
+
+
+def _rx_step_date(frame: pd.DataFrame) -> pd.Timestamp | None:
+    """First day RxMaxSpeed stays above the early-October ceiling.
+
+    The baseline is the median of 28 Sep–7 Oct. The step day is the first
+    later day whose own value, and the median of that day plus the next four,
+    clear the baseline by 20 Mbit/s or 8%. That day is excluded from the pre
+    window. DHBDD01 steps on 14 Oct: 13 Oct is still 264 Mbit/s.
+    """
+    indexed = frame.set_index(pd.to_datetime(frame["day"]).dt.normalize())["rx_max"]
+    indexed = indexed[~indexed.index.duplicated(keep="last")].sort_index().astype(float)
+    baseline_days = indexed.loc["2026-09-28":"2026-10-07"]
+    baseline_days = baseline_days[np.isfinite(baseline_days)]
+    if baseline_days.empty:
+        return None
+    baseline = float(baseline_days.median())
+    search = indexed.loc["2026-10-08":]
+    # A sharp ceiling first. A gradual rise still gets the first day it holds.
+    for minimum, fraction in ((20.0, 0.08), (10.0, 0.04)):
+        threshold = baseline + max(minimum, fraction * baseline)
+        for position, (day, value) in enumerate(search.items()):
+            if not np.isfinite(value) or float(value) < threshold:
+                continue
+            follow = search.iloc[position : position + 5]
+            follow = follow[np.isfinite(follow)]
+            if len(follow) < 4 or float(follow.median()) < threshold:
+                continue
+            return pd.Timestamp(day)
+    return None
 
 
 def _on_calendar(frame: pd.DataFrame, column: str) -> list[float | None]:
@@ -1688,7 +1726,79 @@ def _split_right_axis(chart):
     return value_axis, value_copy, right
 
 
-def _add_chart(slide, left, top, width, height, left_series: dict, right_series: dict | None = None):
+def _series_name(series_element) -> str:
+    title = series_element.find(qn("c:tx"))
+    if title is None:
+        return ""
+    values = title.findall(".//" + qn("c:v"))
+    return values[0].text if values else ""
+
+
+def _add_step_line(chart) -> None:
+    """Thin full-height bar on the day RxMaxSpeed stepped up. Hidden from the legend."""
+    plot = chart._element.chart.plotArea
+    hosts = [item for item in (plot.find(qn("c:barChart")), plot.find(qn("c:lineChart"))) if item is not None]
+    step = None
+    primary = None
+    for host in hosts:
+        for series in list(host.findall(qn("c:ser"))):
+            if _series_name(series) == "RxMax step":
+                step = series
+                primary = host
+                break
+        if step is not None:
+            break
+    if step is None or primary is None:
+        return
+    primary.remove(step)
+    value_axis = plot.find(qn("c:valAx"))
+    maximum = value_axis.find(qn("c:scaling")).find(qn("c:max"))
+    if maximum is not None:
+        for point in step.find(qn("c:val")).findall(".//" + qn("c:pt")):
+            point.find(qn("c:v")).text = maximum.get("val")
+    existing = step.find(qn("c:spPr"))
+    if existing is not None:
+        step.remove(existing)
+    fill = parse_xml(
+        '<c:spPr xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<a:solidFill><a:srgbClr val="1A1A1A"/></a:solidFill>'
+        "<a:ln><a:noFill/></a:ln></c:spPr>"
+    )
+    step.find(qn("c:tx")).addnext(fill)
+    bar_chart = parse_xml(
+        '<c:barChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+        '<c:barDir val="col"/>'
+        '<c:grouping val="clustered"/>'
+        '<c:varyColors val="0"/>'
+        '<c:gapWidth val="80"/>'
+        "</c:barChart>"
+    )
+    bar_chart.find(qn("c:gapWidth")).addprevious(step)
+    for axis_id in primary.findall(qn("c:axId")):
+        bar_chart.append(deepcopy(axis_id))
+    primary.addnext(bar_chart)
+    legend = chart._element.find(".//" + qn("c:legend"))
+    if legend is not None:
+        index = step.find(qn("c:idx")).get("val")
+        legend.append(
+            parse_xml(
+                '<c:legendEntry xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+                f'<c:idx val="{index}"/><c:delete val="1"/></c:legendEntry>'
+            )
+        )
+
+
+def _add_chart(
+    slide,
+    left,
+    top,
+    width,
+    height,
+    left_series: dict,
+    right_series: dict | None = None,
+    mark: date | None = None,
+):
     """A real PowerPoint chart. The right series, when present, uses the right axis."""
     data = CategoryChartData()
     data.categories = CHART_DATES
@@ -1697,6 +1807,12 @@ def _add_chart(slide, left, top, width, height, left_series: dict, right_series:
     chart_type = XL_CHART_TYPE.COLUMN_CLUSTERED if left_series["kind"] == "column" else XL_CHART_TYPE.LINE
     if right_series is not None:
         data.add_series(right_series["name"], right_series["values"])
+    if mark is not None:
+        peak = max(value for value in left_series["values"] if value is not None)
+        data.add_series(
+            "RxMax step",
+            [peak if day == mark else None for day in CHART_DATES],
+        )
     graphic = slide.shapes.add_chart(chart_type, left, top, width, height, data)
     chart = graphic.chart
     _finish_chart(chart)
@@ -1711,11 +1827,15 @@ def _add_chart(slide, left, top, width, height, left_series: dict, right_series:
     # Keep the date axis on the raised floor. autoZero would sit at 0, under the plot.
     primary.find(qn("c:crosses")).set("val", "min")
     if right_series is None:
+        if mark is not None:
+            _add_step_line(chart)
         return limits
     _primary, secondary, right_element = _split_right_axis(chart)
     _color_line(right_element, right_series["color"])
     right_limits = _style_value_axis(secondary, right_series["values"], right_series["axis"], right_series["color"], grid=False)
     secondary.find(qn("c:crosses")).set("val", "max")
+    if mark is not None:
+        _add_step_line(chart)
     return limits, right_limits
 
 
@@ -2036,42 +2156,104 @@ def _draw_site_daily(path: Path, frame: pd.DataFrame) -> None:
     plt.close(fig)
 
 
-def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, pages: int) -> None:
+def _day_row(frame: pd.DataFrame, day: date) -> pd.Series | None:
+    indexed = frame.set_index(pd.to_datetime(frame["day"]).dt.normalize())
+    indexed = indexed[~indexed.index.duplicated(keep="last")]
+    key = pd.Timestamp(day)
+    if key not in indexed.index:
+        return None
+    return indexed.loc[key]
+
+
+def _pool_window(site_frames: dict[str, pd.DataFrame], days_by_site: dict[str, list[date]]) -> dict[str, float]:
+    """Sum every site on each mapped day, then average volume and apply N/D."""
+    daily_volume = []
+    numerator = denominator = prb_n = prb_d = 0.0
+    for index in range(7):
+        volume = 0.0
+        used = 0
+        for site, frame in site_frames.items():
+            row = _day_row(frame, days_by_site[site][index])
+            if row is None:
+                continue
+            volume += float(row["vol"])
+            numerator += float(row["n"])
+            denominator += float(row["d"])
+            prb_n += float(row["prb_n"])
+            prb_d += float(row["prb_d"])
+            used += 1
+        if used:
+            daily_volume.append(volume)
+    return {
+        "vol": float(np.mean(daily_volume)) if daily_volume else float("nan"),
+        "tp": numerator / denominator if denominator else float("nan"),
+        "prb": 100.0 * prb_n / prb_d if prb_d else float("nan"),
+    }
+
+
+def _aligned_change(site_frames: dict[str, pd.DataFrame], steps: dict[str, pd.Timestamp]) -> dict[str, dict[str, float]]:
+    """Pre is the 7 days before each site's step. Post is 8–14 Nov for every site."""
+    pre_days = {
+        site: [(step - pd.Timedelta(days=7 - index)).date() for index in range(7)]
+        for site, step in steps.items()
+    }
+    post_days = {site: list(POST_DAYS) for site in steps}
+    usable = {site: site_frames[site] for site in steps if site in site_frames}
+    return {
+        "pre": _pool_window(usable, pre_days),
+        "post": _pool_window(usable, post_days),
+        "sites": len(usable),
+    }
+
+
+def _add_radio_slide(
+    prs: Presentation,
+    daily: pd.DataFrame,
+    site_count: int,
+    pages: int,
+    change: dict[str, dict[str, float]],
+) -> None:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.92))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(1.18))
     bar.fill.solid()
     bar.fill.fore_color.rgb = navy
     bar.line.fill.background()
-    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.08), Inches(12.4), Inches(0.36))
-    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 24, white, True)
-    vol0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "vol")
-    vol1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "vol")
-    tp0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "tp")
-    tp1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "tp")
-    prb0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "prb")
-    prb1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "prb")
-    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.46), Inches(12.6), Inches(0.40))
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.04), Inches(12.4), Inches(0.32))
+    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 22, white, True)
+    pre, post = change["pre"], change["post"]
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.36), Inches(12.6), Inches(0.78))
     sub.text_frame.word_wrap = True
     _set_run(
         sub.text_frame.paragraphs[0],
         (
-            f"{site_count} sites. Daily data volume {vol0:,.0f} → {vol1:,.0f} GB, "
-            f"DL user throughput {tp0:.1f} → {tp1:.1f} Mbps, "
-            f"DL PRB {prb0:.1f} → {prb1:.1f}%.  5–7 Oct versus 6–8 Nov."
+            f"{site_count} sites. Pre is the 7 days before each site's RxMaxSpeed step, excluding the step day. "
+            "Post is 8–14 Nov for every site. Days are aligned Date 1 to Date 7, then the sites are summed."
         ),
-        13,
+        12,
         RGBColor(0xD6, 0xE3, 0xF0),
         False,
     )
-    _chart_caption(slide, 0.22, 1.02, 6.3, "Daily data volume and DL user throughput")
+    detail = sub.text_frame.add_paragraph()
+    _set_run(
+        detail,
+        (
+            f"Data volume {_move(pre['vol'], post['vol'], 'GB', 0)}.  "
+            f"DL user throughput {_move(pre['tp'], post['tp'], 'Mbps', 1)}.  "
+            f"DL PRB {_move(pre['prb'], post['prb'], '%', 1, points=True)}."
+        ),
+        13,
+        white,
+        True,
+    )
+    _chart_caption(slide, 0.22, 1.26, 6.3, "Daily data volume and DL user throughput")
     volume_limits, throughput_limits = _add_chart(
         slide,
         Inches(0.08),
-        Inches(1.32),
+        Inches(1.56),
         Inches(6.58),
-        Inches(5.45),
+        Inches(5.20),
         {
             "name": "Data volume",
             "values": _on_calendar(daily, "vol"),
@@ -2087,13 +2269,13 @@ def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, pa
             "kind": "line",
         },
     )
-    _chart_caption(slide, 6.78, 1.02, 6.3, "Daily DL PRB")
+    _chart_caption(slide, 6.78, 1.26, 6.3, "Daily DL PRB")
     prb_limits = _add_chart(
         slide,
         Inches(6.68),
-        Inches(1.32),
+        Inches(1.56),
         Inches(6.58),
-        Inches(5.45),
+        Inches(5.20),
         {
             "name": "DL PRB",
             "values": _on_calendar(daily, "prb"),
@@ -2111,7 +2293,7 @@ def _add_radio_slide(prs: Presentation, daily: pd.DataFrame, site_count: int, pa
     foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.05), Inches(10.6), Inches(0.32))
     _set_run(
         foot.text_frame.paragraphs[0],
-        "Cells summed for these sites. Daily file, 1 Sep–15 Nov. The file has no hour, so there is no busy-hour chart.",
+        "Throughput is sum of N / sum of D. PRB is sum of N / sum of D × 100. Volume is the mean of the seven daily totals.",
         11,
         RGBColor(0x80, 0x80, 0x80),
         False,
@@ -2168,7 +2350,18 @@ def main(feg_only: bool = False) -> None:
     pages = len(selected) + (2 if feg_only else 1) + len(trends)
     if feg_only:
         _add_feg_summary_slide(prs, rows, profiles, selected, pages)
-        _add_radio_slide(prs, cell_network, len(selected), pages)
+        steps = {}
+        for site in selected:
+            step = _rx_step_date(feg_daily[site["site"]])
+            if step is None:
+                print(f"  no RxMaxSpeed step for {site['site']}", flush=True)
+                continue
+            steps[site["site"]] = step
+            pre_from = (step - pd.Timedelta(days=7)).date()
+            pre_to = (step - pd.Timedelta(days=1)).date()
+            print(f"  {site['site']} step {step:%d %b}  pre {pre_from:%d %b}–{pre_to:%d %b}", flush=True)
+        change = _aligned_change(cell_sites, steps)
+        _add_radio_slide(prs, cell_network, len(selected), pages, change)
     else:
         _add_summary_slide(prs, rows, selected, profiles, trends, pages)
     for offset, group in enumerate(trends):
