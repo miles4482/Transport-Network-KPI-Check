@@ -43,7 +43,7 @@ import fege_choke_check as fege
 # Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
 # _FEG keeps the FEGE chart only. Earlier files stay as they are.
 OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
-OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v33_FEG.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v34_FEG.pptx")
 CELL_DIR = Path("/tmp/new_kpi/oss")
 FEG_DAILY = Path("/tmp/new_kpi/feg/FEG_KPI_DHAKA_Daily.csv")
 CHART_DIR = Path("/tmp/ppt_charts")
@@ -1528,6 +1528,17 @@ def _dynamic_axis(values) -> tuple[float, float, float]:
     return ymin, ymax, step
 
 
+def _zero_axis(values) -> tuple[float, float, float]:
+    """Start at zero and leave a little room above the highest bar."""
+    finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    high = max(finite) if finite else 1.0
+    step = _nice_step(high / 5.0)
+    ymax = math.ceil((high * 1.12) / step) * step
+    if ymax <= high:
+        ymax += step
+    return 0.0, ymax, step
+
+
 def _rx_step_date(frame: pd.DataFrame) -> pd.Timestamp | None:
     """First day RxMaxSpeed stays above the early-October ceiling.
 
@@ -1609,9 +1620,9 @@ def _set_date_scale(date_axis) -> None:
             props.set("rot", "-2700000")
 
 
-def _style_value_axis(element, values, title: str, color: str, *, grid: bool) -> tuple[float, float, float]:
+def _style_value_axis(element, values, title: str, color: str, *, grid: bool, floor: str = "dynamic") -> tuple[float, float, float]:
     axis = ValueAxis(element)
-    ymin, ymax, step = _dynamic_axis(values)
+    ymin, ymax, step = _zero_axis(values) if floor == "zero" else _dynamic_axis(values)
     axis.minimum_scale = ymin
     axis.maximum_scale = ymax
     axis.major_unit = step
@@ -1687,7 +1698,7 @@ def _finish_chart(chart) -> None:
             marker.set("val", "0")
 
 
-def _split_right_axis(chart):
+def _split_right_axis(chart, kind: str = "line"):
     """Move the second series onto its own value axis on the right."""
     plot = chart._element.chart.plotArea
     host = plot.find(qn("c:barChart"))
@@ -1696,19 +1707,29 @@ def _split_right_axis(chart):
     series = host.findall(qn("c:ser"))
     right = series[1]
     host.remove(right)
-    line_chart = parse_xml(
-        '<c:lineChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
-        '<c:grouping val="standard"/>'
-        '<c:varyColors val="0"/>'
-        '<c:smooth val="0"/>'
-        "</c:lineChart>"
-    )
-    smooth = line_chart.find(qn("c:smooth"))
-    smooth.addprevious(right)
+    if kind == "column":
+        moved = parse_xml(
+            '<c:barChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:barDir val="col"/>'
+            '<c:grouping val="clustered"/>'
+            '<c:varyColors val="0"/>'
+            '<c:gapWidth val="55"/>'
+            "</c:barChart>"
+        )
+        moved.find(qn("c:gapWidth")).addprevious(right)
+    else:
+        moved = parse_xml(
+            '<c:lineChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:grouping val="standard"/>'
+            '<c:varyColors val="0"/>'
+            '<c:smooth val="0"/>'
+            "</c:lineChart>"
+        )
+        moved.find(qn("c:smooth")).addprevious(right)
     cat_id, val_id = "910001", "910002"
-    line_chart.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{cat_id}"/>'))
-    line_chart.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{val_id}"/>'))
-    host.addnext(line_chart)
+    moved.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{cat_id}"/>'))
+    moved.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{val_id}"/>'))
+    host.addnext(moved)
     date_axis = plot.find(qn("c:dateAx"))
     value_axis = plot.find(qn("c:valAx"))
     date_copy = deepcopy(date_axis)
@@ -1766,6 +1787,67 @@ def _add_step_marker(slide, graphic, mark: date) -> None:
     line.line.fill.background()
 
 
+def _fill_series(element, color: str, alpha: int | None = None) -> None:
+    """Solid bar fill. alpha is 0–100000, where 100000 is opaque."""
+    existing = element.find(qn("c:spPr"))
+    if existing is not None:
+        element.remove(existing)
+    tint = f'<a:alpha val="{alpha}"/>' if alpha else ""
+    fill = parse_xml(
+        '<c:spPr xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f'<a:solidFill><a:srgbClr val="{color}">{tint}</a:srgbClr></a:solidFill>'
+        "<a:ln><a:noFill/></a:ln></c:spPr>"
+    )
+    element.find(qn("c:tx")).addnext(fill)
+
+
+def _add_bands(chart, ymax: float) -> None:
+    """Pale columns behind the data for 5–7 Oct and 6–8 Nov. Not in the legend."""
+    plot = chart._element.chart.plotArea
+    host = plot.find(qn("c:lineChart"))
+    if host is None:
+        host = plot.find(qn("c:barChart"))
+    sample = host.find(qn("c:ser"))
+    category = deepcopy(sample.find(qn("c:cat")))
+    axis_ids = host.findall(qn("c:axId"))
+    windows = (
+        (date(2026, 10, 5), date(2026, 10, 8), "D6EAF8", "10"),
+        (date(2026, 11, 6), date(2026, 11, 9), "E2EFDA", "11"),
+    )
+    for start, end, color, index in windows:
+        points = []
+        for offset, day in enumerate(CHART_DATES):
+            if start <= day <= end:
+                points.append(f'<c:pt idx="{offset}"><c:v>{ymax}</c:v></c:pt>')
+        series = parse_xml(
+            '<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            f'<c:idx val="{index}"/><c:order val="{index}"/>'
+            f'<c:tx><c:v>Band {index}</c:v></c:tx>'
+            "</c:ser>"
+        )
+        series.append(deepcopy(category))
+        series.append(
+            parse_xml(
+                '<c:val xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+                f'<c:numLit><c:formatCode>General</c:formatCode>'
+                f'<c:ptCount val="{len(CHART_DATES)}"/>'
+                f'{"".join(points)}</c:numLit></c:val>'
+            )
+        )
+        _fill_series(series, color, alpha=80000)
+        band = parse_xml(
+            '<c:areaChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:grouping val="standard"/>'
+            '<c:varyColors val="0"/>'
+            "</c:areaChart>"
+        )
+        band.find(qn("c:varyColors")).addnext(series)
+        for axis_id in axis_ids:
+            band.append(deepcopy(axis_id))
+        host.addprevious(band)
+
+
 def _add_chart(
     slide,
     left,
@@ -1775,6 +1857,9 @@ def _add_chart(
     left_series: dict,
     right_series: dict | None = None,
     mark: date | None = None,
+    *,
+    legend: bool = True,
+    bands: bool = False,
 ):
     """A real PowerPoint chart. The right series, when present, uses the right axis."""
     data = CategoryChartData()
@@ -1787,25 +1872,61 @@ def _add_chart(
     graphic = slide.shapes.add_chart(chart_type, left, top, width, height, data)
     chart = graphic.chart
     _finish_chart(chart)
-    _set_inner_plot(chart)
+    if not legend:
+        chart.has_legend = False
+    if mark is not None:
+        _set_inner_plot(chart)
     _set_date_scale(chart.category_axis)
     if left_series["kind"] == "column":
-        chart.plots[0].gap_width = 35
-        _color_bars(chart.series[0], left_series["color"])
+        chart.plots[0].gap_width = 40
+        _fill_series(
+            chart.series[0]._element,
+            left_series.get("fill", left_series["color"]),
+            left_series.get("alpha"),
+        )
     else:
         _color_line(chart.series[0]._element, left_series["color"])
     primary = chart._element.chart.plotArea.find(qn("c:valAx"))
-    limits = _style_value_axis(primary, left_series["values"], left_series["axis"], left_series["color"], grid=True)
+    limits = _style_value_axis(
+        primary,
+        left_series["values"],
+        left_series["axis"],
+        left_series["color"],
+        grid=True,
+        floor=left_series.get("floor", "dynamic"),
+    )
     # Keep the date axis on the raised floor. autoZero would sit at 0, under the plot.
     primary.find(qn("c:crosses")).set("val", "min")
     if right_series is None:
+        if bands:
+            _add_bands(chart, limits[1])
         if mark is not None:
             _add_step_marker(slide, graphic, mark)
         return limits
-    _primary, secondary, right_element = _split_right_axis(chart)
-    _color_line(right_element, right_series["color"])
-    right_limits = _style_value_axis(secondary, right_series["values"], right_series["axis"], right_series["color"], grid=False)
+    _primary, secondary, right_element = _split_right_axis(chart, right_series["kind"])
+    if right_series["kind"] == "column":
+        _fill_series(right_element, right_series.get("fill", right_series["color"]), right_series.get("alpha"))
+    else:
+        _color_line(right_element, right_series["color"])
+    right_limits = _style_value_axis(
+        secondary,
+        right_series["values"],
+        right_series["axis"],
+        right_series["color"],
+        grid=False,
+        floor=right_series.get("floor", "dynamic"),
+    )
     secondary.find(qn("c:crosses")).set("val", "max")
+    if bands:
+        _add_bands(chart, limits[1])
+    if right_series["kind"] == "column":
+        # Paint the line after the columns so the line stays in front.
+        plot = chart._element.chart.plotArea
+        line_chart = plot.find(qn("c:lineChart"))
+        first_axis = plot.find(qn("c:dateAx"))
+        if line_chart is not None and first_axis is not None:
+            plot.remove(line_chart)
+            first_axis.addprevious(line_chart)
     if mark is not None:
         _add_step_marker(slide, graphic, mark)
     return limits, right_limits
@@ -2235,86 +2356,74 @@ def _add_radio_slide(
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     navy = RGBColor(0x1F, 0x4E, 0x79)
     white = RGBColor(0xFF, 0xFF, 0xFF)
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(1.42))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.82))
     bar.fill.solid()
     bar.fill.fore_color.rgb = navy
     bar.line.fill.background()
-    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.02), Inches(12.4), Inches(0.28))
-    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 20, white, True)
-    pre, post = change["pre"], change["post"]
-    best = change["best"]
-    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.30), Inches(12.6), Inches(1.08))
-    sub.text_frame.word_wrap = True
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.06), Inches(12.4), Inches(0.34))
+    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 22, white, True)
+    vol0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "vol")
+    vol1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "vol")
+    tp0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "tp")
+    tp1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "tp")
+    prb0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "prb")
+    prb1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "prb")
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.6), Inches(0.34))
+    sub.text_frame.word_wrap = False
     _set_run(
         sub.text_frame.paragraphs[0],
         (
-            f"{site_count} sites. Date 1 to Date 7 line up the 7 days before each site's RxMaxSpeed step "
-            f"with 8–14 Nov. Highest growth in both data volume and DL user throughput is Date {best['index']}: "
-            f"the day before the step versus {best['post']:%d %b}."
-        ),
-        12,
-        RGBColor(0xD6, 0xE3, 0xF0),
-        False,
-    )
-    detail = sub.text_frame.add_paragraph()
-    _set_run(
-        detail,
-        (
-            f"Date {best['index']}: data volume {_move(best['pre']['vol'], best['post_values']['vol'], 'GB', 0)}.  "
-            f"DL user throughput {_move(best['pre']['tp'], best['post_values']['tp'], 'Mbps', 1)}."
+            f"{site_count} sites. Daily data volume {vol0:,.0f} → {vol1:,.0f} GB, "
+            f"DL user throughput {tp0:.1f} → {tp1:.1f} Mbps, "
+            f"DL PRB {prb0:.1f} → {prb1:.1f}%.  5–7 Oct versus 6–8 Nov."
         ),
         13,
-        white,
-        True,
-    )
-    overall = sub.text_frame.add_paragraph()
-    _set_run(
-        overall,
-        (
-            f"All 7 days: data volume {_move(pre['vol'], post['vol'], 'GB', 0)}.  "
-            f"DL user throughput {_move(pre['tp'], post['tp'], 'Mbps', 1)}.  "
-            f"DL PRB {_move(pre['prb'], post['prb'], '%', 1, points=True)}."
-        ),
-        12,
         RGBColor(0xD6, 0xE3, 0xF0),
         False,
     )
-    _chart_caption(slide, 0.22, 1.48, 6.3, "Daily data volume and DL user throughput")
-    volume_limits, throughput_limits = _add_chart(
+    _chart_caption(slide, 0.28, 0.90, 6.3, "Daily data volume and DL user throughput")
+    throughput_limits, volume_limits = _add_chart(
         slide,
         Inches(0.08),
-        Inches(1.78),
-        Inches(6.58),
-        Inches(5.00),
-        {
-            "name": "Data volume",
-            "values": _on_calendar(daily, "vol"),
-            "color": "C65911",
-            "axis": "GB",
-            "kind": "column",
-        },
+        Inches(1.22),
+        Inches(6.55),
+        Inches(5.15),
         {
             "name": "DL user throughput",
             "values": _on_calendar(daily, "tp"),
             "color": "2F5496",
-            "axis": "Mbps",
+            "axis": "DL user throughput (Mbps)",
             "kind": "line",
         },
+        {
+            "name": "Data volume",
+            "values": _on_calendar(daily, "vol"),
+            "color": "C65911",
+            "axis": "Data volume (GB)",
+            "kind": "column",
+            "floor": "zero",
+            "alpha": 50000,
+        },
+        legend=False,
+        bands=True,
     )
-    _chart_caption(slide, 6.78, 1.48, 6.3, "Daily DL PRB")
+    _chart_caption(slide, 6.85, 0.90, 6.2, "Daily DL PRB")
     prb_limits = _add_chart(
         slide,
-        Inches(6.68),
-        Inches(1.78),
-        Inches(6.58),
-        Inches(5.00),
+        Inches(6.70),
+        Inches(1.22),
+        Inches(6.40),
+        Inches(5.15),
         {
             "name": "DL PRB",
             "values": _on_calendar(daily, "prb"),
             "color": "548235",
-            "axis": "DL PRB, %",
+            "axis": "DL PRB (%)",
             "kind": "column",
+            "alpha": 80000,
         },
+        legend=False,
+        bands=True,
     )
     print(
         f"Radio axes: volume {volume_limits[0]:.0f}–{volume_limits[1]:.0f}, "
@@ -2322,10 +2431,25 @@ def _add_radio_slide(
         f"PRB {prb_limits[0]:.1f}–{prb_limits[1]:.1f}",
         flush=True,
     )
-    foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.05), Inches(10.6), Inches(0.32))
+    best = change["best"]
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(6.48), Inches(11.2), Inches(0.48))
+    foot.text_frame.word_wrap = True
     _set_run(
         foot.text_frame.paragraphs[0],
-        "Throughput is sum of N / sum of D. PRB is sum of N / sum of D × 100. Volume is the mean of the seven daily totals.",
+        "Blue band is 5–7 Oct. Green band is 6–8 Nov. Throughput = sum of N / sum of D. PRB = sum of N / sum of D × 100.",
+        11,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    second = foot.text_frame.add_paragraph()
+    _set_run(
+        second,
+        (
+            f"Cells summed for these sites, 1 Sep–15 Nov. Strongest same-day gain is the day before each step "
+            f"versus {best['post']:%-d %b}: volume "
+            f"{best['pre']['vol']:,.0f} to {best['post_values']['vol']:,.0f} GB, throughput "
+            f"{best['pre']['tp']:.1f} to {best['post_values']['tp']:.1f} Mbps."
+        ),
         11,
         RGBColor(0x80, 0x80, 0x80),
         False,
