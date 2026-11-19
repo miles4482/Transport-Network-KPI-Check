@@ -1,0 +1,2573 @@
+#!/usr/bin/env python3
+"""Management PPT: one slide per site for comparison_v1 findings.
+
+Pre window is 5–7 Oct. Post window is 6–8 Nov. comparison_v1 keeps
+sites that were already flat, then the ceiling rose. November is either
+released (solved) or flat again on the new ceiling (choked again).
+Choked again keeps every site. Each other finding keeps the 10
+largest daytime throughput gains. Within a finding, the largest gain
+comes first.
+"""
+
+from __future__ import annotations
+
+import math
+import pickle
+import sys
+from copy import deepcopy
+from datetime import date, timedelta
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from lxml import etree
+from pptx import Presentation
+from pptx.chart.axis import ValueAxis
+from pptx.chart.data import CategoryChartData
+from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.oxml import parse_xml
+from pptx.oxml.ns import qn
+from pptx.util import Emu, Inches, Pt
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fege_choke_check as fege
+
+# Two named decks. _OSS keeps the FEGE chart, the OSS chart, and the OSS note.
+# _FEG keeps the FEGE chart only. Earlier files stay as they are.
+OUT = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v23_OSS.pptx")
+OUT_FEG = Path("Comparison_v1_Findings_5Oct_vs_6Nov_v34_FEG.pptx")
+CELL_DIR = Path("/tmp/new_kpi/oss")
+FEG_DAILY = Path("/tmp/new_kpi/feg/FEG_KPI_DHAKA_Daily.csv")
+CHART_DIR = Path("/tmp/ppt_charts")
+ROW_CACHE = Path("/tmp/compare_v1_rows.pkl")
+
+# Significant Data BusyHour 1H move. Absolute and percent both have to clear
+# the bar so a tiny base rate does not look like a large gain.
+SIG_TP_MBPS = 1.0
+SIG_TP_PCT = 10.0
+SIG_VOL_PCT = 10.0
+# "Not much" / maintained volume: not a real drop, and not a significant rise.
+HOLD_VOL_MIN = -5.0
+HOLD_VOL_MAX = SIG_VOL_PCT
+# Small throughput gain still has to be visible.
+SMALL_TP_MBPS = 0.30
+
+# Both daily charts share this calendar, this label format, and this tick step.
+CHART_START = date(2026, 9, 1)
+CHART_END = date(2026, 11, 15)
+CHART_DATES = [CHART_START + timedelta(days=offset) for offset in range((CHART_END - CHART_START).days + 1)]
+DATE_STEP_DAYS = 7
+EXCEL_EPOCH = date(1899, 12, 30)
+DATE_FORMAT = "dd mmm"
+# Inner plot box, as a fraction of the chart. The step line uses the same box.
+PLOT_X, PLOT_Y, PLOT_W, PLOT_H = 0.105, 0.145, 0.775, 0.73
+# Post window is the same for every site. Pre is the 7 days before that site's step.
+POST_START = date(2026, 11, 8)
+POST_DAYS = [POST_START + timedelta(days=offset) for offset in range(7)]
+
+NAVY = "#1F4E79"
+BLUE = "#5B9BD5"
+GREEN = "#548235"
+RED = "#C00000"
+ORANGE = "#ED7D31"
+PURPLE = "#7030A0"
+GREY = "#595959"
+
+# Highest daytime-throughput improvement first.
+CATEGORY_ORDER = (
+    fege.FINDING_UP_CHOKED,
+    fege.FINDING_SOLVED_UP,
+    fege.FINDING_UP,
+    fege.FINDING_AGAIN,
+    fege.FINDING_SOLVED,
+)
+BUCKET_BOTH = "both"
+BUCKET_HOLD = "hold"
+BUCKET_SMALL = "small"
+BUCKET_OTHER = "other"
+BUCKET_DAY = "day"
+BUCKET_LABEL = {
+    BUCKET_BOTH: "Both throughput and data volume improved",
+    BUCKET_HOLD: "Throughput improved, data volume held",
+    BUCKET_SMALL: "Small improvement, KPIs did not fall",
+    BUCKET_DAY: "Daytime throughput improved",
+    BUCKET_OTHER: "Included with every choked-again site",
+}
+# Choked again is shown in full. Each other finding shows this many,
+# largest daytime gain first. The FEGE deck keeps two Solved slides,
+# which drops the previous slides 40–47.
+OTHER_LIMIT = 10
+FEG_SOLVED_LIMIT = 2
+# Choked again opens the deck. The other findings follow.
+DECK_ORDER = (
+    fege.FINDING_AGAIN,
+    fege.FINDING_SOLVED_UP,
+    fege.FINDING_SOLVED,
+)
+BH_HOURS = (20, 21, 22)
+
+
+def _num(value: object) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return out if np.isfinite(out) else float("nan")
+
+
+def _metrics(row: dict) -> dict | None:
+    prev = row.get("prev_oss") or {}
+    latest = row.get("latest_oss") or {}
+    tp0, tp1 = _num(prev.get("tp_data_1h")), _num(latest.get("tp_data_1h"))
+    vol0, vol1 = _num(prev.get("vol_data_1h")), _num(latest.get("vol_data_1h"))
+    if not all(np.isfinite(v) for v in (tp0, tp1, vol0, vol1)):
+        return None
+    if tp0 == 0 or vol0 == 0:
+        return None
+    tp_delta = tp1 - tp0
+    vol_delta = vol1 - vol0
+    return {
+        "tp0": tp0,
+        "tp1": tp1,
+        "tp_delta": tp_delta,
+        "tp_pct": 100.0 * tp_delta / tp0,
+        "vol0": vol0,
+        "vol1": vol1,
+        "vol_delta": vol_delta,
+        "vol_pct": 100.0 * vol_delta / vol0,
+    }
+
+
+def _sig_tp(m: dict) -> bool:
+    return m["tp_delta"] >= SIG_TP_MBPS and m["tp_pct"] >= SIG_TP_PCT
+
+
+def _bucket(m: dict) -> str:
+    """Which of the three management examples this site is, or blank."""
+    if m["tp_delta"] < 0 and m["vol_delta"] < 0:
+        return ""
+    if _sig_tp(m) and m["vol_pct"] >= SIG_VOL_PCT and m["vol_delta"] > 0:
+        return BUCKET_BOTH
+    if _sig_tp(m) and HOLD_VOL_MIN <= m["vol_pct"] < HOLD_VOL_MAX:
+        return BUCKET_HOLD
+    if (
+        m["tp_delta"] >= SMALL_TP_MBPS
+        and not _sig_tp(m)
+        and m["vol_pct"] >= HOLD_VOL_MIN
+    ):
+        return BUCKET_SMALL
+    return ""
+
+
+def _daytime(series: np.ndarray) -> float:
+    """Median of 09:00–22:00. That is the part of the curve a reader compares."""
+    hours = np.arange(series.size) % 24
+    body = series[(hours >= 9) & (hours <= 22)]
+    body = body[np.isfinite(body)]
+    return float(np.median(body)) if body.size else float("nan")
+
+
+def _min_day_hours(series: np.ndarray) -> int:
+    counts = []
+    for day in range(3):
+        chunk = series[day * 24 : (day + 1) * 24]
+        if chunk.size < 24:
+            return 0
+        counts.append(int(np.isfinite(chunk).sum()))
+    return min(counts) if counts else 0
+
+
+def _hour_mean(series: np.ndarray, hours: tuple[int, ...] | None = None) -> float:
+    """Mean of the hourly samples. hours limits the clock hours, such as 20–22."""
+    if series is None or series.size == 0:
+        return float("nan")
+    if hours is None:
+        good = series[np.isfinite(series)]
+    else:
+        clock = np.arange(series.size) % 24
+        good = series[np.isin(clock, list(hours)) & np.isfinite(series)]
+    return float(np.mean(good)) if good.size else float("nan")
+
+
+def _step(before: float, after: float) -> float:
+    if np.isfinite(before) and np.isfinite(after):
+        return after - before
+    return float("nan")
+
+
+def _profiles(pre: dict, post: dict) -> dict[str, dict]:
+    out = {}
+    for site in pre:
+        if site not in post:
+            continue
+        tp0, tp1 = _daytime(pre[site]["tp"]), _daytime(post[site]["tp"])
+        vol0, vol1 = _daytime(pre[site]["vol"]), _daytime(post[site]["vol"])
+        tp24_0, tp24_1 = _hour_mean(pre[site]["tp"]), _hour_mean(post[site]["tp"])
+        vol24_0, vol24_1 = _hour_mean(pre[site]["vol"]), _hour_mean(post[site]["vol"])
+        tp_bh_0, tp_bh_1 = _hour_mean(pre[site]["tp"], BH_HOURS), _hour_mean(post[site]["tp"], BH_HOURS)
+        vol_bh_0, vol_bh_1 = _hour_mean(pre[site]["vol"], BH_HOURS), _hour_mean(post[site]["vol"], BH_HOURS)
+        out[site] = {
+            "busy_tp0": tp0,
+            "busy_tp1": tp1,
+            "busy_tp_delta": tp1 - tp0 if np.isfinite(tp0) and np.isfinite(tp1) else float("nan"),
+            "busy_tp_pct": (100.0 * (tp1 - tp0) / tp0) if tp0 else float("nan"),
+            "busy_vol0": vol0,
+            "busy_vol1": vol1,
+            "busy_vol_pct": (100.0 * (vol1 - vol0) / vol0) if vol0 else float("nan"),
+            "tp24_0": tp24_0,
+            "tp24_1": tp24_1,
+            "tp24": _step(tp24_0, tp24_1),
+            "vol24": _step(vol24_0, vol24_1),
+            "tp_bh_0": tp_bh_0,
+            "tp_bh_1": tp_bh_1,
+            "tp_bh": _step(tp_bh_0, tp_bh_1),
+            "vol_bh": _step(vol_bh_0, vol_bh_1),
+            "min_hours": min(_min_day_hours(pre[site]["tp"]), _min_day_hours(post[site]["tp"])),
+        }
+    return out
+
+
+def _median_step(rows: list[dict], profiles: dict[str, dict], key: str, finding: str | None = None) -> float:
+    values = []
+    for row in rows:
+        if finding is not None and row.get("finding") != finding:
+            continue
+        profile = profiles.get(row["site"])
+        if profile is None:
+            continue
+        value = profile.get(key, float("nan"))
+        if np.isfinite(value):
+            values.append(value)
+    return float(np.median(values)) if values else float("nan")
+
+
+def _rank_key(site: dict) -> tuple[float, float]:
+    delta = site.get("busy_tp_delta", float("nan"))
+    pct = site.get("busy_tp_pct", float("nan"))
+    return (
+        delta if np.isfinite(delta) else -1e9,
+        pct if np.isfinite(pct) else -1e9,
+    )
+
+
+def select_sites(rows: list[dict], profiles: dict[str, dict], solved_limit: int = OTHER_LIMIT) -> list[dict]:
+    """Every choked-again site, then the largest daytime gains in each other finding.
+
+    Order inside a finding is the daytime throughput step, largest first.
+    """
+    grouped: dict[str, list[dict]] = {name: [] for name in DECK_ORDER}
+    for row in rows:
+        finding = row.get("finding")
+        if finding not in grouped:
+            continue
+        metrics = _metrics(row)
+        profile = profiles.get(row["site"])
+        if metrics is None or profile is None:
+            continue
+        bucket = _bucket(metrics)
+        if not bucket:
+            bucket = BUCKET_OTHER if finding == fege.FINDING_AGAIN else BUCKET_DAY
+        grouped[finding].append({**row, "metrics": metrics, "bucket": bucket, **profile})
+
+    picked: list[dict] = []
+    for finding in DECK_ORDER:
+        pool = sorted(grouped[finding], key=_rank_key, reverse=True)
+        limit = None if finding == fege.FINDING_AGAIN else (
+            solved_limit if finding == fege.FINDING_SOLVED else OTHER_LIMIT
+        )
+        chosen = pool if limit is None else pool[:limit]
+        for index, site in enumerate(chosen, start=1):
+            site["pick_index"] = index
+            site["pick_total"] = len(chosen)
+            picked.append(site)
+        print(f"{finding}: {len(chosen)} of {len(pool)} sites", flush=True)
+        for site in chosen[:12]:
+            m = site["metrics"]
+            print(
+                f"  {site['pick_index']}. {site['site']}  {site['bucket']}"
+                f"  daytime {site['busy_tp0']:.1f}->{site['busy_tp1']:.1f}"
+                f" ({site['busy_tp_pct']:+.0f}%)"
+                f"  1H TP {m['tp0']:.2f}->{m['tp1']:.2f}",
+                flush=True,
+            )
+        if len(chosen) > 12:
+            print(f"  … {len(chosen) - 12} more", flush=True)
+    return picked
+
+
+def _hour_matrix(frame: pd.DataFrame, sites: set[str], value_cols: dict[str, str], start, end):
+    """site -> {name: 72-length array} aligned to the three-day window."""
+    days = list(pd.date_range(start, end, freq="D"))
+    day_index = {day.normalize(): i for i, day in enumerate(days)}
+    out = {
+        site: {name: np.full(72, np.nan) for name in value_cols}
+        for site in sites
+    }
+    if frame.empty:
+        return out, days
+    sub = frame.loc[frame["eNodeB Name"].astype(str).isin(sites)]
+    sites_arr = sub["eNodeB Name"].astype(str).to_numpy()
+    dates = pd.to_datetime(sub["Date"]).dt.normalize().to_numpy()
+    hours = sub["Hour"].to_numpy()
+    arrays = {name: sub[col].to_numpy(dtype=float) for name, col in value_cols.items()}
+    for i, site in enumerate(sites_arr):
+        day = pd.Timestamp(dates[i]).normalize()
+        slot = day_index.get(day)
+        hour = int(hours[i])
+        if slot is None or not 0 <= hour <= 23 or site not in out:
+            continue
+        pos = slot * 24 + hour
+        for name, values in arrays.items():
+            value = float(values[i])
+            if np.isfinite(value):
+                out[site][name][pos] = value
+    return out, days
+
+
+def _prepare_feg(work: pd.DataFrame, sites: set[str], start, end):
+    part = work.loc[
+        work["eNodeB Name"].astype(str).isin(sites)
+        & (work["Date"] >= start)
+        & (work["Date"] <= end),
+        ["eNodeB Name", "Date", "Hour", "Rx", "TxBW"],
+    ].copy()
+    return _hour_matrix(part, sites, {"rx": "Rx", "tx": "TxBW"}, start, end)
+
+
+def _prepare_oss(path: Path, sites: set[str], start, end):
+    raw = pd.read_csv(path)
+    raw["Date"] = fege.parse_kpi_date(raw["Date"])
+    raw["Hour"] = fege.parse_hour(raw["Time"])
+    raw["eNodeB Name"] = raw["eNodeB Name"].astype(str).str.strip()
+    raw = raw.loc[
+        raw["eNodeB Name"].isin(sites)
+        & (raw["Date"] >= start)
+        & (raw["Date"] <= end)
+    ].copy()
+    num = raw["DL User Throughput_N"].astype(float)
+    den = raw["DL User Throughput_D"].astype(float)
+    raw["Throughput"] = np.where(den > 0, num / den, np.nan)
+    raw["Volume"] = raw["Data Volume,GB"].astype(float)
+    return _hour_matrix(
+        raw, sites, {"tp": "Throughput", "vol": "Volume"}, start, end
+    )
+
+
+def _concat(pre: np.ndarray, post: np.ndarray) -> np.ndarray:
+    return np.concatenate([pre, post])
+
+
+def _style_time_axis(ax, n: int) -> None:
+    labels = ["5 Oct", "6 Oct", "7 Oct", "6 Nov", "7 Nov", "8 Nov"]
+    ax.set_xlim(-0.5, n - 0.5)
+    ticks = []
+    tick_labels = []
+    for day in range(6):
+        for hour, text in ((0, "00"), (12, "12")):
+            ticks.append(day * 24 + hour)
+            tick_labels.append(text)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(tick_labels, fontsize=7, color=GREY)
+    ax.tick_params(axis="x", length=0, pad=2)
+    for day, label in enumerate(labels):
+        ax.annotate(
+            label,
+            xy=(day * 24 + 11.5, 0),
+            xycoords=("data", "axes fraction"),
+            xytext=(0, -18),
+            textcoords="offset points",
+            ha="center",
+            va="top",
+            fontsize=8,
+            color=NAVY,
+            fontweight="regular",
+            annotation_clip=False,
+        )
+    ax.axvspan(-0.5, 72 - 0.5, color="#DEEBF7", alpha=0.55, zorder=0)
+    ax.axvspan(72 - 0.5, n - 0.5, color="#E2EFDA", alpha=0.55, zorder=0)
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color("#BFBFBF")
+    ax.tick_params(axis="y", labelsize=8, colors=GREY)
+
+
+def _sharp_limits(values: np.ndarray) -> tuple[float, float]:
+    """Axis close to the 09:00–22:00 body, so a pre/post step is not flattened.
+
+    Night hours still plot. If they sit below the daytime cluster they meet
+    the axis floor instead of pulling the scale back to zero.
+    """
+    hours = np.arange(values.size) % 24
+    body = values[(hours >= 9) & (hours <= 22) & np.isfinite(values)]
+    if body.size < 8:
+        body = values[np.isfinite(values)]
+    if body.size == 0:
+        return 0.0, 1.0
+    finite = values[np.isfinite(values)]
+    low = float(np.percentile(body, 10))
+    body_high = float(np.percentile(body, 90))
+    # The top follows almost every hour, so off-peak peaks are not sliced flat.
+    high = float(np.percentile(finite, 98))
+    peak = float(np.max(finite))
+    body_span = max(body_high - low, 1.0)
+    ymin = low - 0.45 * body_span
+    if ymin < 0:
+        ymin = 0.0
+    if high > 0:
+        ymin = min(ymin, high * 0.22)
+    ymax = high + 0.08 * max(high - ymin, 1.0)
+    if peak <= ymax * 1.15:
+        ymax = peak + 0.06 * max(peak - ymin, 1.0)
+    if ymax <= ymin:
+        ymax = ymin + 1.0
+    return ymin, ymax
+
+
+def _draw_feg(path: Path, rx: np.ndarray, pre_peak: float, pre_avg: float, post_peak: float, *, wide: bool = False) -> None:
+    fig, ax = plt.subplots(figsize=(12.8, 4.15) if wide else (7.4, 3.55), dpi=140)
+    x = np.arange(len(rx))
+    _style_time_axis(ax, len(rx))
+    pre = np.where(x < 72, rx, np.nan)
+    post = np.where(x >= 72, rx, np.nan)
+    ax.plot(x, pre, color=BLUE, linewidth=1.8, label="RxMaxSpeed 5–7 Oct", zorder=3)
+    ax.plot(x, post, color=GREEN, linewidth=1.8, label="RxMaxSpeed 6–8 Nov", zorder=3)
+    if np.isfinite(pre_peak):
+        ax.plot(x[:72], np.full(72, pre_peak), color=RED, linewidth=1.1, linestyle="--", label=f"Peak 5–7 Oct ({pre_peak:.0f})", zorder=2)
+    if np.isfinite(pre_avg):
+        ax.plot(x[:72], np.full(72, pre_avg), color=ORANGE, linewidth=1.1, linestyle="--", label=f"Avg peak 5–7 Oct ({pre_avg:.0f})", zorder=2)
+    if np.isfinite(post_peak):
+        ax.plot(x[72:], np.full(len(rx) - 72, post_peak), color=PURPLE, linewidth=1.1, linestyle="--", label=f"Peak 6–8 Nov ({post_peak:.0f})", zorder=2)
+    finite = rx[np.isfinite(rx)]
+    ymax, _step = fege._chart_y_scale(finite.tolist() if finite.size else [50])
+    ax.set_ylim(0, ymax)
+    ax.set_ylabel("Mbit/s", fontsize=8, color=GREY)
+    fig.text(0.08, 0.98, "FEGE RxMaxSpeed", ha="left", va="top", fontsize=12, color=NAVY, fontweight="bold")
+    ax.legend(
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.02),
+        ncol=5 if wide else 3,
+        frameon=False,
+        fontsize=9 if wide else 7,
+        borderaxespad=0,
+    )
+    fig.subplots_adjust(left=0.06 if wide else 0.08, right=0.985, top=0.78 if wide else 0.70, bottom=0.16 if wide else 0.22)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _daily_peak_low(tp: np.ndarray) -> tuple[float, float]:
+    """Mean of each day's highest throughput hour, and of each day's lowest."""
+    peaks, lows = [], []
+    for day in range(tp.size // 24):
+        chunk = tp[day * 24 : (day + 1) * 24]
+        good = chunk[np.isfinite(chunk)]
+        if good.size == 0:
+            continue
+        peaks.append(float(np.max(good)))
+        lows.append(float(np.min(good)))
+    peak = float(np.mean(peaks)) if peaks else float("nan")
+    low = float(np.mean(lows)) if lows else float("nan")
+    return peak, low
+
+
+def _guide(ax, xspan: np.ndarray, level: float, color: str, style: str, width: float = 1.3):
+    if not np.isfinite(level) or xspan.size == 0:
+        return None
+    line, = ax.plot(
+        xspan,
+        np.full(xspan.size, level),
+        color=color,
+        linewidth=width,
+        linestyle=style,
+        zorder=4,
+    )
+    return line
+
+
+def _evening_volume_mean(vol: np.ndarray) -> float:
+    """Mean data volume at 20:00, 21:00, 22:00 and 23:00 across this window."""
+    picked = []
+    for day in range(vol.size // 24):
+        chunk = vol[day * 24 : (day + 1) * 24]
+        for hour in (20, 21, 22, 23):
+            value = chunk[hour]
+            if np.isfinite(value):
+                picked.append(float(value))
+    return float(np.mean(picked)) if picked else float("nan")
+
+
+def _draw_oss(path: Path, tp: np.ndarray, vol: np.ndarray, pre_level: float, post_level: float) -> None:
+    """Hourly throughput, volume bars, and pre/post guides.
+
+    Throughput guides are the mean daily peak and the mean daily low, each
+    drawn only across its own days. Data volume has one mean line per window,
+    the average of hours 20–23. The pre and post daytime throughput levels
+    stay as a note.
+    """
+    fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
+    x = np.arange(len(tp))
+    _style_time_axis(ax, len(tp))
+    ax2 = ax.twinx()
+    bars = ax2.bar(x, vol, width=0.85, color="#C65911", alpha=0.45, zorder=1)
+    line_tp, = ax.plot(x, tp, color="#2F5496", linewidth=1.6, zorder=3)
+    pre_peak, pre_low = _daily_peak_low(tp[:72])
+    post_peak, post_low = _daily_peak_low(tp[72:])
+    guides = (
+        (_guide(ax, x[:72], pre_peak, "#548235", "--", 1.6), "TP peak pre"),
+        (_guide(ax, x[72:], post_peak, "#203864", "--", 1.6), "TP peak post"),
+        (_guide(ax, x[:72], pre_low, "#7F7F7F", ":", 1.6), "TP low pre"),
+        (_guide(ax, x[72:], post_low, "#000000", ":", 1.6), "TP low post"),
+        # Volume average of hours 20–23. Purple, not orange, so it is not the bars.
+        (_guide(ax2, x[:72], _evening_volume_mean(vol[:72]), "#7030A0", "-.", 2.0), "Vol 20–23 pre"),
+        (_guide(ax2, x[72:], _evening_volume_mean(vol[72:]), "#C00000", "-.", 2.0), "Vol 20–23 post"),
+    )
+    levels = [value for value in (pre_peak, post_peak, pre_low, post_low) if np.isfinite(value)]
+    tp_min, tp_max = _sharp_limits(np.concatenate([tp, levels]) if levels else tp)
+    vol_min, vol_max = _sharp_limits(vol)
+    ax.set_ylim(tp_min, tp_max)
+    ax2.set_ylim(vol_min, vol_max)
+    ax.set_ylabel("Throughput (Mbps)", fontsize=8, color="#2F5496")
+    ax2.set_ylabel("Data volume (GB)", fontsize=8, color="#C65911")
+    ax.tick_params(axis="y", colors="#2F5496")
+    ax2.tick_params(axis="y", labelsize=8, colors="#C65911")
+    ax2.spines["right"].set_color("#C65911")
+    fig.text(0.10, 0.985, "OSS throughput and data volume", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
+    note = []
+    if np.isfinite(pre_level):
+        note.append(f"Pre {pre_level:.1f} Mbps")
+    if np.isfinite(post_level):
+        note.append(f"Post {post_level:.1f} Mbps")
+    if note:
+        fig.text(0.98, 0.985, "    ".join(note), ha="right", va="top", fontsize=8, color=GREY)
+    handles = [line_tp, bars]
+    labels = ["Throughput", "Data volume"]
+    for line, label in guides:
+        if line is not None:
+            handles.append(line)
+            labels.append(label)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(0.08, 0.955),
+        ncol=4,
+        frameon=False,
+        fontsize=7.5,
+        borderaxespad=0,
+        columnspacing=1.0,
+        handlelength=2.2,
+        handletextpad=0.4,
+    )
+    fig.subplots_adjust(left=0.10, right=0.90, top=0.74, bottom=0.18)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _peaks(rx: np.ndarray, on_cap: np.ndarray | None, center: float) -> tuple[float, float]:
+    hours = rx[:72] if rx.size >= 72 else rx
+    finite = hours[np.isfinite(hours)]
+    peak = float(np.max(finite)) if finite.size else float("nan")
+    # Daily maximums approximate the chart's average peak when a stuck level
+    # is not known. Prefer the official wall average when OnCap is present.
+    if on_cap is not None and np.isfinite(center):
+        collected = []
+        for day in range(3):
+            sl = slice(day * 24, day * 24 + 24)
+            day_rx = hours[sl]
+            day_on = on_cap[sl]
+            good = day_rx[np.isfinite(day_rx)]
+            if good.size == 0:
+                continue
+            day_max = float(np.max(good))
+            for value, flag in zip(day_rx, day_on):
+                if not np.isfinite(value):
+                    continue
+                if flag or value >= day_max or value >= center:
+                    collected.append(float(value))
+        avg = float(np.mean(collected)) if collected else float("nan")
+    else:
+        daily = []
+        for day in range(3):
+            sl = hours[day * 24 : day * 24 + 24]
+            good = sl[np.isfinite(sl)]
+            if good.size:
+                daily.append(float(np.max(good)))
+        avg = float(np.mean(daily)) if daily else float("nan")
+    return peak, avg
+
+
+def _sentence(site: dict, include_oss: bool = True) -> list[str]:
+    m = site["metrics"]
+    bucket = site["bucket"]
+    rx0, rx1 = _num(site.get("old_rx")), _num(site.get("new_rx"))
+    if site.get("bw_up") and np.isfinite(rx0) and np.isfinite(rx1):
+        ceiling = (
+            f"Tx ceiling rose from {rx0:.0f} to {rx1:.0f} Mbit/s "
+            f"({rx1 - rx0:+.0f} Mbit/s, busy-hour RxMaxSpeed p90)."
+        )
+    elif np.isfinite(rx0) and np.isfinite(rx1):
+        ceiling = (
+            f"Busy-hour RxMaxSpeed p90 moved from {rx0:.0f} to {rx1:.0f} Mbit/s. "
+            "That is below the Tx BW step-up test of 40 Mbit/s or 12%."
+        )
+    else:
+        ceiling = "Busy-hour RxMaxSpeed ceiling could not be compared."
+    daytime = (
+        f" Daytime 09:00–22:00 median {site['busy_tp0']:.1f} → {site['busy_tp1']:.1f} Mbps."
+    )
+    tp = (
+        f"Data BusyHour 1H throughput {m['tp0']:.2f} → {m['tp1']:.2f} Mbps "
+        f"({m['tp_delta']:+.2f} Mbps, {m['tp_pct']:+.1f}%).{daytime}"
+    )
+    vol = (
+        f"Data BusyHour 1H data volume {m['vol0']:.1f} → {m['vol1']:.1f} GB "
+        f"({m['vol_delta']:+.1f} GB, {m['vol_pct']:+.1f}%)."
+    )
+    if site.get("prev_choked") and site.get("latest_choked"):
+        choke = "Still choked after the window, so the higher throughput is already on the new ceiling."
+    elif site.get("prev_choked") and not site.get("latest_choked"):
+        choke = "Choked on 5–7 Oct. Off the choke list on 6–8 Nov."
+    elif site.get("latest_choked"):
+        choke = "Not choked on 5–7 Oct. Choked on 6–8 Nov."
+    else:
+        choke = "Not on the choke list in either window."
+    day_clear = site.get("busy_tp_pct", 0) >= 8
+    if site.get("bw_up") and bucket == BUCKET_BOTH and day_clear:
+        lead = "After the Tx BW increase, throughput improved significantly and data volume increased with it."
+    elif site.get("bw_up") and bucket == BUCKET_BOTH:
+        lead = "After the Tx BW increase, the congested busy hour is faster and data volume increased. Throughput across the rest of the day is about level."
+    elif site.get("bw_up") and bucket == BUCKET_HOLD and day_clear:
+        lead = "After the Tx BW increase, throughput improved significantly. Data volume was held."
+    elif site.get("bw_up") and bucket == BUCKET_HOLD:
+        lead = "After the Tx BW increase, the congested busy hour is faster and data volume was held. Throughput across the rest of the day is about level."
+    elif site.get("bw_up"):
+        lead = "After the Tx BW increase, throughput is higher and data volume did not fall."
+    elif bucket == BUCKET_BOTH and day_clear:
+        lead = "Throughput and data volume both improved. The Tx ceiling did not meet the step-up test."
+    elif bucket == BUCKET_BOTH:
+        lead = "The congested busy hour is faster and data volume increased. The Tx ceiling did not meet the step-up test."
+    elif bucket == BUCKET_HOLD and day_clear:
+        lead = "Throughput improved significantly and data volume was held. The Tx ceiling did not meet the step-up test."
+    elif bucket == BUCKET_HOLD:
+        lead = "The congested busy hour is faster and data volume was held. The Tx ceiling did not meet the step-up test."
+    elif site.get("busy_tp_pct", 0) >= 8 and site.get("bw_up"):
+        lead = "After the Tx BW increase, daytime throughput improved."
+    elif site.get("busy_tp_pct", 0) >= 8:
+        lead = "Daytime throughput improved. The Tx ceiling did not meet the step-up test."
+    elif site.get("finding") == fege.FINDING_AGAIN:
+        lead = "Still choked on the new ceiling."
+    else:
+        lead = "A small throughput gain, and data volume did not fall. The Tx ceiling did not meet the step-up test."
+    lines = [lead, ceiling]
+    if include_oss:
+        lines.extend((tp, vol))
+    lines.append(choke)
+    return lines
+
+
+def _style_run(run, size: int, color: RGBColor, bold: bool) -> None:
+    run.font.name = "Calibri"
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
+    # Force Calibri on the latin typeface so PowerPoint does not substitute.
+    rpr = run._r.get_or_add_rPr()
+    for tag in ("latin", "ea", "cs"):
+        node = rpr.find(qn(f"a:{tag}"))
+        if node is None:
+            node = rpr.makeelement(qn(f"a:{tag}"), {})
+            rpr.append(node)
+        node.set("typeface", "Calibri")
+
+
+def _set_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = False) -> None:
+    paragraph.clear()
+    run = paragraph.add_run()
+    run.text = text
+    _style_run(run, size, color, bold)
+
+
+def _add_run(paragraph, text: str, size: int, color: RGBColor, bold: bool = False) -> None:
+    run = paragraph.add_run()
+    run.text = text
+    _style_run(run, size, color, bold)
+
+
+def _add_daily_pair(slide, feg_frame: pd.DataFrame, oss_frame: pd.DataFrame) -> pd.Timestamp | None:
+    """Site slide charts: daily FEGE on the left, daily OSS on the right."""
+    step = _rx_step_date(feg_frame)
+    mark = None if step is None else step.date()
+    step_text = "No RxMaxSpeed step found" if step is None else f"Black line: RxMaxSpeed increased {step:%d %b}"
+    _chart_caption(slide, 0.20, 0.88, 6.3, "Daily FEGE", step_text)
+    _add_chart(
+        slide,
+        Inches(0.08),
+        Inches(1.38),
+        Inches(6.58),
+        Inches(3.74),
+        {
+            "name": "RxMaxSpeed",
+            "values": _on_calendar(feg_frame, "rx_max"),
+            "color": "2F5496",
+            "axis": "Mbit/s",
+            "kind": "line",
+        },
+        {
+            "name": "RxMeanSpeed",
+            "values": _on_calendar(feg_frame, "rx_mean"),
+            "color": "C65911",
+            "axis": "Mbit/s",
+            "kind": "line",
+        },
+        mark=mark,
+    )
+    _chart_caption(slide, 6.78, 0.88, 6.3, "Site level OSS KPI, daily", "Same step date as the FEGE chart")
+    _add_chart(
+        slide,
+        Inches(6.68),
+        Inches(1.38),
+        Inches(6.58),
+        Inches(3.74),
+        {
+            "name": "Data volume",
+            "values": _on_calendar(oss_frame, "vol"),
+            "color": "C65911",
+            "axis": "GB",
+            "kind": "column",
+        },
+        {
+            "name": "DL user throughput",
+            "values": _on_calendar(oss_frame, "tp"),
+            "color": "2F5496",
+            "axis": "Mbps",
+            "kind": "line",
+        },
+        mark=mark,
+    )
+    return step
+
+
+def _add_slide(
+    prs: Presentation,
+    site: dict,
+    feg_png: Path | None,
+    oss_png: Path | None,
+    page: int,
+    pages: int,
+    daily_oss: bool = False,
+    feg_daily: pd.DataFrame | None = None,
+    oss_daily: pd.DataFrame | None = None,
+) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    ink = RGBColor(0x33, 0x33, 0x33)
+    accent = {
+        BUCKET_BOTH: RGBColor(0x54, 0x82, 0x35),
+        BUCKET_HOLD: RGBColor(0x2F, 0x54, 0x96),
+        BUCKET_SMALL: RGBColor(0xC6, 0x59, 0x11),
+        BUCKET_OTHER: RGBColor(0x83, 0x3C, 0x0C),
+        BUCKET_DAY: RGBColor(0x1F, 0x4E, 0x79),
+    }.get(site["bucket"], RGBColor(0x1F, 0x4E, 0x79))
+
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.78))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    stripe = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(0.78), prs.slide_width, Inches(0.08))
+    stripe.fill.solid()
+    stripe.fill.fore_color.rgb = accent
+    stripe.line.fill.background()
+
+    title = slide.shapes.add_textbox(Inches(0.28), Inches(0.06), Inches(10.15), Inches(0.40))
+    tf = title.text_frame
+    tf.word_wrap = False
+    _set_run(tf.paragraphs[0], f"{site['finding']}: {site['site']}", 22, white, True)
+
+    meta = slide.shapes.add_textbox(Inches(0.30), Inches(0.44), Inches(9.6), Inches(0.30))
+    mf = meta.text_frame
+    mf.word_wrap = False
+    _set_run(
+        mf.paragraphs[0],
+        BUCKET_LABEL[site["bucket"]],
+        13,
+        RGBColor(0xFF, 0xF2, 0xCC),
+        False,
+    )
+
+    side = slide.shapes.add_textbox(Inches(10.45), Inches(0.16), Inches(2.65), Inches(0.46))
+    sf = side.text_frame
+    sf.word_wrap = False
+    p = sf.paragraphs[0]
+    p.alignment = PP_ALIGN.RIGHT
+    _set_run(
+        p,
+        f"{site['pick_index']} of {site['pick_total']} in this finding",
+        12,
+        white,
+        False,
+    )
+
+    if feg_daily is not None and oss_daily is not None:
+        _add_daily_pair(slide, feg_daily, oss_daily)
+        daily_oss = True
+    elif oss_png is None:
+        slide.shapes.add_picture(str(feg_png), Inches(0.22), Inches(0.98), Inches(12.90), Inches(4.15))
+    else:
+        slide.shapes.add_picture(str(feg_png), Inches(0.18), Inches(0.98), Inches(6.45), Inches(4.15))
+        slide.shapes.add_picture(str(oss_png), Inches(6.70), Inches(0.98), Inches(6.45), Inches(4.15))
+
+    notes = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.22), Inches(5.22), Inches(12.90), Inches(1.95)
+    )
+    notes.fill.solid()
+    notes.fill.fore_color.rgb = RGBColor(0xF7, 0xF9, 0xFB)
+    notes.line.color.rgb = RGBColor(0xD0, 0xD7, 0xE2)
+    ntf = notes.text_frame
+    ntf.word_wrap = True
+    ntf.auto_size = None
+    ntf.margin_left = Inches(0.14)
+    ntf.margin_right = Inches(0.12)
+    ntf.margin_top = Inches(0.08)
+    ntf.margin_bottom = Inches(0.06)
+    try:
+        ntf._txBody.bodyPr.set("anchor", "t")
+    except Exception:
+        pass
+    lines = _sentence(site, include_oss=oss_png is not None and not daily_oss)
+    for i, line in enumerate(lines):
+        paragraph = ntf.paragraphs[0] if i == 0 else ntf.add_paragraph()
+        paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.space_after = Pt(2)
+        _set_run(paragraph, line, 12, navy if i == 0 else ink, i == 0)
+
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.20), Inches(10.5), Inches(0.26))
+    ff = foot.text_frame
+    _set_run(
+        ff.paragraphs[0],
+        "Dates match on both charts, every 7 days. The black line is the RxMaxSpeed step, on the same date in both."
+        if daily_oss
+        else (
+            "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    FEGE RxMaxSpeed, hourly"
+            if oss_png is None
+            else "Pre 5–7 Oct    ·    Post 6–8 Nov    ·    Charts are hourly    ·    Notes use Data BusyHour 1H"
+        ),
+        10,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.20), Inches(1.65), Inches(0.26))
+    pf = page_box.text_frame
+    pp = pf.paragraphs[0]
+    pp.alignment = PP_ALIGN.RIGHT
+    _set_run(pp, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
+
+
+def _set_cell_fill(cell, hex_color: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    for child in list(tc_pr):
+        if child.tag == qn("a:solidFill"):
+            tc_pr.remove(child)
+    solid = tc_pr.makeelement(qn("a:solidFill"), {})
+    solid.append(solid.makeelement(qn("a:srgbClr"), {"val": hex_color}))
+    tc_pr.append(solid)
+
+
+def _set_cell_border(cell, color: str = "D0D7E2", width_pt: float = 0.75) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    width = str(int(width_pt * 12700))
+    for edge in ("lnL", "lnR", "lnT", "lnB"):
+        for child in list(tc_pr):
+            if child.tag == qn(f"a:{edge}"):
+                tc_pr.remove(child)
+        line = tc_pr.makeelement(
+            qn(f"a:{edge}"), {"w": width, "cap": "flat", "cmpd": "sng", "algn": "ctr"}
+        )
+        fill = line.makeelement(qn("a:solidFill"), {})
+        fill.append(fill.makeelement(qn("a:srgbClr"), {"val": color}))
+        line.append(fill)
+        tc_pr.append(line)
+
+
+def _signed(value: float, unit: str, digits: int) -> str:
+    if not np.isfinite(value):
+        return "—"
+    return f"{value:+.{digits}f} {unit}"
+
+
+def _category_brief(rows: list[dict], profiles: dict[str, dict], finding: str) -> dict:
+    """Median hourly gain for one finding, across every comparison site."""
+    group = [row for row in rows if row.get("finding") == finding]
+    return {
+        "n": len(group),
+        "tp_up": sum(1 for row in group if row.get("throughput_impact") == "Improved"),
+        "vol_up": sum(1 for row in group if row.get("volume_impact") == "Improved"),
+        "tp24": _median_step(group, profiles, "tp24"),
+        "tp_bh": _median_step(group, profiles, "tp_bh"),
+        "vol24": _median_step(group, profiles, "vol24"),
+        "vol_bh": _median_step(group, profiles, "vol_bh"),
+    }
+
+
+def _chart_delta(group: dict, frame_key: str, column: str) -> float:
+    """Post minus pre on the combined chart for one category."""
+    before = _window_mean(group[frame_key], TREND_PRE, column)
+    after = _window_mean(group[frame_key], TREND_POST, column)
+    if not (np.isfinite(before) and np.isfinite(after)):
+        return float("nan")
+    return after - before
+
+
+def _summary_box(
+    slide,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    title: str,
+    story: str,
+    brief: dict,
+    trend: dict | None,
+) -> None:
+    """One rounded finding box: median gain, then the combined-chart change."""
+    card = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height)
+    )
+    card.fill.solid()
+    card.fill.fore_color.rgb = RGBColor(0xF7, 0xF9, 0xFB)
+    card.line.color.rgb = RGBColor(0x8F, 0xA8, 0xC4)
+    card.line.width = Pt(1.25)
+    body = slide.shapes.add_textbox(
+        Inches(left + 0.22), Inches(top + 0.10), Inches(width - 0.40), Inches(height - 0.18)
+    )
+    frame = body.text_frame
+    frame.word_wrap = True
+    _set_run(frame.paragraphs[0], title, 16, RGBColor(0x1F, 0x4E, 0x79), True)
+    lines: list[tuple[str, bool, int]] = [
+        (story, False, 11),
+        (f"Throughput, 24h avg    {_signed(brief['tp24'], 'Mbps', 1)}", False, 12),
+        (f"Throughput, 20–22    {_signed(brief['tp_bh'], 'Mbps', 1)}", False, 12),
+        (f"Data volume, 24h avg    {_signed(brief['vol24'], 'GB', 1)}", False, 12),
+        (f"Data volume, 20–22    {_signed(brief['vol_bh'], 'GB', 1)}", False, 12),
+    ]
+    if trend is not None:
+        prb = _chart_delta(trend, "daily", "prb")
+        prb_text = f"{prb:+.1f} pp" if np.isfinite(prb) else "—"
+        n = len(trend["sites"])
+        lines.extend(
+            (
+                (f"Combined chart, {n} sites, 11–12 Oct to 8–9 Nov", True, 12),
+                (
+                    f"BH throughput {_signed(_chart_delta(trend, 'bh', 'tp'), 'Mbps', 1)}"
+                    f"    ·    volume {_signed(_chart_delta(trend, 'bh', 'vol'), 'GB', 0)}",
+                    False,
+                    12,
+                ),
+                (
+                    f"Daily throughput {_signed(_chart_delta(trend, 'daily', 'tp'), 'Mbps', 1)}"
+                    f"    ·    volume {_signed(_chart_delta(trend, 'daily', 'vol'), 'GB', 0)}",
+                    False,
+                    12,
+                ),
+                (
+                    f"Cell throughput {_signed(_chart_delta(trend, 'daily', 'cell'), 'Mbps', 1)}"
+                    f"    ·    DL PRB {prb_text}",
+                    False,
+                    12,
+                ),
+            )
+        )
+    for text, strong, size in lines:
+        paragraph = frame.add_paragraph()
+        paragraph.space_before = Pt(1)
+        color = RGBColor(0x1F, 0x4E, 0x79) if strong else RGBColor(0x33, 0x33, 0x33)
+        _set_run(paragraph, text, size, color, strong)
+
+
+def _combined_note(rows: list[dict], profiles: dict[str, dict]) -> str:
+    """One line for the header: median gain at 24h and at 20–22."""
+    tp24 = _signed(_median_step(rows, profiles, "tp24"), "Mbps", 1)
+    tp_bh = _signed(_median_step(rows, profiles, "tp_bh"), "Mbps", 1)
+    vol24 = _signed(_median_step(rows, profiles, "vol24"), "GB", 1)
+    vol_bh = _signed(_median_step(rows, profiles, "vol_bh"), "GB", 1)
+    return (
+        f"Combined gain. Throughput {tp24} over 24h, {tp_bh} at 20–22. "
+        f"Data volume {vol24} over 24h, {vol_bh} at 20–22."
+    )
+
+
+def _summary_table(slide, left: float, top: float, width: float, height: float, briefs: list[tuple[str, dict]]) -> None:
+    """Combined count table, beside the third finding box."""
+    headers = ("Finding", "Sites", "Throughput improved", "Data volume improved")
+    shape = slide.shapes.add_table(
+        1 + len(briefs), 4, Inches(left), Inches(top), Inches(width), Inches(height)
+    )
+    table = shape.table
+    for index, col_width in enumerate((2.28, 0.84, 1.60, 1.60)):
+        table.columns[index].width = Inches(col_width)
+    tbl_pr = table._tbl.tblPr
+    if tbl_pr is not None:
+        tbl_pr.set("bandRow", "0")
+        tbl_pr.set("firstRow", "0")
+    row_height = Inches(height / (1 + len(briefs)))
+    table.rows[0].height = row_height
+    for col, text in enumerate(headers):
+        cell = table.cell(0, col)
+        _set_cell_fill(cell, "1F4E79")
+        _set_cell_border(cell, "1F4E79", 0.6)
+        cell.margin_left = Inches(0.08)
+        cell.margin_right = Inches(0.06)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        paragraph = cell.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER if col else PP_ALIGN.LEFT
+        _set_run(paragraph, text, 11, RGBColor(0xFF, 0xFF, 0xFF), True)
+    for index, (title, brief) in enumerate(briefs, start=1):
+        table.rows[index].height = row_height
+        values = (title, str(brief["n"]), f"{brief['tp_up']} of {brief['n']}", f"{brief['vol_up']} of {brief['n']}")
+        for col, text in enumerate(values):
+            cell = table.cell(index, col)
+            _set_cell_fill(cell, "F7F9FB" if index % 2 else "FFFFFF")
+            _set_cell_border(cell, "D0D7E2", 0.5)
+            cell.margin_left = Inches(0.08)
+            cell.margin_right = Inches(0.06)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.text_frame.word_wrap = True
+            paragraph = cell.text_frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.CENTER if col else PP_ALIGN.LEFT
+            _set_run(paragraph, text, 12, RGBColor(0x1F, 0x4E, 0x79) if col == 0 else RGBColor(0x33, 0x33, 0x33), col == 0)
+
+
+def _add_summary_slide(
+    prs: Presentation,
+    rows: list[dict],
+    selected: list[dict],
+    profiles: dict[str, dict],
+    trends: list[dict],
+    pages: int,
+) -> None:
+    """Open summary: median gain, then each category's combined-chart change."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = white
+    bg.line.fill.background()
+
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.92))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.06), Inches(12.4), Inches(0.36))
+    _set_run(title.text_frame.paragraphs[0], "Management summary", 24, white, True)
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.5), Inches(0.44))
+    sub_frame = sub.text_frame
+    sub_frame.word_wrap = True
+    _set_run(sub_frame.paragraphs[0], _combined_note(rows, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
+
+    trend_by = {group["finding"]: group for group in trends}
+    panels = (
+        (0.28, 1.04, 6.32, 2.72, fege.FINDING_AGAIN, "Choked again", "The ceiling rose, and the port is flat again on the new ceiling."),
+        (6.72, 1.04, 6.32, 2.72, fege.FINDING_SOLVED_UP, "Solved — Tx BW increased", "The ceiling rose and the port is no longer choked."),
+        (0.28, 3.88, 6.32, 2.72, fege.FINDING_SOLVED, "Solved", "Choked before, and clear now."),
+    )
+    briefs = []
+    for left, top, width, height, finding, title_text, story in panels:
+        brief = _category_brief(rows, profiles, finding)
+        briefs.append((title_text, brief))
+        _summary_box(slide, left, top, width, height, title_text, story, brief, trend_by.get(finding))
+    _summary_table(slide, 6.72, 3.88, 6.32, 2.72, briefs)
+
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(6.68), Inches(10.7), Inches(0.58))
+    foot_frame = foot.text_frame
+    foot_frame.word_wrap = True
+    _set_run(
+        foot_frame.paragraphs[0],
+        "Median lines are 6–8 Nov versus 5–7 Oct. Combined chart sums the uploaded trend sites, 11–12 Oct to 8–9 Nov.",
+        11,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(6.72), Inches(1.7), Inches(0.32))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
+
+
+def _rose_pairs(group: list[dict]) -> list[tuple[float, float]]:
+    """Busy-hour RxMaxSpeed p90 before and after, for sites whose ceiling rose."""
+    pairs = []
+    for row in group:
+        before, after = _num(row.get("old_rx")), _num(row.get("new_rx"))
+        if np.isfinite(before) and np.isfinite(after) and after > before:
+            pairs.append((before, after))
+    return pairs
+
+
+def _feg_speed_rows(rows: list[dict]) -> list[dict]:
+    """One table row per finding on this deck. Speed is the choked-hour ceiling."""
+    order = (
+        (fege.FINDING_AGAIN, "Choked again"),
+        (fege.FINDING_SOLVED_UP, "Solved — Tx BW increased"),
+        (fege.FINDING_SOLVED, "Solved"),
+    )
+    table = []
+    for finding, label in order:
+        group = [row for row in rows if row.get("finding") == finding]
+        if not group:
+            continue
+        pairs = _rose_pairs(group)
+        pre = float(np.mean([before for before, _ in pairs])) if pairs else float("nan")
+        post = float(np.mean([after for _, after in pairs])) if pairs else float("nan")
+        n_up = len(pairs)
+        comment = f"Avg of these {n_up} sites, busy-hour RxMaxSpeed p90."
+        table.append({"label": label, "n": len(group), "pre": pre, "post": post, "comment": comment})
+    return table
+
+
+def _tp_step(before: object, after: object) -> str:
+    """Pre to post FEGE RxMaxSpeed, in Mbit/s."""
+    before_n, after_n = _num(before), _num(after)
+    if not (np.isfinite(before_n) and np.isfinite(after_n)):
+        return "—"
+    delta = int(round(after_n - before_n))
+    step = f"{delta:+d}" if delta else "0"
+    return f"{before_n:.0f} → {after_n:.0f} ({step})"
+
+
+def _attach_feg_speed(selected: list[dict], pre_feg: dict, post_feg: dict) -> None:
+    """Daily is every hour. BH is 20:00, 21:00 and 22:00. Both are RxMaxSpeed."""
+    for site in selected:
+        name = str(site["site"])
+        pre = pre_feg.get(name, {}).get("rx")
+        post = post_feg.get(name, {}).get("rx")
+        site["feg24_0"] = _hour_mean(pre) if pre is not None else float("nan")
+        site["feg24_1"] = _hour_mean(post) if post is not None else float("nan")
+        site["feg_bh_0"] = _hour_mean(pre, BH_HOURS) if pre is not None else float("nan")
+        site["feg_bh_1"] = _hour_mean(post, BH_HOURS) if post is not None else float("nan")
+
+
+# Row tint follows the finding, matching the sample table.
+_FINDING_FILL = {
+    fege.FINDING_AGAIN: "D6EAF8",
+    fege.FINDING_SOLVED_UP: "E2EFDA",
+    fege.FINDING_SOLVED: "FDE9D9",
+}
+
+
+def _add_feg_summary_slide(
+    prs: Presentation,
+    rows: list[dict],
+    profiles: dict[str, dict],
+    selected: list[dict],
+    pages: int,
+) -> None:
+    """FEG opening slide: top ceiling gains, then pre and post speed by finding."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = white
+    bg.line.fill.background()
+
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.92))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.06), Inches(12.4), Inches(0.36))
+    _set_run(title.text_frame.paragraphs[0], "Summary of Observations", 24, white, True)
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.5), Inches(0.44))
+    sub_frame = sub.text_frame
+    sub_frame.word_wrap = True
+    _set_run(sub_frame.paragraphs[0], _combined_note(selected, profiles), 12, RGBColor(0xD6, 0xE3, 0xF0), False)
+
+    # Only the sites that have a slide. Slide 1 is this summary, so the table
+    # stops at the last site slide.
+    site_headers = ("#", "Site", "Findings", "Daily FEG Speed", "BH FEG Speed")
+    site_count = len(selected)
+    site_shape = slide.shapes.add_table(
+        1 + site_count, 5, Inches(0.16), Inches(1.04), Inches(6.28), Inches(6.16)
+    )
+    site_table = site_shape.table
+    for index, col_width in enumerate((0.30, 0.82, 1.56, 1.80, 1.80)):
+        site_table.columns[index].width = Inches(col_width)
+    site_pr = site_table._tbl.tblPr
+    if site_pr is not None:
+        site_pr.set("bandRow", "0")
+        site_pr.set("firstRow", "0")
+    header_h = Inches(0.26)
+    body_h = Inches((6.16 - 0.26) / site_count) if site_count else Inches(0.2)
+    site_table.rows[0].height = header_h
+    for col, text in enumerate(site_headers):
+        cell = site_table.cell(0, col)
+        _set_cell_fill(cell, "1F4E79")
+        _set_cell_border(cell, "1F4E79", 0.4)
+        cell.margin_left = Inches(0.03)
+        cell.margin_right = Inches(0.02)
+        cell.margin_top = Inches(0.01)
+        cell.margin_bottom = Inches(0.0)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        cell.text_frame.word_wrap = False
+        paragraph = cell.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER if col != 2 else PP_ALIGN.LEFT
+        _set_run(paragraph, text, 8, white, True)
+    for index, site in enumerate(selected, start=1):
+        site_table.rows[index].height = body_h
+        finding = str(site.get("finding") or "")
+        fill = _FINDING_FILL.get(finding, "FFFFFF")
+        values = (
+            str(index),
+            str(site["site"]),
+            finding,
+            _tp_step(site.get("feg24_0"), site.get("feg24_1")),
+            _tp_step(site.get("feg_bh_0"), site.get("feg_bh_1")),
+        )
+        for col, text in enumerate(values):
+            cell = site_table.cell(index, col)
+            _set_cell_fill(cell, fill)
+            _set_cell_border(cell, "D0D7E2", 0.4)
+            cell.margin_left = Inches(0.03)
+            cell.margin_right = Inches(0.02)
+            cell.margin_top = Inches(0.0)
+            cell.margin_bottom = Inches(0.0)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.text_frame.word_wrap = False
+            paragraph = cell.text_frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.LEFT if col in (2,) else PP_ALIGN.CENTER
+            _set_run(paragraph, text, 8, RGBColor(0x1F, 0x29, 0x37), False)
+
+    speed_rows = _feg_speed_rows(selected)
+    headers = (
+        "Finding Category",
+        "Sites",
+        "Pre FEG Throughput (Speed, Mbps)",
+        "Post FEG Throughput (Speed, Mbps)",
+        "Comment",
+    )
+    shape = slide.shapes.add_table(
+        1 + len(speed_rows), 5, Inches(6.58), Inches(1.06), Inches(6.52), Inches(3.20)
+    )
+    table = shape.table
+    for index, col_width in enumerate((1.42, 0.58, 1.42, 1.48, 1.62)):
+        table.columns[index].width = Inches(col_width)
+    tbl_pr = table._tbl.tblPr
+    if tbl_pr is not None:
+        tbl_pr.set("bandRow", "0")
+        tbl_pr.set("firstRow", "0")
+    row_height = Inches(3.20 / (1 + len(speed_rows)))
+    table.rows[0].height = row_height
+    for col, text in enumerate(headers):
+        cell = table.cell(0, col)
+        _set_cell_fill(cell, "1F4E79")
+        _set_cell_border(cell, "1F4E79", 0.6)
+        cell.margin_left = Inches(0.05)
+        cell.margin_right = Inches(0.04)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        cell.text_frame.word_wrap = True
+        paragraph = cell.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER
+        _set_run(paragraph, text, 10, white, True)
+    for index, row in enumerate(speed_rows, start=1):
+        table.rows[index].height = row_height
+        pre = f"{row['pre']:.0f}" if np.isfinite(row["pre"]) else "—"
+        post = f"{row['post']:.0f}" if np.isfinite(row["post"]) else "—"
+        values = (row["label"], str(row["n"]), pre, post, row["comment"])
+        for col, text in enumerate(values):
+            cell = table.cell(index, col)
+            _set_cell_fill(cell, "F7F9FB" if index % 2 else "FFFFFF")
+            _set_cell_border(cell, "D0D7E2", 0.5)
+            cell.margin_left = Inches(0.05)
+            cell.margin_right = Inches(0.04)
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.text_frame.word_wrap = True
+            paragraph = cell.text_frame.paragraphs[0]
+            paragraph.alignment = PP_ALIGN.LEFT if col in (0, 4) else PP_ALIGN.CENTER
+            _set_run(
+                paragraph,
+                text,
+                10 if col == 4 else 11,
+                navy if col == 0 else RGBColor(0x33, 0x33, 0x33),
+                col == 0,
+            )
+
+    note = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.58), Inches(4.40), Inches(6.52), Inches(1.22)
+    )
+    note.fill.solid()
+    note.fill.fore_color.rgb = RGBColor(0xE7, 0xE6, 0xE6)
+    note.line.color.rgb = RGBColor(0xBF, 0xBF, 0xBF)
+    note_box = slide.shapes.add_textbox(Inches(6.74), Inches(4.50), Inches(6.20), Inches(1.02))
+    note_frame = note_box.text_frame
+    note_frame.word_wrap = True
+    _set_run(note_frame.paragraphs[0], "Additional notes", 13, navy, True)
+    note_line = note_frame.add_paragraph()
+    note_line.space_before = Pt(3)
+    _set_run(
+        note_line,
+        "Daily FEG speed is the mean of every hour of RxMaxSpeed. BH FEG speed is the mean of 20, 21 and 22. The table on the right is the busy-hour p90 of these sites.",
+        11,
+        RGBColor(0x33, 0x33, 0x33),
+        False,
+    )
+
+    link = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.58), Inches(5.76), Inches(6.52), Inches(1.10)
+    )
+    link.fill.solid()
+    link.fill.fore_color.rgb = RGBColor(0xDE, 0xEB, 0xF7)
+    link.line.color.rgb = RGBColor(0x5B, 0x9B, 0xD5)
+    link_box = slide.shapes.add_textbox(Inches(6.74), Inches(5.90), Inches(6.20), Inches(0.84))
+    link_frame = link_box.text_frame
+    link_frame.word_wrap = True
+    _set_run(link_frame.paragraphs[0], "Attached Excel of all sites list", 13, navy, True)
+    file_line = link_frame.add_paragraph()
+    file_line.space_before = Pt(2)
+    file_run = file_line.add_run()
+    file_run.text = "FEGE_Choked_Flat_Sites_v91.xlsx"
+    _style_run(file_run, 12, RGBColor(0x2F, 0x54, 0x96), False)
+    file_run.font.underline = True
+    file_run.hyperlink.address = (
+        "https://github.com/miles4482/Transport-Network-KPI-Check/blob/"
+        "cursor/comparison-v1-nov-ed53/FEGE_Choked_Flat_Sites_v91.xlsx"
+    )
+
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(7.05), Inches(1.75), Inches(0.28))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"1 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
+
+
+def _on_cap_vector(work: pd.DataFrame, site: str, start, end) -> np.ndarray:
+    out = np.zeros(72, dtype=bool)
+    if "OnCap" not in work.columns:
+        return out
+    part = work.loc[
+        (work["eNodeB Name"].astype(str) == site)
+        & (work["Date"] >= start)
+        & (work["Date"] <= end)
+    ]
+    days = list(pd.date_range(start, end, freq="D"))
+    day_index = {day.normalize(): i for i, day in enumerate(days)}
+    for date, hour, flag in zip(part["Date"], part["Hour"], part["OnCap"]):
+        slot = day_index.get(pd.Timestamp(date).normalize())
+        hour = int(hour)
+        if slot is None or not 0 <= hour <= 23:
+            continue
+        out[slot * 24 + hour] = bool(flag)
+    return out
+
+
+# Long trend uploaded on main. Daily is 15 Sep–9 Nov. Hourly is 10 Oct–9 Nov.
+TREND_DAILY_CSV = Path("/tmp/kpi_trend/daily/OSS KPI trend_Daily_15Sep-09Nov.csv")
+TREND_HOURLY_CSV = Path("/tmp/kpi_trend/hourly/OSS KPI trend_Hourly_10Oct-09Nov.csv")
+TREND_PRE = (pd.Timestamp("2026-10-11"), pd.Timestamp("2026-10-12"))
+TREND_POST = (pd.Timestamp("2026-11-08"), pd.Timestamp("2026-11-09"))
+TREND_COLS = {
+    "traffic": "Total Traffic (Mbit)",
+    "tp_n": "User Throughput in DownLink (Mbps)_N",
+    "tp_d": "User Throughput in DownLink (Mbps)_D",
+    "cell_n": "DL PDCP Throughput (Mbit/s)_N",
+    "cell_d": "DL PDCP Throughput (Mbit/s)_D",
+    "prb_n": "DL PRB Utilization_N",
+    "prb_d": "UL PRB Utilization_D",
+}
+
+
+def _trend_dates(series: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(series.astype(str).str.strip(), format="%d-%b")
+    return parsed.map(lambda stamp: stamp.replace(year=2026))
+
+
+def _load_trend_frame(path: Path, hourly: bool) -> pd.DataFrame:
+    if not path.exists():
+        raise SystemExit(f"Trend KPI file not found: {path}")
+    usecols = ["Date", "eNodeB Name", *TREND_COLS.values()]
+    if hourly:
+        usecols.insert(1, "Time")
+    frame = pd.read_csv(path, usecols=usecols)
+    frame = frame.rename(columns={"eNodeB Name": "site", **{v: k for k, v in TREND_COLS.items()}})
+    frame["site"] = frame["site"].astype(str).str.strip()
+    frame["day"] = _trend_dates(frame["Date"])
+    for column in TREND_COLS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if hourly:
+        frame["hour"] = frame["Time"].astype(str).str.split(":").str[0].astype(int)
+    return frame
+
+
+def _aggregate_kpi(frame: pd.DataFrame) -> pd.DataFrame:
+    """One row per day. Rates are summed counters, then divided."""
+    grouped = frame.groupby("day", sort=True)[list(TREND_COLS)].sum(min_count=1)
+    denominator = grouped["tp_d"].where(grouped["tp_d"] > 0)
+    cell_den = grouped["cell_d"].where(grouped["cell_d"] > 0)
+    prb_den = grouped["prb_d"].where(grouped["prb_d"] > 0)
+    return pd.DataFrame(
+        {
+            "vol": grouped["traffic"] / 8 / 1024 / 1024 / 1024,
+            "tp": grouped["tp_n"] / denominator,
+            "cell": grouped["cell_n"] / cell_den / 1000,
+            "prb": grouped["prb_n"] / prb_den * 100,
+        }
+    )
+
+
+def _window_mean(frame: pd.DataFrame, days: tuple[pd.Timestamp, pd.Timestamp], column: str) -> float:
+    values = frame.reindex(list(days))[column].astype(float)
+    values = values[np.isfinite(values)]
+    if values.empty:
+        return float("nan")
+    return float(values.mean())
+
+
+def _move(before: float, after: float, unit: str, digits: int, points: bool = False) -> str:
+    if not (np.isfinite(before) and np.isfinite(after)):
+        return "n/a"
+    delta = after - before
+    if points:
+        return f"{before:.1f}% to {after:.1f}% ({delta:+.1f} pp)"
+    pct = delta / before * 100 if before else float("nan")
+    pct_text = f", {pct:+.0f}%" if np.isfinite(pct) else ""
+    return f"{before:,.{digits}f} to {after:,.{digits}f} {unit} ({delta:+.{digits}f}{pct_text})"
+
+
+def _trend_groups(rows: list[dict]) -> list[dict]:
+    daily = _load_trend_frame(TREND_DAILY_CSV, hourly=False)
+    hourly = _load_trend_frame(TREND_HOURLY_CSV, hourly=True)
+    hourly = hourly[hourly["hour"].isin(BH_HOURS)]
+    uploaded = set(daily["site"])
+    groups = []
+    for finding in DECK_ORDER:
+        sites = sorted(row["site"] for row in rows if row.get("finding") == finding and row["site"] in uploaded)
+        if not sites:
+            continue
+        wanted = set(sites)
+        groups.append(
+            {
+                "finding": finding,
+                "sites": sites,
+                "daily": _aggregate_kpi(daily[daily["site"].isin(wanted)]),
+                "bh": _aggregate_kpi(hourly[hourly["site"].isin(wanted)]),
+            }
+        )
+    skipped = len(uploaded - {row["site"] for row in rows})
+    print(f"Trend sites in a finding: {sum(len(g['sites']) for g in groups)} of {len(uploaded)}; {skipped} uploaded sites are outside the current findings", flush=True)
+    return groups
+
+
+def _trend_note(group: dict) -> list[str]:
+    daily, bh = group["daily"], group["bh"]
+    n = len(group["sites"])
+    site_word = "site" if n == 1 else "sites"
+    lines = [
+        f"{group['finding']}: {n} {site_word} from the uploaded trend. Pre is the mean of 11–12 Oct. Post is the mean of 8–9 Nov.",
+        "Busy hour (hours 20, 21 and 22): "
+        f"user throughput {_move(_window_mean(bh, TREND_PRE, 'tp'), _window_mean(bh, TREND_POST, 'tp'), 'Mbps', 1)}. "
+        f"Data volume {_move(_window_mean(bh, TREND_PRE, 'vol'), _window_mean(bh, TREND_POST, 'vol'), 'GB', 0)}.",
+        "Daily: "
+        f"user throughput {_move(_window_mean(daily, TREND_PRE, 'tp'), _window_mean(daily, TREND_POST, 'tp'), 'Mbps', 1)}. "
+        f"Data volume {_move(_window_mean(daily, TREND_PRE, 'vol'), _window_mean(daily, TREND_POST, 'vol'), 'GB', 0)}.",
+        "Daily cell throughput "
+        f"{_move(_window_mean(daily, TREND_PRE, 'cell'), _window_mean(daily, TREND_POST, 'cell'), 'Mbps', 1)}. "
+        f"DL PRB {_move(_window_mean(daily, TREND_PRE, 'prb'), _window_mean(daily, TREND_POST, 'prb'), '%', 1, points=True)}.",
+    ]
+    return lines
+
+
+def _nice_step(span: float) -> float:
+    """A round tick step that puts about five intervals across the axis."""
+    if span <= 0:
+        return 1.0
+    raw = span / 6.0
+    exponent = math.floor(math.log10(raw))
+    base = 10 ** exponent
+    for multiplier in (1, 2, 2.5, 5, 10):
+        if raw <= multiplier * base:
+            return multiplier * base
+    return 10 * base
+
+
+def _dynamic_axis(values) -> tuple[float, float, float]:
+    """Put the floor as high as a round tick allows, with a little air under the data.
+
+    A throughput series whose lowest point is 6.6 Mbps starts at 5, not 0.
+    A volume series whose lowest point is 821 GB starts at 700, not 500.
+    The top stays just above the highest point so a peak is not clipped.
+    """
+    finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    if not finite:
+        return 0.0, 1.0, 0.2
+    low = min(finite)
+    high = max(finite)
+    span = high - low
+    if span <= 0:
+        span = max(abs(high) * 0.08, 1.0)
+    step = _nice_step(span)
+    air = max(span * 0.08, step * 0.15)
+    target_min = low - air
+    target_max = high + max(span * 0.12, step * 0.4)
+    if low >= 0 and target_min < 0:
+        target_min = 0.0
+    ymin = math.floor(target_min / step) * step
+    ymax = math.ceil(target_max / step) * step
+    if ymin < 0 <= low:
+        ymin = 0.0
+    if ymin >= low:
+        ymin -= step
+    if ymax <= high:
+        ymax += step
+    return ymin, ymax, step
+
+
+def _zero_axis(values) -> tuple[float, float, float]:
+    """Start at zero and leave a little room above the highest bar."""
+    finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    high = max(finite) if finite else 1.0
+    step = _nice_step(high / 5.0)
+    ymax = math.ceil((high * 1.12) / step) * step
+    if ymax <= high:
+        ymax += step
+    return 0.0, ymax, step
+
+
+def _rx_step_date(frame: pd.DataFrame) -> pd.Timestamp | None:
+    """First day RxMaxSpeed stays above the early-October ceiling.
+
+    The baseline is the median of 28 Sep–7 Oct. The step day is the first
+    later day whose own value, and the median of that day plus the next four,
+    clear the baseline by 20 Mbit/s or 8%. That day is excluded from the pre
+    window. DHBDD01 steps on 14 Oct: 13 Oct is still 264 Mbit/s.
+    """
+    indexed = frame.set_index(pd.to_datetime(frame["day"]).dt.normalize())["rx_max"]
+    indexed = indexed[~indexed.index.duplicated(keep="last")].sort_index().astype(float)
+    baseline_days = indexed.loc["2026-09-28":"2026-10-07"]
+    baseline_days = baseline_days[np.isfinite(baseline_days)]
+    if baseline_days.empty:
+        return None
+    baseline = float(baseline_days.median())
+    search = indexed.loc["2026-10-08":]
+    # A sharp ceiling first. A gradual rise still gets the first day it holds.
+    for minimum, fraction in ((20.0, 0.08), (10.0, 0.04)):
+        threshold = baseline + max(minimum, fraction * baseline)
+        for position, (day, value) in enumerate(search.items()):
+            if not np.isfinite(value) or float(value) < threshold:
+                continue
+            follow = search.iloc[position : position + 5]
+            follow = follow[np.isfinite(follow)]
+            if len(follow) < 4 or float(follow.median()) < threshold:
+                continue
+            return pd.Timestamp(day)
+    return None
+
+
+def _on_calendar(frame: pd.DataFrame, column: str) -> list[float | None]:
+    """One value per day from 1 Sep through 15 Nov. Missing days stay blank."""
+    indexed = frame.set_index(pd.to_datetime(frame["day"]).dt.normalize())[column]
+    indexed = indexed[~indexed.index.duplicated(keep="last")]
+    values: list[float | None] = []
+    for day in CHART_DATES:
+        value = indexed.get(pd.Timestamp(day), np.nan)
+        if value is None or not np.isfinite(value):
+            values.append(None)
+        else:
+            values.append(float(value))
+    return values
+
+
+def _excel_serial(day: date) -> float:
+    return float((day - EXCEL_EPOCH).days)
+
+
+def _set_date_scale(date_axis) -> None:
+    """Same start, end, format, and 7-day step on every daily chart."""
+    element = date_axis._element
+    date_axis.minimum_scale = _excel_serial(CHART_START)
+    date_axis.maximum_scale = _excel_serial(CHART_END + timedelta(days=1))
+    date_axis.tick_labels.number_format = DATE_FORMAT
+    date_axis.tick_labels.font.size = Pt(9)
+    date_axis.tick_labels.font.name = "Calibri"
+    date_axis.tick_labels.font.color.rgb = RGBColor(0x59, 0x59, 0x59)
+    auto = element.find(qn("c:auto"))
+    if auto is not None:
+        auto.set("val", "0")
+    base = element.find(qn("c:baseTimeUnit"))
+    major = element.find(qn("c:majorUnit"))
+    if major is None:
+        major = etree.Element(qn("c:majorUnit"))
+        if base is not None:
+            base.addnext(major)
+        else:
+            element.append(major)
+    major.set("val", str(DATE_STEP_DAYS))
+    unit = element.find(qn("c:majorTimeUnit"))
+    if unit is None:
+        unit = etree.Element(qn("c:majorTimeUnit"))
+        major.addnext(unit)
+    unit.set("val", "days")
+    body = element.find(qn("c:txPr"))
+    if body is not None:
+        props = body.find(qn("a:bodyPr"))
+        if props is not None:
+            props.set("rot", "-2700000")
+
+
+def _style_value_axis(element, values, title: str, color: str, *, grid: bool, floor: str = "dynamic") -> tuple[float, float, float]:
+    axis = ValueAxis(element)
+    ymin, ymax, step = _zero_axis(values) if floor == "zero" else _dynamic_axis(values)
+    axis.minimum_scale = ymin
+    axis.maximum_scale = ymax
+    axis.major_unit = step
+    axis.has_major_gridlines = grid
+    if grid:
+        axis.major_gridlines.format.line.color.rgb = RGBColor(0xD9, 0xD9, 0xD9)
+        axis.major_gridlines.format.line.width = Pt(0.75)
+    number_format = "#,##0" if step >= 1 else "0.0"
+    axis.tick_labels.number_format = number_format
+    axis.tick_labels.font.size = Pt(9)
+    axis.tick_labels.font.name = "Calibri"
+    axis.tick_labels.font.color.rgb = RGBColor.from_string(color)
+    axis.has_title = True
+    paragraph = axis.axis_title.text_frame.paragraphs[0]
+    paragraph.text = title
+    paragraph.font.size = Pt(9)
+    paragraph.font.name = "Calibri"
+    paragraph.font.color.rgb = RGBColor.from_string(color)
+    paragraph.font.bold = False
+    try:
+        axis.format.line.color.rgb = RGBColor.from_string(color)
+    except Exception:
+        pass
+    return ymin, ymax, step
+
+
+def _color_line(series_element, color: str, width_pt: float = 2.0) -> None:
+    existing = series_element.find(qn("c:spPr"))
+    if existing is not None:
+        series_element.remove(existing)
+    width = int(width_pt * 12700)
+    line = parse_xml(
+        f'<c:spPr xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        f'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f'<a:ln w="{width}" cap="rnd"><a:solidFill><a:srgbClr val="{color}"/></a:solidFill></a:ln>'
+        f"</c:spPr>"
+    )
+    series_element.find(qn("c:tx")).addnext(line)
+    if series_element.find(qn("c:marker")) is None:
+        marker = parse_xml(
+            '<c:marker xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:symbol val="none"/></c:marker>'
+        )
+        line.addnext(marker)
+    else:
+        symbol = series_element.find(qn("c:marker")).find(qn("c:symbol"))
+        if symbol is not None:
+            symbol.set("val", "none")
+    if series_element.find(qn("c:smooth")) is None:
+        series_element.append(parse_xml('<c:smooth xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="0"/>'))
+
+
+def _color_bars(series, color: str) -> None:
+    series.format.fill.solid()
+    series.format.fill.fore_color.rgb = RGBColor.from_string(color)
+    series.format.line.fill.background()
+
+
+def _finish_chart(chart) -> None:
+    chart.has_title = False
+    chart.has_legend = True
+    chart.legend.position = XL_LEGEND_POSITION.TOP
+    chart.legend.include_in_layout = False
+    chart.legend.font.size = Pt(10)
+    chart.legend.font.name = "Calibri"
+    text = chart._element.find(qn("c:txPr"))
+    if text is not None:
+        default = text.find(".//" + qn("a:defRPr"))
+        if default is not None:
+            default.set("sz", "900")
+    for marker in chart._element.findall(".//" + qn("c:marker")):
+        if marker.get("val") is not None:
+            marker.set("val", "0")
+
+
+def _split_right_axis(chart, kind: str = "line"):
+    """Move the second series onto its own value axis on the right."""
+    plot = chart._element.chart.plotArea
+    host = plot.find(qn("c:barChart"))
+    if host is None:
+        host = plot.find(qn("c:lineChart"))
+    series = host.findall(qn("c:ser"))
+    right = series[1]
+    host.remove(right)
+    if kind == "column":
+        moved = parse_xml(
+            '<c:barChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:barDir val="col"/>'
+            '<c:grouping val="clustered"/>'
+            '<c:varyColors val="0"/>'
+            '<c:gapWidth val="55"/>'
+            "</c:barChart>"
+        )
+        moved.find(qn("c:gapWidth")).addprevious(right)
+    else:
+        moved = parse_xml(
+            '<c:lineChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:grouping val="standard"/>'
+            '<c:varyColors val="0"/>'
+            '<c:smooth val="0"/>'
+            "</c:lineChart>"
+        )
+        moved.find(qn("c:smooth")).addprevious(right)
+    cat_id, val_id = "910001", "910002"
+    moved.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{cat_id}"/>'))
+    moved.append(parse_xml(f'<c:axId xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" val="{val_id}"/>'))
+    host.addnext(moved)
+    date_axis = plot.find(qn("c:dateAx"))
+    value_axis = plot.find(qn("c:valAx"))
+    date_copy = deepcopy(date_axis)
+    value_copy = deepcopy(value_axis)
+    date_copy.find(qn("c:axId")).set("val", cat_id)
+    date_copy.find(qn("c:crossAx")).set("val", val_id)
+    date_copy.find(qn("c:delete")).set("val", "1")
+    value_copy.find(qn("c:axId")).set("val", val_id)
+    value_copy.find(qn("c:crossAx")).set("val", cat_id)
+    value_copy.find(qn("c:axPos")).set("val", "r")
+    value_copy.find(qn("c:crosses")).set("val", "max")
+    grid = value_copy.find(qn("c:majorGridlines"))
+    if grid is not None:
+        value_copy.remove(grid)
+    plot.append(date_copy)
+    plot.append(value_copy)
+    return value_axis, value_copy, right
+
+
+def _set_inner_plot(chart) -> None:
+    """Fix the data box so a line drawn on the slide lands on the right date."""
+    plot = chart._element.chart.plotArea
+    layout = plot.find(qn("c:layout"))
+    if layout is None:
+        layout = parse_xml('<c:layout xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>')
+        plot.insert(0, layout)
+    for child in list(layout):
+        layout.remove(child)
+    layout.append(
+        parse_xml(
+            '<c:manualLayout xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:layoutTarget val="inner"/>'
+            '<c:xMode val="edge"/>'
+            '<c:yMode val="edge"/>'
+            f'<c:x val="{PLOT_X}"/>'
+            f'<c:y val="{PLOT_Y}"/>'
+            f'<c:w val="{PLOT_W}"/>'
+            f'<c:h val="{PLOT_H}"/>'
+            "</c:manualLayout>"
+        )
+    )
+
+
+def _add_step_marker(slide, graphic, mark: date) -> None:
+    """A plain line on the step date. It is not a series, so it has no legend entry."""
+    span = (CHART_END + timedelta(days=1) - CHART_START).days
+    fraction = (mark - CHART_START).days / span
+    thickness = Emu(12700)
+    x = graphic.left + int((PLOT_X + fraction * PLOT_W) * graphic.width) - thickness // 2
+    y = graphic.top + int(PLOT_Y * graphic.height)
+    height = int(PLOT_H * graphic.height)
+    line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, thickness, height)
+    line.fill.solid()
+    line.fill.fore_color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+    line.line.fill.background()
+
+
+def _fill_series(element, color: str, alpha: int | None = None) -> None:
+    """Solid bar fill. alpha is 0–100000, where 100000 is opaque."""
+    existing = element.find(qn("c:spPr"))
+    if existing is not None:
+        element.remove(existing)
+    tint = f'<a:alpha val="{alpha}"/>' if alpha else ""
+    fill = parse_xml(
+        '<c:spPr xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f'<a:solidFill><a:srgbClr val="{color}">{tint}</a:srgbClr></a:solidFill>'
+        "<a:ln><a:noFill/></a:ln></c:spPr>"
+    )
+    element.find(qn("c:tx")).addnext(fill)
+
+
+def _add_bands(chart, ymax: float) -> None:
+    """Pale columns behind the data for 5–7 Oct and 6–8 Nov. Not in the legend."""
+    plot = chart._element.chart.plotArea
+    host = plot.find(qn("c:lineChart"))
+    if host is None:
+        host = plot.find(qn("c:barChart"))
+    sample = host.find(qn("c:ser"))
+    category = deepcopy(sample.find(qn("c:cat")))
+    axis_ids = host.findall(qn("c:axId"))
+    windows = (
+        (date(2026, 10, 5), date(2026, 10, 8), "D6EAF8", "10"),
+        (date(2026, 11, 6), date(2026, 11, 9), "E2EFDA", "11"),
+    )
+    for start, end, color, index in windows:
+        points = []
+        for offset, day in enumerate(CHART_DATES):
+            if start <= day <= end:
+                points.append(f'<c:pt idx="{offset}"><c:v>{ymax}</c:v></c:pt>')
+        series = parse_xml(
+            '<c:ser xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            f'<c:idx val="{index}"/><c:order val="{index}"/>'
+            f'<c:tx><c:v>Band {index}</c:v></c:tx>'
+            "</c:ser>"
+        )
+        series.append(deepcopy(category))
+        series.append(
+            parse_xml(
+                '<c:val xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+                f'<c:numLit><c:formatCode>General</c:formatCode>'
+                f'<c:ptCount val="{len(CHART_DATES)}"/>'
+                f'{"".join(points)}</c:numLit></c:val>'
+            )
+        )
+        _fill_series(series, color, alpha=80000)
+        band = parse_xml(
+            '<c:areaChart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+            '<c:grouping val="standard"/>'
+            '<c:varyColors val="0"/>'
+            "</c:areaChart>"
+        )
+        band.find(qn("c:varyColors")).addnext(series)
+        for axis_id in axis_ids:
+            band.append(deepcopy(axis_id))
+        host.addprevious(band)
+
+
+def _add_chart(
+    slide,
+    left,
+    top,
+    width,
+    height,
+    left_series: dict,
+    right_series: dict | None = None,
+    mark: date | None = None,
+    *,
+    legend: bool = True,
+    bands: bool = False,
+):
+    """A real PowerPoint chart. The right series, when present, uses the right axis."""
+    data = CategoryChartData()
+    data.categories = CHART_DATES
+    data.categories.number_format = DATE_FORMAT
+    data.add_series(left_series["name"], left_series["values"])
+    chart_type = XL_CHART_TYPE.COLUMN_CLUSTERED if left_series["kind"] == "column" else XL_CHART_TYPE.LINE
+    if right_series is not None:
+        data.add_series(right_series["name"], right_series["values"])
+    graphic = slide.shapes.add_chart(chart_type, left, top, width, height, data)
+    chart = graphic.chart
+    _finish_chart(chart)
+    if not legend:
+        chart.has_legend = False
+    if mark is not None:
+        _set_inner_plot(chart)
+    _set_date_scale(chart.category_axis)
+    if left_series["kind"] == "column":
+        chart.plots[0].gap_width = 40
+        _fill_series(
+            chart.series[0]._element,
+            left_series.get("fill", left_series["color"]),
+            left_series.get("alpha"),
+        )
+    else:
+        _color_line(chart.series[0]._element, left_series["color"])
+    primary = chart._element.chart.plotArea.find(qn("c:valAx"))
+    limits = _style_value_axis(
+        primary,
+        left_series["values"],
+        left_series["axis"],
+        left_series["color"],
+        grid=True,
+        floor=left_series.get("floor", "dynamic"),
+    )
+    # Keep the date axis on the raised floor. autoZero would sit at 0, under the plot.
+    primary.find(qn("c:crosses")).set("val", "min")
+    if right_series is None:
+        if bands:
+            _add_bands(chart, limits[1])
+        if mark is not None:
+            _add_step_marker(slide, graphic, mark)
+        return limits
+    _primary, secondary, right_element = _split_right_axis(chart, right_series["kind"])
+    if right_series["kind"] == "column":
+        _fill_series(right_element, right_series.get("fill", right_series["color"]), right_series.get("alpha"))
+    else:
+        _color_line(right_element, right_series["color"])
+    right_limits = _style_value_axis(
+        secondary,
+        right_series["values"],
+        right_series["axis"],
+        right_series["color"],
+        grid=False,
+        floor=right_series.get("floor", "dynamic"),
+    )
+    secondary.find(qn("c:crosses")).set("val", "max")
+    if bands:
+        _add_bands(chart, limits[1])
+    if right_series["kind"] == "column":
+        # Paint the line after the columns so the line stays in front.
+        plot = chart._element.chart.plotArea
+        line_chart = plot.find(qn("c:lineChart"))
+        first_axis = plot.find(qn("c:dateAx"))
+        if line_chart is not None and first_axis is not None:
+            plot.remove(line_chart)
+            first_axis.addprevious(line_chart)
+    if mark is not None:
+        _add_step_marker(slide, graphic, mark)
+    return limits, right_limits
+
+
+def _chart_caption(slide, left: float, top: float, width: float, title: str, subtitle: str | None = None) -> None:
+    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(0.46))
+    frame = box.text_frame
+    frame.word_wrap = False
+    _set_run(frame.paragraphs[0], title, 14, RGBColor(0x1F, 0x4E, 0x79), True)
+    if subtitle:
+        second = frame.add_paragraph()
+        _set_run(second, subtitle, 10, RGBColor(0x59, 0x59, 0x59), False)
+
+
+def _raised_limits(low: float, high: float) -> tuple[float, float]:
+    """Place the axis floor just under the series so the movement fills the chart."""
+    span = max(high - low, 0.4)
+    ymin = low - 0.55 * span
+    ymax = high + 0.35 * span
+    if ymin < 0:
+        ymin = 0.0
+    if ymax <= ymin:
+        ymax = ymin + 1.0
+    return ymin, ymax
+
+
+def _draw_trend_chart(
+    path: Path,
+    frame: pd.DataFrame,
+    *,
+    bar: str,
+    line: str,
+    bar_name: str,
+    line_name: str,
+    bar_color: str,
+    left_label: str,
+    pre_on: str,
+) -> None:
+    dates = frame.index.to_pydatetime()
+    bars = frame[bar].to_numpy(dtype=float)
+    line_values = frame[line].to_numpy(dtype=float)
+    pre_days = list(TREND_PRE)
+    pre_value = float(frame.reindex(pre_days)[line if pre_on == "line" else bar].mean())
+    fig, ax = plt.subplots(figsize=(8.15, 4.25), dpi=140)
+    fig.patch.set_facecolor("white")
+    x = mdates.date2num(dates)
+    ax.bar(x, bars, width=0.72, color=bar_color, label=bar_name, zorder=2)
+    ax2 = ax.twinx()
+    ax2.plot(x, line_values, color="#C459B0", lw=1.8, label=line_name, zorder=3)
+    if np.isfinite(pre_value):
+        host = ax2 if pre_on == "line" else ax
+        host.axhline(
+            pre_value,
+            color="#222222",
+            ls="--",
+            lw=1.05,
+            zorder=4,
+            label="11–12 Oct throughput" if pre_on == "line" else "11–12 Oct PRB",
+        )
+    finite_bars = bars[np.isfinite(bars)]
+    if len(finite_bars):
+        low, high = float(np.min(finite_bars)), float(np.max(finite_bars))
+        if pre_on == "bar" and np.isfinite(pre_value):
+            low, high = min(low, pre_value), max(high, pre_value)
+        ax.set_ylim(*_raised_limits(low, high))
+    finite_line = line_values[np.isfinite(line_values)]
+    if len(finite_line):
+        low, high = float(np.min(finite_line)), float(np.max(finite_line))
+        if pre_on == "line" and np.isfinite(pre_value):
+            low, high = min(low, pre_value), max(high, pre_value)
+        ax2.set_ylim(*_raised_limits(low, high))
+    span_days = max((dates[-1] - dates[0]).days, 1) if len(dates) else 1
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=4 if span_days < 40 else 7))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.tick_params(axis="x", labelsize=8, labelrotation=40)
+    ax.tick_params(axis="y", labelsize=8, colors="#595959")
+    ax2.tick_params(axis="y", labelsize=8, colors="#C459B0")
+    ax.set_ylabel(left_label, fontsize=8, color="#595959")
+    ax2.set_ylabel("Mbps", fontsize=8, color="#C459B0")
+    ax.yaxis.grid(True, color="#E6E6E6", zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ("top",):
+        ax.spines[spine].set_visible(False)
+        ax2.spines[spine].set_visible(False)
+    ax.spines["left"].set_color("#BFBFBF")
+    ax2.spines["right"].set_color("#C459B0")
+    handles, labels = ax.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(handles + handles2, labels + labels2, loc="upper center", bbox_to_anchor=(0.5, 1.18), ncol=3, frameon=False, fontsize=7.5)
+    fig.subplots_adjust(left=0.13, right=0.87, top=0.82, bottom=0.22)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _add_trend_slide(prs: Presentation, group: dict, chart_dir: Path, page: int, pages: int) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    header = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.62))
+    header.fill.solid()
+    header.fill.fore_color.rgb = RGBColor(0x1F, 0x4E, 0x79)
+    header.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.32), Inches(0.08), Inches(9.4), Inches(0.46))
+    _set_run(title.text_frame.paragraphs[0], group["finding"], 26, RGBColor(0xFF, 0xFF, 0xFF), True)
+    charts = (
+        ("BH Chart", group["bh"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line"),
+        ("Daily Chart", group["daily"], "vol", "tp", "Data volume, GB", "User throughput, Mbps", "#B0B0B0", "GB", "line"),
+        ("Daily", group["daily"], "prb", "cell", "DL PRB, %", "Cell throughput, Mbps", "#7DCEA0", "DL PRB, %", "bar"),
+    )
+    lefts = (0.22, 4.52, 8.82)
+    for left, spec in zip(lefts, charts):
+        caption, frame, bar, line, bar_name, line_name, color, ylabel, pre_on = spec
+        png = chart_dir / f"trend_{page:02d}_{caption.replace(' ', '_').lower()}.png"
+        _draw_trend_chart(
+            png,
+            frame,
+            bar=bar,
+            line=line,
+            bar_name=bar_name,
+            line_name=line_name,
+            bar_color=color,
+            left_label=ylabel,
+            pre_on=pre_on,
+        )
+        cap = slide.shapes.add_textbox(Inches(left), Inches(0.70), Inches(4.15), Inches(0.28))
+        cap_p = cap.text_frame.paragraphs[0]
+        cap_p.alignment = PP_ALIGN.CENTER
+        _set_run(cap_p, caption, 13, RGBColor(0x1F, 0x4E, 0x79), True)
+        slide.shapes.add_picture(str(png), Inches(left), Inches(0.98), Inches(4.22), Inches(4.15))
+
+    notes = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.22), Inches(5.22), Inches(12.90), Inches(1.88)
+    )
+    notes.fill.solid()
+    notes.fill.fore_color.rgb = RGBColor(0xF7, 0xF9, 0xFB)
+    notes.line.color.rgb = RGBColor(0xD0, 0xD7, 0xE2)
+    box = notes.text_frame
+    box.word_wrap = True
+    box.margin_left = Inches(0.14)
+    box.margin_right = Inches(0.12)
+    box.margin_top = Inches(0.08)
+    for index, line in enumerate(_trend_note(group)):
+        paragraph = box.paragraphs[0] if index == 0 else box.add_paragraph()
+        paragraph.space_after = Pt(3)
+        _set_run(paragraph, line, 13, RGBColor(0x1F, 0x4E, 0x79) if index == 0 else RGBColor(0x33, 0x33, 0x33), index == 0)
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(7.18), Inches(10.6), Inches(0.26))
+    _set_run(
+        foot.text_frame.paragraphs[0],
+        "Dashed line is 11–12 Oct. BH sums hours 20, 21 and 22. Daily runs 15 Sep–9 Nov.",
+        10,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.4), Inches(7.18), Inches(1.65), Inches(0.26))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"{page} / {pages}", 10, RGBColor(0x80, 0x80, 0x80), False)
+
+
+def _load_cell_daily(sites: set[str]) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Cell rows summed to a day. Throughput is N/D. PRB is N/D times 100."""
+    paths = sorted(CELL_DIR.glob("OSS KPI Daily Cel Level_*.csv"))
+    if not paths:
+        raise SystemExit(f"Cell-level daily OSS not found in {CELL_DIR}")
+    usecols = [
+        "Date",
+        "eNodeB Name",
+        "Data Volume,GB",
+        "DL User Throughput_N",
+        "DL User Throughput_D",
+        "DL PRB Utilization_N",
+        "DL PRB Utilization_D",
+    ]
+    frames = []
+    for path in paths:
+        frame = pd.read_csv(path, usecols=usecols)
+        frame = frame.loc[frame["eNodeB Name"].astype(str).isin(sites)]
+        frames.append(frame)
+    raw = pd.concat(frames, ignore_index=True)
+    raw["day"] = pd.to_datetime(raw["Date"].astype(str) + "-2026", format="%d-%b-%Y")
+    for column in usecols[2:]:
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
+
+    def _finish(frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame.copy()
+        out["tp"] = np.where(out["d"] > 0, out["n"] / out["d"], np.nan)
+        out["prb"] = np.where(out["prb_d"] > 0, 100.0 * out["prb_n"] / out["prb_d"], np.nan)
+        return out.sort_values("day")
+
+    named = {
+        "vol": ("Data Volume,GB", "sum"),
+        "n": ("DL User Throughput_N", "sum"),
+        "d": ("DL User Throughput_D", "sum"),
+        "prb_n": ("DL PRB Utilization_N", "sum"),
+        "prb_d": ("DL PRB Utilization_D", "sum"),
+    }
+    network = _finish(raw.groupby("day", as_index=False).agg(**named))
+    site_rows = raw.groupby(["eNodeB Name", "day"], as_index=False).agg(**named)
+    site_rows = _finish(site_rows)
+    by_site = {
+        str(site): part.drop(columns="eNodeB Name")
+        for site, part in site_rows.groupby("eNodeB Name", sort=False)
+    }
+    return network, by_site
+
+
+def _daily_window_mean(frame: pd.DataFrame, start: str, end: str, column: str) -> float:
+    part = frame[(frame["day"] >= start) & (frame["day"] <= end)]
+    values = part[column].to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.mean(values)) if values.size else float("nan")
+
+
+def _mark_compare_windows(ax) -> None:
+    ax.axvspan(pd.Timestamp("2026-10-05"), pd.Timestamp("2026-10-08"), color="#D6EAF8", alpha=0.7, zorder=0)
+    ax.axvspan(pd.Timestamp("2026-11-06"), pd.Timestamp("2026-11-09"), color="#E2EFDA", alpha=0.7, zorder=0)
+
+
+def _date_axis(ax) -> None:
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.tick_params(axis="x", labelsize=7, colors=GREY)
+    for label in ax.get_xticklabels():
+        label.set_rotation(0)
+
+
+def _draw_radio(path: Path, daily: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.55), dpi=140)
+    days = daily["day"]
+    left, right = axes
+    _mark_compare_windows(left)
+    _mark_compare_windows(right)
+    volume = left.twinx()
+    volume.bar(days, daily["vol"], width=0.8, color="#C65911", alpha=0.45, zorder=1)
+    left.plot(days, daily["tp"], color="#2F5496", linewidth=1.8, zorder=3)
+    left.set_ylim(*_raised_limits(float(np.nanmin(daily["tp"])), float(np.nanmax(daily["tp"]))))
+    volume.set_ylim(0, float(np.nanmax(daily["vol"])) * 1.25)
+    left.set_ylabel("DL user throughput (Mbps)", fontsize=8, color="#2F5496")
+    volume.set_ylabel("Data volume (GB)", fontsize=8, color="#C65911")
+    left.set_title("Daily data volume and DL user throughput", fontsize=11, color=NAVY, loc="left")
+    right.bar(days, daily["prb"], width=0.8, color="#548235", alpha=0.75, zorder=1)
+    right.set_ylim(*_raised_limits(float(np.nanmin(daily["prb"])), float(np.nanmax(daily["prb"]))))
+    right.set_ylabel("DL PRB (%)", fontsize=8, color="#548235")
+    right.set_title("Daily DL PRB", fontsize=11, color=NAVY, loc="left")
+    for ax in (left, right):
+        _date_axis(ax)
+        ax.tick_params(axis="y", labelsize=8)
+    fig.text(
+        0.01,
+        0.01,
+        "Blue band is 5–7 Oct. Green band is 6–8 Nov. Throughput = sum of N / sum of D. PRB = sum of N / sum of D × 100.",
+        fontsize=8,
+        color=GREY,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _load_feg_daily(sites: set[str]) -> dict[str, pd.DataFrame]:
+    """One row per site per day. Speeds are converted from bit/s to Mbit/s."""
+    if not FEG_DAILY.exists():
+        raise SystemExit(f"Daily FEGE file not found: {FEG_DAILY}")
+    frame = pd.read_csv(
+        FEG_DAILY,
+        usecols=["Date", "eNodeB Name", "VS.FEGE.RxMaxSpeed(bit/s)", "VS.FEGE.RxMeanSpeed(bit/s)"],
+    )
+    frame = frame.loc[frame["eNodeB Name"].astype(str).isin(sites)].copy()
+    frame["day"] = pd.to_datetime(frame["Date"].astype(str) + "-2026", format="%d-%b-%Y")
+    frame["rx_max"] = pd.to_numeric(frame["VS.FEGE.RxMaxSpeed(bit/s)"], errors="coerce") / 1_000_000.0
+    frame["rx_mean"] = pd.to_numeric(frame["VS.FEGE.RxMeanSpeed(bit/s)"], errors="coerce") / 1_000_000.0
+    return {
+        str(site): part.sort_values("day")
+        for site, part in frame.groupby("eNodeB Name", sort=False)
+    }
+
+
+def _draw_site_feg_daily(path: Path, frame: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
+    _mark_compare_windows(ax)
+    mean_ax = ax.twinx()
+    max_line, = ax.plot(frame["day"], frame["rx_max"], color=BLUE, linewidth=1.6, zorder=3)
+    mean_line, = mean_ax.plot(frame["day"], frame["rx_mean"], color=ORANGE, linewidth=1.6, zorder=3)
+    ax.set_ylim(*_raised_limits(float(np.nanmin(frame["rx_max"])), float(np.nanmax(frame["rx_max"]))))
+    mean_ax.set_ylim(*_raised_limits(float(np.nanmin(frame["rx_mean"])), float(np.nanmax(frame["rx_mean"]))))
+    ax.set_ylabel("RxMaxSpeed, Mbit/s", fontsize=8, color=BLUE)
+    mean_ax.set_ylabel("RxMeanSpeed, Mbit/s", fontsize=8, color=ORANGE)
+    ax.tick_params(axis="y", colors=BLUE, labelsize=8)
+    mean_ax.tick_params(axis="y", colors=ORANGE, labelsize=8)
+    _date_axis(ax)
+    fig.text(0.08, 0.98, "Daily FEGE", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
+    fig.legend(
+        [max_line, mean_line],
+        ["RxMaxSpeed", "RxMeanSpeed"],
+        loc="upper left",
+        bbox_to_anchor=(0.08, 0.93),
+        ncol=2,
+        frameon=False,
+        fontsize=8,
+    )
+    fig.subplots_adjust(left=0.10, right=0.88, top=0.76, bottom=0.16)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _draw_site_daily(path: Path, frame: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(7.4, 3.55), dpi=140)
+    _mark_compare_windows(ax)
+    ax2 = ax.twinx()
+    ax2.bar(frame["day"], frame["vol"], width=0.8, color="#C65911", alpha=0.45, zorder=1, label="Data volume")
+    ax.plot(frame["day"], frame["tp"], color="#2F5496", linewidth=1.6, zorder=3, label="DL user throughput")
+    ax.set_ylim(*_raised_limits(float(np.nanmin(frame["tp"])), float(np.nanmax(frame["tp"]))))
+    ax2.set_ylim(0, float(np.nanmax(frame["vol"])) * 1.3)
+    ax.set_ylabel("Mbps", fontsize=8, color="#2F5496")
+    ax2.set_ylabel("GB", fontsize=8, color="#C65911")
+    _date_axis(ax)
+    fig.text(0.08, 0.98, "Site level OSS KPI, daily", ha="left", va="top", fontsize=11, color=NAVY, fontweight="bold")
+    fig.text(0.08, 0.90, "Data volume vs DL user throughput", ha="left", va="top", fontsize=8, color=GREY)
+    fig.subplots_adjust(left=0.10, right=0.88, top=0.78, bottom=0.18)
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def _day_row(frame: pd.DataFrame, day: date) -> pd.Series | None:
+    indexed = frame.set_index(pd.to_datetime(frame["day"]).dt.normalize())
+    indexed = indexed[~indexed.index.duplicated(keep="last")]
+    key = pd.Timestamp(day)
+    if key not in indexed.index:
+        return None
+    return indexed.loc[key]
+
+
+def _pool_day(site_frames: dict[str, pd.DataFrame], days_by_site: dict[str, list[date]], index: int) -> dict[str, float]:
+    """One mapped day: sites summed, then throughput and PRB from N/D."""
+    volume = numerator = denominator = prb_n = prb_d = 0.0
+    used = 0
+    for site, frame in site_frames.items():
+        row = _day_row(frame, days_by_site[site][index])
+        if row is None:
+            continue
+        volume += float(row["vol"])
+        numerator += float(row["n"])
+        denominator += float(row["d"])
+        prb_n += float(row["prb_n"])
+        prb_d += float(row["prb_d"])
+        used += 1
+    return {
+        "vol": volume if used else float("nan"),
+        "n": numerator,
+        "d": denominator,
+        "prb_n": prb_n,
+        "prb_d": prb_d,
+        "tp": numerator / denominator if denominator else float("nan"),
+        "prb": 100.0 * prb_n / prb_d if prb_d else float("nan"),
+    }
+
+
+def _pool_window(days: list[dict[str, float]]) -> dict[str, float]:
+    """Mean of the seven daily volume totals. Throughput and PRB are N/D across those days."""
+    volume = [day["vol"] for day in days if np.isfinite(day["vol"])]
+    numerator = sum(day["n"] for day in days)
+    denominator = sum(day["d"] for day in days)
+    prb_n = sum(day["prb_n"] for day in days)
+    prb_d = sum(day["prb_d"] for day in days)
+    return {
+        "vol": float(np.mean(volume)) if volume else float("nan"),
+        "tp": numerator / denominator if denominator else float("nan"),
+        "prb": 100.0 * prb_n / prb_d if prb_d else float("nan"),
+    }
+
+
+def _aligned_change(site_frames: dict[str, pd.DataFrame], steps: dict[str, pd.Timestamp]) -> dict:
+    """Pre is the 7 days before each site's step. Post is 8–14 Nov for every site.
+
+    Date 1 is seven days before the step and 8 Nov. Date 7 is the day before
+    the step and 14 Nov. The best date is the mapped day where both data
+    volume and DL user throughput rise, and the smaller of those two rises
+    is the largest.
+    """
+    pre_days = {
+        site: [(step - pd.Timedelta(days=7 - index)).date() for index in range(7)]
+        for site, step in steps.items()
+    }
+    post_days = {site: list(POST_DAYS) for site in steps}
+    usable = {site: site_frames[site] for site in steps if site in site_frames}
+    mapped = []
+    for index in range(7):
+        pre = _pool_day(usable, pre_days, index)
+        post = _pool_day(usable, post_days, index)
+        volume_pct = (post["vol"] - pre["vol"]) / pre["vol"] * 100 if pre["vol"] else float("nan")
+        throughput_pct = (post["tp"] - pre["tp"]) / pre["tp"] * 100 if pre["tp"] else float("nan")
+        mapped.append(
+            {
+                "index": index + 1,
+                "post": POST_DAYS[index],
+                "pre": pre,
+                "post_values": post,
+                "volume_pct": volume_pct,
+                "throughput_pct": throughput_pct,
+            }
+        )
+        print(
+            f"  Date {index + 1} vs {POST_DAYS[index]:%d %b}: "
+            f"volume {pre['vol']:,.0f} → {post['vol']:,.0f} ({volume_pct:+.1f}%), "
+            f"throughput {pre['tp']:.2f} → {post['tp']:.2f} ({throughput_pct:+.1f}%)",
+            flush=True,
+        )
+    best = max(mapped, key=lambda day: min(day["volume_pct"], day["throughput_pct"]))
+    print(
+        f"Highest joint growth is Date {best['index']} versus {best['post']:%d %b}",
+        flush=True,
+    )
+    return {
+        "pre": _pool_window([day["pre"] for day in mapped]),
+        "post": _pool_window([day["post_values"] for day in mapped]),
+        "sites": len(usable),
+        "best": best,
+    }
+
+
+def _add_radio_slide(
+    prs: Presentation,
+    daily: pd.DataFrame,
+    site_count: int,
+    pages: int,
+    change: dict[str, dict[str, float]],
+) -> None:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    navy = RGBColor(0x1F, 0x4E, 0x79)
+    white = RGBColor(0xFF, 0xFF, 0xFF)
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.82))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = navy
+    bar.line.fill.background()
+    title = slide.shapes.add_textbox(Inches(0.36), Inches(0.06), Inches(12.4), Inches(0.34))
+    _set_run(title.text_frame.paragraphs[0], "Radio KPI summary", 22, white, True)
+    vol0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "vol")
+    vol1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "vol")
+    tp0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "tp")
+    tp1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "tp")
+    prb0 = _daily_window_mean(daily, "2026-10-05", "2026-10-07", "prb")
+    prb1 = _daily_window_mean(daily, "2026-11-06", "2026-11-08", "prb")
+    sub = slide.shapes.add_textbox(Inches(0.36), Inches(0.42), Inches(12.6), Inches(0.34))
+    sub.text_frame.word_wrap = False
+    _set_run(
+        sub.text_frame.paragraphs[0],
+        (
+            f"{site_count} sites. Daily data volume {vol0:,.0f} → {vol1:,.0f} GB, "
+            f"DL user throughput {tp0:.1f} → {tp1:.1f} Mbps, "
+            f"DL PRB {prb0:.1f} → {prb1:.1f}%.  5–7 Oct versus 6–8 Nov."
+        ),
+        13,
+        RGBColor(0xD6, 0xE3, 0xF0),
+        False,
+    )
+    _chart_caption(slide, 0.28, 0.90, 6.3, "Daily data volume and DL user throughput")
+    throughput_limits, volume_limits = _add_chart(
+        slide,
+        Inches(0.08),
+        Inches(1.22),
+        Inches(6.55),
+        Inches(5.15),
+        {
+            "name": "DL user throughput",
+            "values": _on_calendar(daily, "tp"),
+            "color": "2F5496",
+            "axis": "DL user throughput (Mbps)",
+            "kind": "line",
+        },
+        {
+            "name": "Data volume",
+            "values": _on_calendar(daily, "vol"),
+            "color": "C65911",
+            "axis": "Data volume (GB)",
+            "kind": "column",
+            "floor": "zero",
+            "alpha": 50000,
+        },
+        legend=False,
+        bands=True,
+    )
+    _chart_caption(slide, 6.85, 0.90, 6.2, "Daily DL PRB")
+    prb_limits = _add_chart(
+        slide,
+        Inches(6.70),
+        Inches(1.22),
+        Inches(6.40),
+        Inches(5.15),
+        {
+            "name": "DL PRB",
+            "values": _on_calendar(daily, "prb"),
+            "color": "548235",
+            "axis": "DL PRB (%)",
+            "kind": "column",
+            "alpha": 80000,
+        },
+        legend=False,
+        bands=True,
+    )
+    print(
+        f"Radio axes: volume {volume_limits[0]:.0f}–{volume_limits[1]:.0f}, "
+        f"throughput {throughput_limits[0]:.1f}–{throughput_limits[1]:.1f}, "
+        f"PRB {prb_limits[0]:.1f}–{prb_limits[1]:.1f}",
+        flush=True,
+    )
+    best = change["best"]
+    foot = slide.shapes.add_textbox(Inches(0.28), Inches(6.48), Inches(11.2), Inches(0.48))
+    foot.text_frame.word_wrap = True
+    _set_run(
+        foot.text_frame.paragraphs[0],
+        "Blue band is 5–7 Oct. Green band is 6–8 Nov. Throughput = sum of N / sum of D. PRB = sum of N / sum of D × 100.",
+        11,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    second = foot.text_frame.add_paragraph()
+    _set_run(
+        second,
+        (
+            f"Cells summed for these sites, 1 Sep–15 Nov. Strongest same-day gain is the day before each step "
+            f"versus {best['post']:%-d %b}: volume "
+            f"{best['pre']['vol']:,.0f} to {best['post_values']['vol']:,.0f} GB, throughput "
+            f"{best['pre']['tp']:.1f} to {best['post_values']['tp']:.1f} Mbps."
+        ),
+        11,
+        RGBColor(0x80, 0x80, 0x80),
+        False,
+    )
+    page_box = slide.shapes.add_textbox(Inches(11.3), Inches(7.05), Inches(1.75), Inches(0.28))
+    page_p = page_box.text_frame.paragraphs[0]
+    page_p.alignment = PP_ALIGN.RIGHT
+    _set_run(page_p, f"2 / {pages}", 12, RGBColor(0x80, 0x80, 0x80), False)
+
+
+def main(feg_only: bool = False) -> None:
+    cached = pickle.loads(ROW_CACHE.read_bytes())
+    rows = cached["rows"]
+    latest_work = cached["latest_work"]
+    pre_cache = pickle.loads(Path("/tmp/fege_report_cache.pkl").read_bytes())
+    pre_work = pre_cache["work"]
+    all_sites = {row["site"] for row in rows}
+    print(f"Scoring hourly OSS for {len(all_sites)} comparison sites...", flush=True)
+    pre_oss_all, _ = _prepare_oss(
+        fege._previous_capacity_path(), all_sites, fege.ANALYSIS_START, fege.ANALYSIS_END
+    )
+    post_oss_all, _ = _prepare_oss(
+        Path("/tmp/oss_nov_capacity.csv"), all_sites, fege.LATEST_START, fege.LATEST_END
+    )
+    profiles = _profiles(pre_oss_all, post_oss_all)
+    selected = select_sites(rows, profiles, solved_limit=FEG_SOLVED_LIMIT if feg_only else OTHER_LIMIT)
+    if feg_only:
+        selected = [site for site in selected if site.get("bw_up")]
+    if not selected:
+        raise SystemExit("No sites matched the finding selection")
+
+    sites = {site["site"] for site in selected}
+    print(f"Building charts for {len(selected)} slides...", flush=True)
+    pre_feg, _ = _prepare_feg(pre_work, sites, fege.ANALYSIS_START, fege.ANALYSIS_END)
+    post_feg, _ = _prepare_feg(latest_work, sites, fege.LATEST_START, fege.LATEST_END)
+    _attach_feg_speed(selected, pre_feg, post_feg)
+    pre_oss = {name: pre_oss_all[name] for name in sites}
+    post_oss = {name: post_oss_all[name] for name in sites}
+
+    CHART_DIR.mkdir(parents=True, exist_ok=True)
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    prs.core_properties.title = "Tx BW increase: throughput and data volume"
+    prs.core_properties.subject = "comparison_v1 site findings, 5–7 Oct versus 6–8 Nov"
+
+    trends = [] if feg_only else _trend_groups(rows)
+    cell_network = cell_sites = None
+    if feg_only:
+        print(f"Summing daily cell OSS for {len(selected)} sites...", flush=True)
+        names = {site["site"] for site in selected}
+        cell_network, cell_sites = _load_cell_daily(names)
+        feg_daily = _load_feg_daily(names)
+    pages = len(selected) + (2 if feg_only else 1) + len(trends)
+    if feg_only:
+        _add_feg_summary_slide(prs, rows, profiles, selected, pages)
+        steps = {}
+        for site in selected:
+            step = _rx_step_date(feg_daily[site["site"]])
+            if step is None:
+                print(f"  no RxMaxSpeed step for {site['site']}", flush=True)
+                continue
+            steps[site["site"]] = step
+            pre_from = (step - pd.Timedelta(days=7)).date()
+            pre_to = (step - pd.Timedelta(days=1)).date()
+            print(f"  {site['site']} step {step:%d %b}  pre {pre_from:%d %b}–{pre_to:%d %b}", flush=True)
+        change = _aligned_change(cell_sites, steps)
+        _add_radio_slide(prs, cell_network, len(selected), pages, change)
+    else:
+        _add_summary_slide(prs, rows, selected, profiles, trends, pages)
+    for offset, group in enumerate(trends):
+        page = 2 + offset
+        _add_trend_slide(prs, group, CHART_DIR, page, pages)
+        print(f"  trend {page}/{pages} {group['finding']} ({len(group['sites'])} sites)", flush=True)
+        for line in _trend_note(group):
+            print("   ", line, flush=True)
+    first_site_page = 3 if feg_only else 2 + len(trends)
+    for page, site in enumerate(selected, start=first_site_page):
+        name = site["site"]
+        rx = _concat(pre_feg[name]["rx"], post_feg[name]["rx"])
+        pre_on = _on_cap_vector(pre_work, name, fege.ANALYSIS_START, fege.ANALYSIS_END)
+        post_on = _on_cap_vector(latest_work, name, fege.LATEST_START, fege.LATEST_END)
+        pre_peak, pre_avg = _peaks(rx[:72], pre_on, _num(site.get("prev_center")))
+        post_peak, _post_avg = _peaks(rx[72:], post_on, _num(site.get("latest_center")))
+        if feg_only and name in feg_daily and name in cell_sites:
+            _add_slide(
+                prs,
+                site,
+                None,
+                None,
+                page,
+                pages,
+                feg_daily=feg_daily[name],
+                oss_daily=cell_sites[name],
+            )
+            print(f"  slide {page}/{pages} {name}", flush=True)
+            continue
+        wide = feg_only and name not in cell_sites
+        feg_png = CHART_DIR / f"{page:02d}_{name}_feg{'_wide' if wide else ''}.png"
+        _draw_feg(feg_png, rx, pre_peak, pre_avg, post_peak, wide=wide)
+        oss_png = None
+        daily_oss = False
+        if not feg_only:
+            oss_png = CHART_DIR / f"{page:02d}_{name}_oss.png"
+            _draw_oss(
+                oss_png,
+                _concat(pre_oss[name]["tp"], post_oss[name]["tp"]),
+                _concat(pre_oss[name]["vol"], post_oss[name]["vol"]),
+                site["busy_tp0"],
+                site["busy_tp1"],
+            )
+        _add_slide(prs, site, feg_png, oss_png, page, pages, daily_oss=daily_oss)
+        print(f"  slide {page}/{pages} {name}", flush=True)
+
+    out = OUT_FEG if feg_only else OUT
+    prs.save(out)
+    print(f"Wrote {out} ({pages} slides)", flush=True)
+
+
+if __name__ == "__main__":
+    main(feg_only=True)
